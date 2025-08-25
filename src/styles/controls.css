@@ -56,3 +56,110 @@ button:active {
 .muted {
   color: #7f8b90;
 }
+
+/* Warning element shown near buffer controls */
+.buffer-warning {
+  background: #3a2a1f;
+  color: #ffdca6;
+  padding: 6px 8px;
+  border-radius: 6px;
+  margin-top: 6px;
+  font-size: 12px;
+}
+
+/* Responsive Layout */
+@media (max-width: 768px) {
+  .wrap {
+    flex-direction: column;
+    padding: 8px;
+    gap: 8px;
+  }
+
+  .canvas-panel {
+    height: 60vh;
+    min-height: 300px;
+  }
+
+  .controls {
+    width: 100%;
+    max-width: 100%;
+    height: auto;
+    max-height: 40vh;
+    overflow-y: auto;
+  }
+
+  .control {
+    padding: 8px;
+  }
+
+  label {
+    font-size: 12px;
+  }
+
+  .small {
+    font-size: 11px;
+  }
+
+  button {
+    padding: 6px 8px;
+    font-size: 12px;
+  }
+}
+
+@media (max-width: 480px) {
+  .wrap {
+    padding: 4px;
+  }
+
+  .canvas-panel {
+    height: 50vh;
+    min-height: 250px;
+  }
+
+  .row {
+    flex-wrap: wrap;
+    gap: 4px;
+  }
+
+  button {
+    flex: 1;
+    min-width: 80px;
+  }
+}
+
+/* Main Styles */
+html, body {
+  height: 100%;
+  margin: 0;
+  background: #111;
+  color: #ddd;
+  font-family: system-ui, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+}
+
+.wrap {
+  display: flex;
+  height: 100%;
+  align-items: stretch;
+  gap: 12px;
+  padding: 12px;
+  box-sizing: border-box;
+}
+
+.canvas-panel {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #000;
+  border-radius: 8px;
+  padding: 8px;
+  box-shadow: 0 6px 30px rgba(0, 0, 0, 0.7);
+}
+
+canvas {
+  width: 100%;
+  height: 100%;
+  max-height: 90vh;
+  border-radius: 6px;
+  display: block;
+}

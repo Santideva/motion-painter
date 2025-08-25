@@ -123,7 +123,10 @@ export class WebGLRenderer {
       uBoff: gl.getUniformLocation(this.programs.composite, 'uBoff'),
       uMotionThresh: gl.getUniformLocation(this.programs.composite, 'uMotionThresh'),
       uGlow: gl.getUniformLocation(this.programs.composite, 'uGlow'),
-      uBufferSize: gl.getUniformLocation(this.programs.composite, 'uBufferSize')
+      uBufferSize: gl.getUniformLocation(this.programs.composite, 'uBufferSize'),
+      uFlipY: gl.getUniformLocation(this.programs.composite, 'uFlipY'),
+      uTime: gl.getUniformLocation(this.programs.composite, 'uTime'),
+      uDelta: gl.getUniformLocation(this.programs.composite, 'uDelta')
     };
     
     // Get frame uniform locations dynamically - up to 16 only
@@ -142,7 +145,8 @@ export class WebGLRenderer {
     this.uniformLocations.motion = {
       uCurr: gl.getUniformLocation(this.programs.motion, 'uCurr'),
       uPrev: gl.getUniformLocation(this.programs.motion, 'uPrev'),
-      uMotionThresh: gl.getUniformLocation(this.programs.motion, 'uMotionThresh')
+      uMotionThresh: gl.getUniformLocation(this.programs.motion, 'uMotionThresh'),
+      uFlipY: gl.getUniformLocation(this.programs.motion, 'uFlipY')
     };
   }
   
@@ -157,7 +161,7 @@ export class WebGLRenderer {
     return { width, height };
   }
   
-  renderComposite(frameTextures, uniforms) {
+  renderComposite(frameTextures, uniforms = {}) {
     const gl = this.gl;
     const actualBufferSize = Math.min(frameTextures.length, CONFIG.MAX_BUFFER_SIZE, this.maxTextureUnits);
     
@@ -196,28 +200,39 @@ export class WebGLRenderer {
     
     // Set other uniforms with proper clamping
     if (locs.uTimeShift) {
-      gl.uniform1i(locs.uTimeShift, Math.min(uniforms.timeShift, actualBufferSize - 1));
+      gl.uniform1i(locs.uTimeShift, Math.min(uniforms.timeShift || 0, actualBufferSize - 1));
     }
     if (locs.uOpacity) {
-      gl.uniform1f(locs.uOpacity, uniforms.opacity);
+      gl.uniform1f(locs.uOpacity, uniforms.opacity ?? 0.6);
     }
     if (locs.uInvert) {
       gl.uniform1i(locs.uInvert, uniforms.invert ? 1 : 0);
     }
     if (locs.uRoff) {
-      gl.uniform1i(locs.uRoff, Math.min(uniforms.rOff, actualBufferSize - 1));
+      gl.uniform1i(locs.uRoff, Math.min(uniforms.rOff || 0, actualBufferSize - 1));
     }
     if (locs.uGoff) {
-      gl.uniform1i(locs.uGoff, Math.min(uniforms.gOff, actualBufferSize - 1));
+      gl.uniform1i(locs.uGoff, Math.min(uniforms.gOff || 0, actualBufferSize - 1));
     }
     if (locs.uBoff) {
-      gl.uniform1i(locs.uBoff, Math.min(uniforms.bOff, actualBufferSize - 1));
+      gl.uniform1i(locs.uBoff, Math.min(uniforms.bOff || 0, actualBufferSize - 1));
     }
     if (locs.uMotionThresh) {
-      gl.uniform1f(locs.uMotionThresh, uniforms.motionThresh);
+      gl.uniform1f(locs.uMotionThresh, uniforms.motionThresh ?? 0.08);
     }
     if (locs.uGlow) {
-      gl.uniform1f(locs.uGlow, uniforms.glow);
+      gl.uniform1f(locs.uGlow, uniforms.glow ?? 0.9);
+    }
+    
+    // New: flip and time uniforms
+    if (locs.uFlipY) {
+      gl.uniform1i(locs.uFlipY, uniforms.flipY ? 1 : 0);
+    }
+    if (locs.uTime) {
+      gl.uniform1f(locs.uTime, uniforms.time ?? 0.0);
+    }
+    if (locs.uDelta) {
+      gl.uniform1f(locs.uDelta, uniforms.delta ?? 0.0);
     }
     
     // Draw

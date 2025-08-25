@@ -26,6 +26,16 @@
         opacity: 0.6;
         margin-top: 4px;
       }
+
+      /* small warning style used by Controls.showWarning */
+      .buffer-warning {
+        background: #3a2a1f;
+        color: #ffdca6;
+        padding: 6px 8px;
+        border-radius: 6px;
+        margin-top: 6px;
+        font-size: 12px;
+      }
     </style>
   </head>
   <body>
@@ -47,11 +57,12 @@
         <div class="control">
           <label>Buffer Configuration</label>
           <div class="row">
+            <!-- NOTE: max is intentionally set to 16 (CONFIG.MAX_BUFFER_SIZE). -->
             <input
               id="bufferSize"
               type="range"
               min="4"
-              max="64"
+              max="16"
               value="8"
               style="flex: 2"
             />
@@ -59,9 +70,8 @@
               <option value="0">Preset...</option>
               <option value="4">Minimal (4)</option>
               <option value="8">Standard (8)</option>
-              <option value="16">Enhanced (16)</option>
-              <option value="32">Maximum (32)</option>
-              <option value="64">Extreme (64)</option>
+              <option value="12">Enhanced (12)</option>
+              <option value="16">Maximum (16)</option>
             </select>
           </div>
           <div class="small muted row">
@@ -175,7 +185,7 @@
 
         <div class="control small muted">
           <div>
-            <strong>Enhanced Features:</strong> Variable buffer size (4-64
+            <strong>Enhanced Features:</strong> Variable buffer size (4-16
             frames), logarithmic retention policy for optimal temporal
             distribution. Uses frame differencing, color-channel time shift, and
             temporal blending.

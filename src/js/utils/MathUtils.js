@@ -1,8 +1,3 @@
-/**
- * Math and utility functions with spiral buffer support
- * Updated for 16 frame hardware limit
- */
-
 export const CONFIG = {
   BUFFER_SIZE: 4, // Legacy default
   DEFAULT_BUFFER_SIZE: 8, // New default with more capacity
@@ -202,19 +197,20 @@ export function getOptimalBufferSize(availableMemoryMB = 100, width = 1920, heig
 /**
  * Validate buffer configuration against hardware limits
  * @param {number} bufferSize - Proposed buffer size
+ * @param {number} hardwareMaxTextureUnits - (optional) runtime hardware max texture units
  * @returns {Object} Validation result
  */
-export function validateBufferSize(bufferSize) {
+export function validateBufferSize(bufferSize, hardwareMaxTextureUnits = CONFIG.HARDWARE_MAX_TEXTURE_UNITS) {
   const size = Math.round(bufferSize);
   const isValid = size >= CONFIG.MIN_BUFFER_SIZE && size <= CONFIG.MAX_BUFFER_SIZE;
   const clamped = Math.max(CONFIG.MIN_BUFFER_SIZE, Math.min(CONFIG.MAX_BUFFER_SIZE, size));
-  const isHardwareLimited = size > CONFIG.HARDWARE_MAX_TEXTURE_UNITS;
+  const isHardwareLimited = size > hardwareMaxTextureUnits;
   
   let warning = null;
   if (size < CONFIG.MIN_BUFFER_SIZE) {
     warning = `Buffer size must be at least ${CONFIG.MIN_BUFFER_SIZE}`;
   } else if (isHardwareLimited) {
-    warning = `Buffer size limited to ${CONFIG.MAX_BUFFER_SIZE} by WebGL texture unit constraints`;
+    warning = `Buffer size limited to ${Math.min(CONFIG.MAX_BUFFER_SIZE, hardwareMaxTextureUnits)} by WebGL texture unit constraints`;
   } else if (!isValid) {
     warning = `Buffer size must be between ${CONFIG.MIN_BUFFER_SIZE} and ${CONFIG.MAX_BUFFER_SIZE}`;
   }
@@ -235,22 +231,8 @@ export function validateBufferSize(bufferSize) {
  * @returns {number[]} Optimized spiral indices
  */
 export function getOptimizedSpiralIndices(bufferSize) {
-  const size = Math.min(bufferSize, CONFIG.MAX_BUFFER_SIZE);
-  
-  // Pre-computed optimal patterns for common sizes
-  const precomputedPatterns = {
-    4: [0, 1, 2, 3],
-    8: [0, 1, 2, 3, 4, 7, 11, 16],
-    12: [0, 1, 2, 3, 4, 7, 11, 16, 23, 32, 45, 64],
-    16: [0, 1, 2, 3, 4, 7, 11, 16, 23, 32, 45, 64, 90, 128, 181, 256]
-  };
-  
-  if (precomputedPatterns[size]) {
-    return precomputedPatterns[size];
-  }
-  
-  // Fall back to dynamic generation for non-standard sizes
-  return getSpiralBufferIndices(size).map(index => Math.min(index, size - 1));
+  // Safer: prefer dynamically generated indices that are guaranteed in-bounds
+  return getSpiralBufferIndices(bufferSize);
 }
 
 /**

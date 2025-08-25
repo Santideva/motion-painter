@@ -18,6 +18,10 @@ export class Controls {
       motionThresh: 0.08,
       glow: 0.9
     };
+
+    // Optional fields for real measured video/canvas size
+    this.videoWidth = null;
+    this.videoHeight = null;
   }
   
   init() {
@@ -68,7 +72,7 @@ export class Controls {
         const validation = validateBufferSize(newSize);
         
         this.params.bufferSize = validation.clampedSize;
-        this.elements.bufferSizeVal.textContent = this.params.bufferSize;
+        if (this.elements.bufferSizeVal) this.elements.bufferSizeVal.textContent = this.params.bufferSize;
         this.updateBufferInfo();
         this.updateTimeShiftLimits();
         this.notifyChange('bufferSize', this.params.bufferSize);
@@ -311,9 +315,20 @@ export class Controls {
     }
   }
   
-  updateBufferInfo() {
+  /**
+   * updateBufferInfo now accepts width/height to show real memory usage
+   */
+  updateBufferInfo(width = null, height = null) {
+    // Prefer stored video/canvas size if present
+    if (!width && this.videoWidth && this.videoHeight) {
+      width = this.videoWidth;
+      height = this.videoHeight;
+    }
+    width = width || CONFIG.DEFAULT_RESOLUTION.width;
+    height = height || CONFIG.DEFAULT_RESOLUTION.height;
+
     if (this.elements.bufferMemory) {
-      const memoryUsage = calculateBufferMemoryUsage(this.params.bufferSize);
+      const memoryUsage = calculateBufferMemoryUsage(this.params.bufferSize, width, height);
       this.elements.bufferMemory.innerHTML = `
         <span class="memory-usage ${memoryUsage.recommendation}">
           ${memoryUsage.totalMB} MB

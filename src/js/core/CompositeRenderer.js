@@ -88,25 +88,36 @@ export class CompositeRenderer {
     }
   }
   
-  renderComposite(frameTextures) {
+  /**
+   * New rendering entry: accept textures and uniforms
+   */
+  renderComposite(frameTextures, uniforms = {}) {
     // Ensure WebGL renderer is aware of current buffer size
     const effectiveSize = Math.min(frameTextures.length, CONFIG.MAX_BUFFER_SIZE);
     this.webglRenderer.updateBufferSize(effectiveSize);
     
     // Validate parameters one more time before rendering
     const validatedParams = this.getValidatedParams(effectiveSize);
+    // Merge shader-time uniforms
+    const renderUniforms = {
+      ...validatedParams,
+      // allow overrides passed via uniforms (time, delta, flipY, etc.)
+      ...uniforms
+    };
     
-    this.webglRenderer.renderComposite(frameTextures, validatedParams);
+    this.webglRenderer.renderComposite(frameTextures, renderUniforms);
   }
   
   renderMotionDebug(frameTextures) {
     const currentTexture = frameTextures[0];
     const previousTexture = frameTextures[1] || currentTexture; // Fallback if only one frame
     
+    // Pass optional flip/uniforms as part of the motion shader path if provided
     this.webglRenderer.renderMotionMask(
       currentTexture, 
       previousTexture, 
-      this.params.motionThresh
+      this.params.motionThresh,
+      // motion shader doesn't change other uniforms currently
     );
   }
   
@@ -127,23 +138,34 @@ export class CompositeRenderer {
   }
   
   /**
-   * Process a new video frame with enhanced error handling
+   * Process a new video frame with enhanced ordering and time info
    * @param {HTMLVideoElement} video - Video source
+   * @param {Object} opts - { time: seconds, delta: seconds, flipY: boolean }
    */
-  processFrame(video) {
+  processFrame(video, opts = {}) {
     try {
-      // Upload current frame to buffer
+      // Upload current frame to buffer at writeIndex
       this.frameBuffer.uploadVideoFrame(video);
-      
-      // Rotate buffers using current retention policy
-      this.frameBuffer.rotateBuffers();
-      
-      // Advance write index for next frame
+
+      // Advance write index so newest frame is considered at read-time index 0
       this.frameBuffer.advanceWriteIndex();
-      
-      // Render the composite
-      this.render();
-      
+
+      // Build read-ordered view according to retention policy
+      this.frameBuffer.rotateBuffers();
+
+      // Get read-ordered textures (newest first)
+      const frameTextures = this.frameBuffer.getTextures();
+
+      // Render using validated params and pass time/flipY
+      const validatedParams = this.getValidatedParams(Math.min(frameTextures.length, CONFIG.MAX_BUFFER_SIZE));
+      const renderUniforms = {
+        ...validatedParams,
+        time: opts.time ?? 0.0,
+        delta: opts.delta ?? 0.0,
+        flipY: !!opts.flipY
+      };
+      this.renderComposite(frameTextures, renderUniforms);
+
     } catch (error) {
       console.error('Error processing frame:', error);
       throw error; // Re-throw to allow caller to handle
@@ -154,6 +176,8 @@ export class CompositeRenderer {
     try {
       // Initialize all buffer slots with the first frame
       this.frameBuffer.initializeWithFrame(video);
+      // Ensure read-ordered view is built
+      this.frameBuffer.rotateBuffers();
     } catch (error) {
       console.error('Error initializing buffer:', error);
       throw error;
@@ -201,7 +225,16 @@ export class CompositeRenderer {
     const pixels = new Uint8Array(width * height * 4);
     gl.readPixels(0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
     
-    return new ImageData(new Uint8ClampedArray(pixels), width, height);
+    // Flip rows to upright ImageData
+    const rowSize = width * 4;
+    const flipped = new Uint8ClampedArray(width * height * 4);
+    for (let y = 0; y < height; y++) {
+      const srcStart = y * rowSize;
+      const dstStart = (height - y - 1) * rowSize;
+      flipped.set(pixels.subarray(srcStart, srcStart + rowSize), dstStart);
+    }
+    
+    return new ImageData(flipped, width, height);
   }
   
   /**
@@ -371,6 +404,7 @@ export class CompositeRenderer {
   
   /**
    * Reset to optimal configuration for current hardware
+   * (keeps original logic)
    */
   resetToOptimal() {
     const optimalSize = Math.min(
@@ -418,8 +452,8 @@ export class CompositeRenderer {
       validation.errors.push(`Buffer size (${this.params.bufferSize}) exceeds hardware limit (${caps.maxTextureUnits})`);
     }
     
-    // Check WebGL renderer support
-    if (!this.webglRenderer.isBufferSizeSupported(this.params.bufferSize)) {
+    // Check WebGL renderer support - gracefully handle if method missing
+    if (typeof this.webglRenderer.isBufferSizeSupported === 'function' && !this.webglRenderer.isBufferSizeSupported(this.params.bufferSize)) {
       validation.isSupported = false;
       validation.errors.push(`Buffer size not supported by WebGL renderer`);
     }
