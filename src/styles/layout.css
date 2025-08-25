@@ -1,0 +1,59 @@
+/* Responsive Layout */
+@media (max-width: 768px) {
+  .wrap {
+    flex-direction: column;
+    padding: 8px;
+    gap: 8px;
+  }
+
+  .canvas-panel {
+    height: 60vh;
+    min-height: 300px;
+  }
+
+  .controls {
+    width: 100%;
+    max-width: 100%;
+    height: auto;
+    max-height: 40vh;
+    overflow-y: auto;
+  }
+
+  .control {
+    padding: 8px;
+  }
+
+  label {
+    font-size: 12px;
+  }
+
+  .small {
+    font-size: 11px;
+  }
+
+  button {
+    padding: 6px 8px;
+    font-size: 12px;
+  }
+}
+
+@media (max-width: 480px) {
+  .wrap {
+    padding: 4px;
+  }
+
+  .canvas-panel {
+    height: 50vh;
+    min-height: 250px;
+  }
+
+  .row {
+    flex-wrap: wrap;
+    gap: 4px;
+  }
+
+  button {
+    flex: 1;
+    min-width: 80px;
+  }
+}

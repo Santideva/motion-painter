@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Motion Painter — WebGL2 Demo</title>
+    <style>
+      .memory-usage.low {
+        color: #4caf50;
+      }
+      .memory-usage.medium {
+        color: #ff9800;
+      }
+      .memory-usage.high {
+        color: #f44336;
+      }
+      .memory-detail {
+        font-size: 0.8em;
+        opacity: 0.7;
+      }
+      .buffer-preset {
+        margin-left: 8px;
+      }
+      .keyboard-hint {
+        font-size: 0.75em;
+        opacity: 0.6;
+        margin-top: 4px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="canvas-panel">
+        <canvas id="glcanvas"></canvas>
+      </div>
+      <div class="controls">
+        <div class="control">
+          <label>Source</label>
+          <div class="row">
+            <button id="startCam">Start Camera</button>
+            <button id="useVideo">Load Sample Video</button>
+            <span class="small muted" id="status">idle</span>
+          </div>
+        </div>
+
+        <!-- New Buffer Configuration Section -->
+        <div class="control">
+          <label>Buffer Configuration</label>
+          <div class="row">
+            <input
+              id="bufferSize"
+              type="range"
+              min="4"
+              max="64"
+              value="8"
+              style="flex: 2"
+            />
+            <select id="bufferPreset" class="buffer-preset">
+              <option value="0">Preset...</option>
+              <option value="4">Minimal (4)</option>
+              <option value="8">Standard (8)</option>
+              <option value="16">Enhanced (16)</option>
+              <option value="32">Maximum (32)</option>
+              <option value="64">Extreme (64)</option>
+            </select>
+          </div>
+          <div class="small muted row">
+            Buffer size: <span id="bufferSizeVal">8</span>
+            <span id="bufferMemory" style="margin-left: 12px"></span>
+          </div>
+          <div class="row">
+            <label style="font-size: 0.9em">
+              <input id="spiralRetention" type="checkbox" checked />
+              Logarithmic retention (spiral buffer)
+            </label>
+          </div>
+          <div class="keyboard-hint">
+            Ctrl+/- to adjust buffer size, Ctrl+S to toggle spiral retention
+          </div>
+        </div>
+
+        <div class="control">
+          <label>Time shift (frames back)</label>
+          <input id="timeShift" type="range" min="0" max="7" value="1" />
+          <div class="small muted row">
+            <span id="timeShiftVal">1</span> / buffer size
+            <span id="maxBufferSize">8</span>
+          </div>
+        </div>
+
+        <div class="control">
+          <label>Opacity (blend of older → current)</label>
+          <input
+            id="opacity"
+            type="range"
+            min="0"
+            max="1"
+            step="0.01"
+            value="0.6"
+          />
+        </div>
+
+        <div class="control">
+          <label>Invert older frames?</label>
+          <input id="invert" type="checkbox" checked />
+        </div>
+
+        <div class="control">
+          <label>Color channel time offsets (r / g / b)</label>
+          <div class="row">
+            <input
+              id="rOff"
+              type="range"
+              min="0"
+              max="7"
+              value="1"
+              style="flex: 1"
+            />
+            <input
+              id="gOff"
+              type="range"
+              min="0"
+              max="7"
+              value="2"
+              style="flex: 1"
+            />
+            <input
+              id="bOff"
+              type="range"
+              min="0"
+              max="7"
+              value="3"
+              style="flex: 1"
+            />
+          </div>
+          <div class="small muted row">
+            r:<span id="rVal">1</span> g:<span id="gVal">2</span> b:<span
+              id="bVal"
+              >3</span
+            >
+          </div>
+        </div>
+
+        <div class="control">
+          <label>Motion threshold (difference)</label>
+          <input
+            id="motionThresh"
+            type="range"
+            min="0"
+            max="1"
+            step="0.01"
+            value="0.08"
+          />
+        </div>
+
+        <div class="control">
+          <label>Glow (motion boost) intensity</label>
+          <input
+            id="glow"
+            type="range"
+            min="0"
+            max="2"
+            step="0.01"
+            value="0.9"
+          />
+        </div>
+
+        <div class="control">
+          <label>Debug</label>
+          <div class="row">
+            <button id="showMotion">Toggle motion mask</button>
+            <button id="pauseBtn">Pause</button>
+          </div>
+        </div>
+
+        <div class="control small muted">
+          <div>
+            <strong>Enhanced Features:</strong> Variable buffer size (4-64
+            frames), logarithmic retention policy for optimal temporal
+            distribution. Uses frame differencing, color-channel time shift, and
+            temporal blending.
+          </div>
+          <div class="keyboard-hint" style="margin-top: 8px">
+            <strong>Keyboard shortcuts:</strong> Space (pause), M (motion mask),
+            C (camera), V (video), R (reset)
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <video id="sourceVideo" playsinline muted style="display: none"></video>
+  </body>
+</html>
