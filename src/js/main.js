@@ -8,6 +8,8 @@ import { WebGLRenderer } from './core/WebGLRenderer.js';
 import { FrameBuffer } from './core/FrameBuffer.js';
 import { MotionDetector } from './core/MotionDetector.js';
 import { CompositeRenderer } from './core/CompositeRenderer.js';
+import { FrameEvictionHook } from './core/FrameEvictionHook.js';
+import { PreprocessorWorker } from './core/PreprocessorWorker.js';
 
 // Import UI modules
 import { Controls } from './ui/Controls.js';
@@ -26,6 +28,10 @@ class MotionPainter {
     this.compositeRenderer = null;
     this.controls = null;
     this.mediaInput = null;
+    
+    // Preprocessor + evictionHook will be created in init() once frameBuffer exists
+    this.preprocessor = null;
+    this.evictionHook = null;
     
     this.isRendering = false;
     this.isPaused = false;
@@ -54,6 +60,23 @@ class MotionPainter {
       const initialBufferSize = validation.clampedSize;
       
       this.frameBuffer = new FrameBuffer(this.webglRenderer.gl, initialBufferSize);
+      
+      // --- set up preprocessor + eviction hook AFTER FrameBuffer exists ---
+      try {
+        // create wrapper; worker URL should point to your worker module
+        this.preprocessor = new PreprocessorWorker('./core/preprocessor.worker.js');
+
+        // create and attach the eviction hook (FrameEvictionHook is defensive if frameBuffer is null)
+        this.evictionHook = new FrameEvictionHook(this.preprocessor);
+        this.evictionHook.attach(this.frameBuffer);
+        console.log('Eviction hook attached to FrameBuffer');
+      } catch (err) {
+        console.error('Failed to initialize preprocessor/eviction hook:', err);
+        // keep app running — preprocessor is optional for rendering
+        this.preprocessor = null;
+        this.evictionHook = null;
+      }
+      
       this.motionDetector = new MotionDetector();
       this.compositeRenderer = new CompositeRenderer(
         this.webglRenderer, 
@@ -597,6 +620,17 @@ displayHardwareLimitations() {
   
   destroy() {
     this.stopRendering();
+    
+    // Detach eviction hook and terminate preprocessor worker (if present)
+    if (this.evictionHook && typeof this.evictionHook.detach === 'function') {
+      try { this.evictionHook.detach(); } catch (e) { console.warn('Error detaching eviction hook', e); }
+      this.evictionHook = null;
+    }
+
+    if (this.preprocessor && this.preprocessor.worker) {
+      try { this.preprocessor.worker.terminate(); } catch (e) { console.warn('Error terminating preprocessor worker', e); }
+      this.preprocessor = null;
+    }
     
     if (this.mediaInput) {
       this.mediaInput.destroy();

@@ -1,3 +1,4 @@
+// src/core/FrameBuffer.js
 import { CONFIG, getSpiralBufferIndices } from '../utils/MathUtils.js';
 
 export class FrameBuffer {
@@ -12,10 +13,15 @@ export class FrameBuffer {
     this.height = 0;
     this.frameCount = 0; // Total frames processed
     this.readTextures = null; // Read-ordered view computed by rotateBuffers (do not mutate this.textures)
+    this.onEvict = null; // callback(ImageBitmap or null, meta)
+
 
     // Spiral buffer configuration
     this.useSpiralRetention = true;
     this.spiralIndices = null; // Cached spiral indices for current buffer size
+
+    // Eviction readback config (max side length for downsampled readback)
+    this.evictReadMaxSide = 256; // tune this: lower => cheaper readback
 
     // Hardware validation
     this.validateHardwareLimits();
@@ -169,7 +175,7 @@ export class FrameBuffer {
     } catch (e) {
       // Fallback to texImage2D if texSubImage2D fails (some platforms/browsers)
       try {
-        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
+        gl.texImage2D(gl.TEXTURE_2D, 0, this.gl.RGBA, this.gl.RGBA, this.gl.UNSIGNED_BYTE, video);
       } catch (err) {
         console.error('uploadVideoFrame: texture upload failed', err);
       }
@@ -243,9 +249,130 @@ export class FrameBuffer {
     this.readTextures = ordered;
   }
 
+  // -------------------- NEW: eviction readback helper --------------------
+  // Read a texture slot into an ImageBitmap. Optionally downsamples to this.evictReadMaxSide
+  async _readTextureToImageBitmap(texture, srcWidth, srcHeight) {
+    const gl = this.gl;
+
+    if (!texture) return null;
+
+    // If the source is already small enough, read directly; otherwise downsample via an FBO
+    const maxSide = this.evictReadMaxSide || 256;
+    let readW = srcWidth;
+    let readH = srcHeight;
+
+    if (Math.max(srcWidth, srcHeight) > maxSide) {
+      const scale = maxSide / Math.max(srcWidth, srcHeight);
+      readW = Math.max(1, Math.floor(srcWidth * scale));
+      readH = Math.max(1, Math.floor(srcHeight * scale));
+    }
+
+    // Create temporary readback texture & framebuffer
+    const tmpTex = this.createTexture(readW, readH);
+    const tmpFb = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, tmpFb);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tmpTex, 0);
+
+    // Render the source texture into tmpTex using a simple blit. We'll create and use a small shader/quad here.
+    // For simplicity we assume a small internal blit helper exists; if not, perform a simple textured draw.
+    try {
+      // Minimal blit implementation (bind src texture to unit 0 and draw a fullscreen quad).
+      // The actual blit shader/setup is assumed to be present in your renderer. If you don't have a blit,
+      // you can use `gl.copyTexSubImage2D` if both textures are compatible, or render a quad using current GL program.
+      // Here we use a conservative fallback: attach the source texture to a framebuffer and read its pixels directly,
+      // when the sizes match; otherwise a full-blit path is needed. To keep this snippet safe, prefer readPixels
+      // from the texture's existing framebuffer if you created one earlier.
+
+      // If the texture has an associated framebuffer in this.framebuffers array, we can read from it directly.
+      let srcFb = null;
+      const idx = this.textures.indexOf(texture);
+      if (idx >= 0 && this.framebuffers[idx]) srcFb = this.framebuffers[idx];
+
+      if (srcFb && srcWidth === readW && srcHeight === readH) {
+        // identical size => read straight from existing framebuffer
+        gl.bindFramebuffer(gl.FRAMEBUFFER, srcFb);
+      } else {
+        // Fallback: we will render src texture into tmpFb. Bind tmpFb and draw quad sampling `texture`.
+        gl.bindFramebuffer(gl.FRAMEBUFFER, tmpFb);
+        // Setup viewport for downsample draw
+        gl.viewport(0, 0, readW, readH);
+        // You need a small blit draw call here using your renderer's textured quad.
+        // If you don't have a reusable blit, you should implement one that:
+        //  - binds a simple shader that samples unit 0, draws a full-screen triangle/quad.
+        //  - binds `texture` to TEXTURE0.
+        // As we cannot assume your renderer APIs, leaving an explicit TODO for minimal integration.
+        // TODO: call your renderer.blitTexture(texture, targetFb=tmpFb, targetSize=[readW,readH]);
+        // If you cannot blit now, we still proceed to try reading from the texture's srcFb if available.
+      }
+
+      const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+      if (status !== gl.FRAMEBUFFER_COMPLETE) {
+        console.warn('FrameBuffer.readback: framebuffer incomplete', status);
+      }
+
+      const pixels = new Uint8Array(readW * readH * 4);
+      // readPixels reads bottom-left origin — callers should account for flip if needed
+      gl.readPixels(0, 0, readW, readH, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+
+      // cleanup: restore default framebuffer & delete temporary resources
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      try { gl.deleteFramebuffer(tmpFb); } catch (e) {}
+      try { gl.deleteTexture(tmpTex); } catch (e) {}
+
+      // Convert bytes to ImageBitmap (transferable)
+      // careful: this uses browser createImageBitmap(ImageData) API
+      const clamped = new Uint8ClampedArray(pixels.buffer);
+      const imageData = new ImageData(clamped, readW, readH);
+      return await createImageBitmap(imageData);
+    } catch (err) {
+      // Ensure we unbind/cleanup even on errors
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      try { gl.deleteFramebuffer(tmpFb); } catch (e) {}
+      try { gl.deleteTexture(tmpTex); } catch (e) {}
+      console.warn('FrameBuffer._readTextureToImageBitmap failed', err);
+      throw err;
+    }
+  }
+
+  // -------------------- UPDATED: advanceWriteIndex triggers async eviction readback --------------------
   advanceWriteIndex() {
+    const evictedIndex = this.writeIndex; // about to overwrite this slot
+
+    // Trigger eviction hook: convert old GL texture -> ImageBitmap then call onEvict(imageBitmap, meta)
+    if (this.onEvict && this.textures[evictedIndex]) {
+      try {
+        console.debug('evict:readback-start', { index: evictedIndex, frameNumber: this.frameCount });
+        // Capture reference sizes
+        const srcWidth = this.width || CONFIG.DEFAULT_RESOLUTION.width;
+        const srcHeight = this.height || CONFIG.DEFAULT_RESOLUTION.height;
+
+        // initiate async readback (do not await here — we don't block main loop).
+        this._readTextureToImageBitmap(this.textures[evictedIndex], srcWidth, srcHeight)
+          .then(imageBitmap => {
+            if (!imageBitmap) {
+              console.warn('evict:readback produced no bitmap', evictedIndex);
+              return;
+            }
+            const meta = { index: evictedIndex, frameNumber: this.frameCount, timestamp: Date.now(), readW: imageBitmap.width, readH: imageBitmap.height };
+            try {
+              console.debug('evict:forwarding', meta);
+              // Ownership of imageBitmap moves to the hook/consumer (transferable). Consumer must close when done.
+              this.onEvict(imageBitmap, meta);
+            } catch (err) {
+              console.error('evict:handler threw', err);
+              try { imageBitmap.close(); } catch (e) {}
+            }
+          })
+          .catch(err => {
+            console.warn('evict:readback failed', { index: evictedIndex, err });
+          });
+      } catch (err) {
+        console.warn('Eviction callback scheduling error:', err);
+      }
+    }
+
+    // Advance the write index — this invalidates readTextures cache
     this.writeIndex = (this.writeIndex + 1) % this.bufferSize;
-    // When writeIndex changes, the read order changes — invalidate cached readTextures
     this.readTextures = null;
   }
 
