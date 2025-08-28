@@ -1,17 +1,8 @@
 // preprocessor.worker.js
 // Module worker that receives ImageBitmap frames from the main thread wrapper,
 // generates thumbnail + quick phash + manifest, writes artifacts to storage, and notifies main thread.
-// Expects storage.js to be next to this file.
 
-importScripts(); // no-op but keeps worker style clear; module workers support import()
-
-// Import storage functions (works because this is a module worker and webpack bundles it)
-import {
-  initStorage,
-  putInboundArtifact,
-  // getArtifact,
-  // other exports if needed...
-} from './storage.js';
+importScripts('./storage.js');
 
 const BROADCAST_CHANNEL = 'motion-painter-store';
 const bc = new BroadcastChannel(BROADCAST_CHANNEL);
@@ -19,10 +10,28 @@ const bc = new BroadcastChannel(BROADCAST_CHANNEL);
 // Worker config
 const DEFAULT_THUMB_MAX_SIDE = 256;
 
+// Worker initialization state
+let storageReady = false;
+const pendingFrames = [];
+
 // Initialize storage from worker side (safe; on first call this will open db)
-initStorage({ quota: undefined, startEvictor: true }).catch(err => {
-  console.warn('preprocessor.worker: storage init failed', err);
-});
+self.initStorage({ quota: undefined, startEvictor: true })
+  .then(() => {
+    storageReady = true;
+    console.log('preprocessor.worker: storage initialized, processing pending frames');
+    
+    // Process any queued frames
+    const queued = [...pendingFrames];
+    pendingFrames.length = 0;
+    queued.forEach(frame => processFrame(frame));
+    
+    // Signal main thread that worker is ready
+    postMessage({ event: 'worker:ready' });
+  })
+  .catch(err => {
+    console.error('preprocessor.worker: storage init failed', err);
+    postMessage({ event: 'worker:error', error: err.message });
+  });
 
 // Utility: average hash (aHash) quick implementation
 async function computeAHashFromBitmap(imageBitmap, hashSize = 8) {
@@ -78,17 +87,28 @@ function computeMotionMapPlaceholder(imageBitmap) {
 
 // Main task: process incoming frame
 async function processFrame({ jobId, meta = {}, imageBitmap, options = {} }) {
+  const startTime = Date.now();
+  
   try {
+    // Emit progress
+    postMessage({ event: 'progress', jobId, stage: 'processing_start', timestamp: startTime });
+
     // Decide mode: preview vs final
     const mode = options.mode || meta.mode || 'preview'; // 'preview' or 'final'
     const thumbMax = mode === 'final' ? 512 : DEFAULT_THUMB_MAX_SIDE;
 
+    // Apply downsample scale if provided in options
+    const downsampleScale = options.downsampleScale || 1.0;
+    const effectiveThumbMax = Math.floor(thumbMax * downsampleScale);
+
     // Create thumbnail
-    const { blob: thumbBlob, w, h } = await createThumbnailBlob(imageBitmap, thumbMax);
+    postMessage({ event: 'progress', jobId, stage: 'creating_thumbnail' });
+    const { blob: thumbBlob, w, h } = await createThumbnailBlob(imageBitmap, effectiveThumbMax);
 
     // compute phash (aHash here)
     // For phash we can compute from the thumbnail (fast)
     // create a small bitmap from the blob
+    postMessage({ event: 'progress', jobId, stage: 'computing_phash' });
     const thumbBitmap = await createImageBitmap(thumbBlob);
     const phash = await computeAHashFromBitmap(thumbBitmap, 8);
     try { thumbBitmap.close(); } catch (e) {}
@@ -97,6 +117,9 @@ async function processFrame({ jobId, meta = {}, imageBitmap, options = {} }) {
     const srcHash = meta.srcHash || `src-${Date.now()}-${Math.random().toString(36).slice(2,8)}`;
     const frameNumber = meta.frameNumber || null;
     const timestamp = meta.timestamp || Date.now();
+    const producerVersion = 'preproc-v1';
+    const hashVersion = 'ahash-v1';
+    
     const thumbKey = `thumb:${srcHash}:${w}x${h}`;
     const phashKey = `phash:${srcHash}`;
     const manifestKey = `manifest:${srcHash}`;
@@ -105,63 +128,216 @@ async function processFrame({ jobId, meta = {}, imageBitmap, options = {} }) {
       key: thumbKey,
       type: 'thumbnail',
       blob: thumbBlob,
-      meta: { srcHash, frameNumber, timestamp, sizeBytes: thumbBlob.size, origin: 'preprocessor', producer: 'preproc-v1' },
+      meta: { 
+        srcHash, 
+        frameNumber, 
+        timestamp, 
+        sizeBytes: thumbBlob.size, 
+        origin: 'preprocessor', 
+        producerVersion,
+        dimensions: { width: w, height: h },
+        downsampleScale: downsampleScale !== 1.0 ? downsampleScale : undefined
+      },
       createdAt: new Date().toISOString()
     };
 
     const phashArtifact = {
       key: phashKey,
       type: 'phash',
-      data: { phash },
-      meta: { srcHash, frameNumber, timestamp, producer: 'preproc-v1' },
+      data: { phash, hashVersion, algorithm: 'aHash' },
+      meta: { 
+        srcHash, 
+        frameNumber, 
+        timestamp, 
+        producerVersion,
+        hashVersion,
+        sizeBytes: JSON.stringify({ phash, hashVersion, algorithm: 'aHash' }).length
+      },
       createdAt: new Date().toISOString()
     };
 
     const manifestArtifact = {
       key: manifestKey,
       type: 'manifest',
-      data: { keys: [thumbKey, phashKey], frameNumber, timestamp, meta },
-      meta: { srcHash, frameNumber, timestamp, producer: 'preproc-v1' },
+      data: { 
+        keys: [thumbKey, phashKey], 
+        frameNumber, 
+        timestamp, 
+        meta,
+        versions: {
+          thumbnail: producerVersion,
+          phash: hashVersion,
+          sdf: null,
+          pose: null
+        },
+        processingMode: mode,
+        downsampleScale: downsampleScale !== 1.0 ? downsampleScale : undefined
+      },
+      meta: { 
+        srcHash, 
+        frameNumber, 
+        timestamp, 
+        producerVersion,
+        sizeBytes: JSON.stringify({
+          keys: [thumbKey, phashKey],
+          frameNumber,
+          timestamp,
+          meta
+        }).length
+      },
       createdAt: new Date().toISOString()
     };
 
     // Write artifacts to storage
-    await putInboundArtifact(thumbArtifact);
-    await putInboundArtifact(phashArtifact);
-    await putInboundArtifact(manifestArtifact);
+    postMessage({ event: 'progress', jobId, stage: 'writing_storage' });
+    await self.putInboundArtifact(thumbArtifact);
+    await self.putInboundArtifact(phashArtifact);
+    await self.putInboundArtifact(manifestArtifact);
+
+    const durationMs = Date.now() - startTime;
 
     // Notify main thread and broadcast channel
-    postMessage({ event: 'artifact:ready', jobId, keys: [thumbKey, phashKey, manifestKey], meta: { srcHash, frameNumber, timestamp } });
-    bc.postMessage({ event: 'artifact:ready', jobId, keys: [thumbKey, phashKey, manifestKey], meta: { srcHash, frameNumber, timestamp } });
+    const readyData = { 
+      event: 'artifact:ready', 
+      jobId, 
+      keys: [thumbKey, phashKey, manifestKey], 
+      meta: { srcHash, frameNumber, timestamp, producerVersion, hashVersion },
+      durationMs,
+      processingMode: mode,
+      downsampleScale: downsampleScale !== 1.0 ? downsampleScale : undefined
+    };
+    
+    postMessage(readyData);
+    bc.postMessage(readyData);
 
     // Close the incoming ImageBitmap to free GPU resources
     try { imageBitmap.close(); } catch (e) {}
+    
   } catch (err) {
     console.error('preprocessor.worker: processing failed', err);
-    postMessage({ event: 'artifact:error', jobId, error: String(err) });
-    bc.postMessage({ event: 'artifact:error', jobId, error: String(err) });
+    const errorData = { event: 'artifact:error', jobId, error: String(err), stack: err.stack };
+    postMessage(errorData);
+    bc.postMessage(errorData);
     try { imageBitmap.close(); } catch (e) {}
+  }
+}
+
+// Handle reprocess requests (for future SDF/pose generation)
+async function handleReprocess({ jobId, key, actions = [], priority = 0 }) {
+  try {
+    postMessage({ event: 'progress', jobId, stage: 'reprocess_start', key, actions });
+
+    // Get the original artifact
+    const artifact = await self.getArtifact(key);
+    if (!artifact) {
+      throw new Error(`Artifact not found: ${key}`);
+    }
+
+    const results = [];
+    
+    for (const action of actions) {
+      if (action === 'sdf') {
+        // Placeholder for SDF generation
+        const sdfKey = `sdf:${artifact.meta.srcHash}`;
+        const sdfArtifact = {
+          key: sdfKey,
+          type: 'sdf',
+          data: { placeholder: true, message: 'SDF generation not yet implemented' },
+          meta: {
+            ...artifact.meta,
+            producerVersion: 'sdf-v1',
+            reprocessedFrom: key,
+            reprocessedAt: new Date().toISOString()
+          },
+          createdAt: new Date().toISOString()
+        };
+        await self.putInboundArtifact(sdfArtifact);
+        results.push(sdfKey);
+        
+      } else if (action === 'pose') {
+        // Placeholder for pose estimation
+        const poseKey = `pose:${artifact.meta.srcHash}`;
+        const poseArtifact = {
+          key: poseKey,
+          type: 'pose',
+          data: { placeholder: true, message: 'Pose estimation not yet implemented' },
+          meta: {
+            ...artifact.meta,
+            producerVersion: 'pose-v1',
+            reprocessedFrom: key,
+            reprocessedAt: new Date().toISOString()
+          },
+          createdAt: new Date().toISOString()
+        };
+        await self.putInboundArtifact(poseArtifact);
+        results.push(poseKey);
+      }
+    }
+
+    postMessage({ 
+      event: 'reprocess:complete', 
+      jobId, 
+      originalKey: key, 
+      newKeys: results 
+    });
+
+  } catch (err) {
+    console.error('preprocessor.worker: reprocess failed', err);
+    postMessage({ 
+      event: 'reprocess:error', 
+      jobId, 
+      key, 
+      error: String(err) 
+    });
   }
 }
 
 // Worker message handler
 self.onmessage = async (ev) => {
   const msg = ev.data || {};
+  
   if (msg.op === 'preprocess') {
     // message should contain { jobId, meta, imageBitmap, options? }
     const { jobId, meta = {}, options = {} } = msg;
     // imageBitmap is a transferred ImageBitmap
     const imageBitmap = msg.imageBitmap || ev.data.imageBitmap || null;
+    
     if (!imageBitmap) {
       postMessage({ event: 'artifact:error', jobId, error: 'No ImageBitmap received' });
       return;
     }
-    // Enqueue work (we process inline sequentially to avoid heavy concurrency)
-    // For more concurrency, implement a queue and limit active tasks.
+
+    if (!storageReady) {
+      // Queue the frame for processing once storage is ready
+      pendingFrames.push({ jobId, meta, imageBitmap, options });
+      console.debug('preprocessor.worker: storage not ready, queuing frame', jobId);
+      return;
+    }
+    
+    // Process immediately if storage is ready
     processFrame({ jobId, meta, imageBitmap, options });
+    
+  } else if (msg.op === 'reprocess') {
+    const { jobId, key, actions, priority } = msg;
+    if (!storageReady) {
+      postMessage({ event: 'reprocess:error', jobId, key, error: 'Storage not ready' });
+      return;
+    }
+    handleReprocess({ jobId, key, actions, priority });
+    
   } else if (msg.op === 'shutdown') {
+    // Clean up any pending frames
+    pendingFrames.forEach(({ imageBitmap }) => {
+      try { imageBitmap.close(); } catch (e) {}
+    });
+    pendingFrames.length = 0;
+    
+    // Close broadcast channel
+    try { bc.close(); } catch (e) {}
+    
     postMessage({ event: 'worker:shutdown' });
     close();
+    
   } else {
     // other ops
     console.debug('preprocessor.worker: unknown op', msg.op);

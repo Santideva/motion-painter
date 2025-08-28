@@ -104,7 +104,7 @@ async function putCounter(tx, id, value) {
  *  - quotaBytes: number (optional)
  *  - startEvictor: boolean (start periodic eviction)
  */
-export async function initStorage({ quota = DEFAULT_QUOTA_BYTES, startEvictor = true } = {}) {
+async function initStorage({ quota = DEFAULT_QUOTA_BYTES, startEvictor = true } = {}) {
   quotaBytes = quota;
   await openDB();
   ensureBroadcast();
@@ -131,7 +131,7 @@ export async function initStorage({ quota = DEFAULT_QUOTA_BYTES, startEvictor = 
  * }
  * Returns: { ok:true, seq } or { ok:false, reason }
  */
-export async function putInboundArtifact(artifact) {
+async function putInboundArtifact(artifact) {
   const db = await openDB();
   const now = new Date().toISOString();
   const art = {
@@ -145,6 +145,7 @@ export async function putInboundArtifact(artifact) {
   if (!art.meta.sizeBytes) {
     // try to estimate size
     if (art.blob && typeof art.blob.size === 'number') art.meta.sizeBytes = art.blob.size;
+    else if (art.data) art.meta.sizeBytes = JSON.stringify(art.data).length;
     else art.meta.sizeBytes = 0;
   }
 
@@ -204,7 +205,7 @@ export async function putInboundArtifact(artifact) {
  * Atomically reserve the artifact and append to work stream.
  * Returns { ok:true, leaseToken, workSeq } or { ok:false, reason }
  */
-export async function promoteToWork(key, { consumerId = 'unknown', priority = 0, leaseMs = 5 * 60 * 1000 } = {}) {
+async function promoteToWork(key, { consumerId = 'unknown', priority = 0, leaseMs = 5 * 60 * 1000 } = {}) {
   const db = await openDB();
   const now = Date.now();
   return new Promise((resolve, reject) => {
@@ -253,7 +254,7 @@ export async function promoteToWork(key, { consumerId = 'unknown', priority = 0,
  * reserveArtifact(key, { owner, leaseMs }) - short lease
  * Returns { ok:true, leaseToken, reservedUntil } or { ok:false, reason }
  */
-export async function reserveArtifact(key, { owner = 'unknown', leaseMs = 5 * 60 * 1000 } = {}) {
+async function reserveArtifact(key, { owner = 'unknown', leaseMs = 5 * 60 * 1000 } = {}) {
   const db = await openDB();
   const now = Date.now();
   return new Promise((resolve) => {
@@ -285,7 +286,7 @@ export async function reserveArtifact(key, { owner = 'unknown', leaseMs = 5 * 60
 /**
  * releaseReservation(key, leaseToken)
  */
-export async function releaseReservation(key, leaseToken) {
+async function releaseReservation(key, leaseToken) {
   const db = await openDB();
   return new Promise((resolve) => {
     const tx = db.transaction(ARTIFACTS_STORE, 'readwrite');
@@ -312,7 +313,7 @@ export async function releaseReservation(key, leaseToken) {
  * pinArtifact(key, { owner, type = 'soft' })
  * soft: eligible for auto-demotion under pressure; hard: not auto-evictable
  */
-export async function pinArtifact(key, { owner = 'user', type = 'soft' } = {}) {
+async function pinArtifact(key, { owner = 'user', type = 'soft' } = {}) {
   const db = await openDB();
   return new Promise((resolve) => {
     const tx = db.transaction([ARTIFACTS_STORE, COUNTERS_STORE], 'readwrite');
@@ -353,7 +354,7 @@ export async function pinArtifact(key, { owner = 'user', type = 'soft' } = {}) {
 /**
  * unpinArtifact(key)
  */
-export async function unpinArtifact(key) {
+async function unpinArtifact(key) {
   const db = await openDB();
   return new Promise((resolve) => {
     const tx = db.transaction([ARTIFACTS_STORE, COUNTERS_STORE], 'readwrite');
@@ -384,7 +385,7 @@ export async function unpinArtifact(key) {
 /**
  * getArtifact(key) -> artifact object or null
  */
-export async function getArtifact(key) {
+async function getArtifact(key) {
   const db = await openDB();
   return new Promise((resolve) => {
     const tx = db.transaction(ARTIFACTS_STORE, 'readonly');
@@ -401,7 +402,7 @@ export async function getArtifact(key) {
  * mode = 'clone' => returns logical clone (metadata-only)
  * mode = 'deepcopy' => makes deep copy of blob and returns new artifact key (costly)
  */
-export async function getReadHandle(key, { mode = 'ref', owner = 'unknown' } = {}) {
+async function getReadHandle(key, { mode = 'ref', owner = 'unknown' } = {}) {
   const art = await getArtifact(key);
   if (!art) return { ok: false, reason: 'NOT_FOUND' };
 
@@ -451,10 +452,79 @@ export async function getReadHandle(key, { mode = 'ref', owner = 'unknown' } = {
 }
 
 /**
+ * getSimilar(srcMeta, { timeWindow, phashThreshold }) - fallback lookup
+ */
+async function getSimilar(srcMeta, { timeWindow = 5000, phashThreshold = 0.85 } = {}) {
+  const db = await openDB();
+  return new Promise((resolve) => {
+    const tx = db.transaction(ARTIFACTS_STORE, 'readonly');
+    const store = tx.objectStore(ARTIFACTS_STORE);
+    const results = [];
+    
+    // Simple similarity search - in production you'd want more sophisticated indexing
+    const req = store.openCursor();
+    req.onsuccess = (ev) => {
+      const cursor = ev.target.result;
+      if (!cursor) {
+        resolve(results);
+        return;
+      }
+      
+      const art = cursor.value;
+      if (art.meta?.srcHash === srcMeta.srcHash) {
+        results.push(art);
+      } else if (srcMeta.timestamp && art.meta?.timestamp) {
+        const timeDiff = Math.abs(art.meta.timestamp - srcMeta.timestamp);
+        if (timeDiff <= timeWindow) {
+          results.push(art);
+        }
+      }
+      
+      cursor.continue();
+    };
+    req.onerror = () => resolve([]);
+  });
+}
+
+/**
+ * acquireForProcessing(key, { allowFallback }) - atomic promote with fallback
+ */
+async function acquireForProcessing(key, { allowFallback = true, consumerId = 'processor' } = {}) {
+  // Try atomic promotion first
+  const promoteResult = await promoteToWork(key, { consumerId });
+  if (promoteResult.ok) {
+    return { ok: true, type: 'promoted', ...promoteResult };
+  }
+  
+  if (!allowFallback) {
+    return { ok: false, reason: 'PROMOTION_FAILED', details: promoteResult };
+  }
+  
+  // Fallback to similarity search
+  const artifact = await getArtifact(key);
+  if (!artifact) {
+    return { ok: false, reason: 'NOT_FOUND' };
+  }
+  
+  const similar = await getSimilar(artifact.meta);
+  if (similar.length > 0) {
+    // Try to promote the first similar artifact
+    for (const candidate of similar) {
+      const fallbackPromote = await promoteToWork(candidate.key, { consumerId });
+      if (fallbackPromote.ok) {
+        return { ok: true, type: 'fallback', originalKey: key, ...fallbackPromote };
+      }
+    }
+  }
+  
+  return { ok: false, reason: 'NO_ALTERNATIVES' };
+}
+
+/**
  * checkQuotaAndEvict()
  * Evict oldest inbound items until totalBytes <= quotaBytes (or nothing evictable).
  */
-export async function checkQuotaAndEvict() {
+async function checkQuotaAndEvict() {
   const db = await openDB();
   // read totalBytes
   const total = await getCounter(db, 'totalBytes') || 0;
@@ -534,7 +604,56 @@ export async function checkQuotaAndEvict() {
   });
 }
 
-export function startEvictorLoop(ms = evictIntervalMs) {
+/**
+ * getStorageStats() - get current storage statistics
+ */
+async function getStorageStats() {
+  const db = await openDB();
+  const totalBytes = await getCounter(db, 'totalBytes') || 0;
+  const pinnedBytes = await getCounter(db, 'pinnedBytes') || 0;
+  
+  // Count artifacts and streams
+  const tx = db.transaction([ARTIFACTS_STORE, STREAMS_STORE], 'readonly');
+  const artifacts = tx.objectStore(ARTIFACTS_STORE);
+  const streams = tx.objectStore(STREAMS_STORE);
+  
+  return new Promise((resolve) => {
+    let artifactCount = 0;
+    let inboundCount = 0;
+    let workCount = 0;
+    
+    const artifactReq = artifacts.count();
+    artifactReq.onsuccess = () => {
+      artifactCount = artifactReq.result;
+      
+      const streamReq = streams.openCursor();
+      streamReq.onsuccess = (ev) => {
+        const cursor = ev.target.result;
+        if (!cursor) {
+          resolve({
+            totalBytes,
+            pinnedBytes,
+            quotaBytes,
+            utilization: totalBytes / quotaBytes,
+            artifactCount,
+            inboundCount,
+            workCount,
+            freeBytes: Math.max(0, quotaBytes - totalBytes)
+          });
+          return;
+        }
+        
+        const entry = cursor.value;
+        if (entry.stream === 'inbound') inboundCount++;
+        else if (entry.stream === 'work') workCount++;
+        
+        cursor.continue();
+      };
+    };
+  });
+}
+
+function startEvictorLoop(ms = evictIntervalMs) {
   if (evictIntervalId) clearInterval(evictIntervalId);
   evictIntervalId = setInterval(() => {
     checkQuotaAndEvict().catch(err => console.warn('evict loop error', err));
@@ -542,7 +661,7 @@ export function startEvictorLoop(ms = evictIntervalMs) {
   return evictIntervalId;
 }
 
-export function stopEvictorLoop() {
+function stopEvictorLoop() {
   if (evictIntervalId) clearInterval(evictIntervalId);
   evictIntervalId = null;
 }
@@ -552,11 +671,42 @@ function generateToken() {
   return `${Date.now()}-${Math.random().toString(36).slice(2,9)}`;
 }
 
-// Export helpers
+// Export functions for ES6 modules
 export {
+  initStorage,
+  putInboundArtifact,
+  promoteToWork,
+  reserveArtifact,
+  releaseReservation,
+  pinArtifact,
+  unpinArtifact,
+  getArtifact,
+  getReadHandle,
+  getSimilar,
+  acquireForProcessing,
+  checkQuotaAndEvict,
+  getStorageStats,
+  startEvictorLoop,
+  stopEvictorLoop,
   getCounter,
-  checkQuotaAndEvict as _checkQuotaAndEvict,
-  startEvictorLoop as startEvictor,
-  stopEvictorLoop as stopEvictor,
   quotaBytes as currentQuotaBytes
 };
+
+// Export functions for classic workers (global scope)
+if (typeof self !== 'undefined') {
+  self.initStorage = initStorage;
+  self.putInboundArtifact = putInboundArtifact;
+  self.promoteToWork = promoteToWork;
+  self.reserveArtifact = reserveArtifact;
+  self.releaseReservation = releaseReservation;
+  self.pinArtifact = pinArtifact;
+  self.unpinArtifact = unpinArtifact;
+  self.getArtifact = getArtifact;
+  self.getReadHandle = getReadHandle;
+  self.getSimilar = getSimilar;
+  self.acquireForProcessing = acquireForProcessing;
+  self.checkQuotaAndEvict = checkQuotaAndEvict;
+  self.getStorageStats = getStorageStats;
+  self.startEvictorLoop = startEvictorLoop;
+  self.stopEvictorLoop = stopEvictorLoop;
+}
