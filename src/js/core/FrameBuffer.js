@@ -341,7 +341,7 @@ export class FrameBuffer {
     // Trigger eviction hook: convert old GL texture -> ImageBitmap then call onEvict(imageBitmap, meta)
     if (this.onEvict && this.textures[evictedIndex]) {
       try {
-        console.debug('evict:readback-start', { index: evictedIndex, frameNumber: this.frameCount });
+        // console.debug('evict:readback-start', { index: evictedIndex, frameNumber: this.frameCount });
         // Capture reference sizes
         const srcWidth = this.width || CONFIG.DEFAULT_RESOLUTION.width;
         const srcHeight = this.height || CONFIG.DEFAULT_RESOLUTION.height;
@@ -355,7 +355,7 @@ export class FrameBuffer {
             }
             const meta = { index: evictedIndex, frameNumber: this.frameCount, timestamp: Date.now(), readW: imageBitmap.width, readH: imageBitmap.height };
             try {
-              console.debug('evict:forwarding', meta);
+              // console.debug('evict:forwarding', meta);
               // Ownership of imageBitmap moves to the hook/consumer (transferable). Consumer must close when done.
               this.onEvict(imageBitmap, meta);
             } catch (err) {

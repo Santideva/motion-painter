@@ -5,12 +5,130 @@
   display: flex;
   flex-direction: column;
   gap: 10px;
+  transition: transform 0.3s ease, opacity 0.3s ease;
+}
+
+.controls.hidden {
+  transform: translateX(-100%);
+  opacity: 0;
+  pointer-events: none;
 }
 
 .control {
   background: #0f1113;
   padding: 10px;
   border-radius: 8px;
+}
+
+/* Viewport Controls */
+.viewport-controls {
+  border: 1px solid #333;
+}
+
+.viewport-controls.collapsed .viewport-content {
+  display: none;
+}
+
+.viewport-header {
+  cursor: pointer;
+  user-select: none;
+  transition: background-color 0.2s ease;
+}
+
+.viewport-header:hover {
+  background-color: #1a1e21;
+}
+
+.viewport-header label {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 0;
+  cursor: pointer;
+}
+
+.toggle-icon {
+  font-size: 10px;
+  transition: transform 0.2s ease;
+}
+
+.viewport-content {
+  margin-top: 8px;
+}
+
+.viewport-content select {
+  background: #1a1e21;
+  color: #ddd;
+  border: 1px solid #333;
+  border-radius: 4px;
+  padding: 4px 8px;
+  font-size: 12px;
+}
+
+.compact {
+  padding: 4px 8px;
+  font-size: 11px;
+  margin-left: 4px;
+}
+
+/* Viewport Size Classes */
+.viewport-small .canvas-panel {
+  max-width: 640px;
+  max-height: 480px;
+}
+
+.viewport-medium .canvas-panel {
+  max-width: 800px;
+  max-height: 600px;
+}
+
+.viewport-large .canvas-panel {
+  max-width: 1200px;
+  max-height: 900px;
+}
+
+.viewport-fit .canvas-panel {
+  flex: 1;
+  max-width: none;
+  max-height: 90vh;
+}
+
+.viewport-fullscreen {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 1000;
+  background: #000;
+  padding: 0;
+  gap: 0;
+}
+
+.viewport-fullscreen .canvas-panel {
+  width: 100vw;
+  height: 100vh;
+  max-width: none;
+  max-height: none;
+  border-radius: 0;
+  padding: 0;
+}
+
+.viewport-fullscreen .controls {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  width: 300px;
+  max-width: 300px;
+  background: rgba(15, 17, 19, 0.9);
+  backdrop-filter: blur(10px);
+  border: 1px solid #333;
+  border-radius: 8px;
+  z-index: 1001;
+}
+
+.viewport-fullscreen .controls.hidden {
+  transform: translateX(calc(100% + 20px));
 }
 
 label {
@@ -88,6 +206,13 @@ button:active {
     overflow-y: auto;
   }
 
+  .viewport-fullscreen .controls {
+    top: 5px;
+    right: 5px;
+    width: 280px;
+    max-width: 280px;
+  }
+
   .control {
     padding: 8px;
   }
@@ -104,6 +229,11 @@ button:active {
     padding: 6px 8px;
     font-size: 12px;
   }
+
+  .compact {
+    padding: 3px 6px;
+    font-size: 10px;
+  }
 }
 
 @media (max-width: 480px) {
@@ -116,6 +246,11 @@ button:active {
     min-height: 250px;
   }
 
+  .viewport-fullscreen .controls {
+    width: 250px;
+    max-width: 250px;
+  }
+
   .row {
     flex-wrap: wrap;
     gap: 4px;
@@ -124,6 +259,10 @@ button:active {
   button {
     flex: 1;
     min-width: 80px;
+  }
+
+  .compact {
+    min-width: 60px;
   }
 }
 
@@ -143,6 +282,7 @@ html, body {
   gap: 12px;
   padding: 12px;
   box-sizing: border-box;
+  transition: all 0.3s ease;
 }
 
 .canvas-panel {
@@ -154,6 +294,7 @@ html, body {
   border-radius: 8px;
   padding: 8px;
   box-shadow: 0 6px 30px rgba(0, 0, 0, 0.7);
+  transition: all 0.3s ease;
 }
 
 canvas {
@@ -162,4 +303,5 @@ canvas {
   max-height: 90vh;
   border-radius: 6px;
   display: block;
+  transition: all 0.3s ease;
 }

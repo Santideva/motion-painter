@@ -3,13 +3,9 @@
 
 export class PreprocessorWorker {
   constructor() {
-    try {
-      this.worker = new Worker('./preprocessor.worker.js');
-    } catch (err) {
-      console.error('PreprocessorWorker: Failed to create worker', err);
-      throw err;
-    }
-
+    console.log('PreprocessorWorker: Creating worker...');
+    
+    // Initialize all properties first
     this.jobCounter = 0;
     this.pending = new Map();
     this.workerReady = false;
@@ -32,17 +28,52 @@ export class PreprocessorWorker {
       backpressureActive: false
     };
 
+    // Create worker with correct path resolution
+    try {
+      // Fix: Use absolute path from public folder root
+      this.worker = new Worker('/src/js/core/preprocessor.worker.js');
+      console.log('PreprocessorWorker: Worker created successfully');
+    } catch (err) {
+      console.error('PreprocessorWorker: Failed to create worker', err);
+      throw err;
+    }
+
+    // Add timeout for worker readiness
+    this.readyTimeout = setTimeout(() => {
+      if (!this.workerReady) {
+        console.error('PreprocessorWorker: Worker failed to become ready within 10 seconds');
+        console.log('PreprocessorWorker: Current state:', {
+          workerReady: this.workerReady,
+          queuedFrames: this.queuedFrames.length,
+          pendingJobs: this.pending.size
+        });
+      }
+    }, 10000);
+
+    // Set up message handler
     this.worker.onmessage = (ev) => {
       const data = ev.data || {};
+      console.log('PreprocessorWorker: Received message:', data.event, data);
       
       if (data.event === 'worker:ready') {
+        clearTimeout(this.readyTimeout);
         this.workerReady = true;
         console.log('PreprocessorWorker: worker is ready, processing queued frames');
+        
+        // Add detailed startup diagnostics
+        const metrics = this.getMetrics();
+        console.log('Worker startup diagnostics:', {
+          queuedFrames: metrics.queuedFrames,
+          maxQueueSize: metrics.maxQueueSize,
+          capacity: this.getCapacityStatus(),
+          canAccept: this.canAcceptFrames()
+        });
         this._processQueuedFrames();
         
       } else if (data.event === 'worker:error') {
         console.error('PreprocessorWorker: worker initialization error', data.error);
         this.workerReady = false;
+        clearTimeout(this.readyTimeout);
         
       } else if (data.event === 'artifact:ready') {
         console.info('PreprocessorWorker: artifact ready', data.jobId, data.keys || data.key);
@@ -60,10 +91,18 @@ export class PreprocessorWorker {
 
     this.worker.onerror = (ev) => {
       console.error('PreprocessorWorker: worker error', ev.message || ev);
+      console.error('PreprocessorWorker: worker error details:', {
+        filename: ev.filename,
+        lineno: ev.lineno,
+        colno: ev.colno,
+        error: ev.error
+      });
+      clearTimeout(this.readyTimeout);
     };
 
     this.worker.onmessageerror = (ev) => {
       console.error('PreprocessorWorker: worker message error', ev);
+      clearTimeout(this.readyTimeout);
     };
   }
 
@@ -161,8 +200,8 @@ export class PreprocessorWorker {
   _findVictimFrame() {
     // Find the frame with lowest priority, or oldest if priorities are equal
     let victimIndex = 0;
-    let lowestPriority = this.queuedFrames[0].priority;
-    let oldestTime = this.queuedFrames[0].timestamp;
+    let lowestPriority = this.queuedFrames[0]?.priority || 0;
+    let oldestTime = this.queuedFrames[0]?.timestamp || Date.now();
     
     for (let i = 1; i < this.queuedFrames.length; i++) {
       const frame = this.queuedFrames[i];
@@ -275,6 +314,21 @@ export class PreprocessorWorker {
 
   // Enhanced metrics including backpressure status
   getMetrics() {
+    // Defensive check to prevent undefined errors
+    if (!this.pending) {
+      console.warn('PreprocessorWorker.getMetrics: pending Map not initialized');
+      return {
+        workerReady: this.workerReady || false,
+        pending: 0,
+        queuedFrames: this.queuedFrames ? this.queuedFrames.length : 0,
+        maxQueueSize: this.maxQueueSize || 30,
+        totalJobs: this.jobCounter || 0,
+        droppedCount: this.droppedCount || 0,
+        backpressureActive: this.backpressureActive || false,
+        ...this.metrics
+      };
+    }
+
     return {
       workerReady: this.workerReady,
       pending: this.pending.size,
@@ -292,7 +346,7 @@ export class PreprocessorWorker {
     return this.workerReady && !this._shouldApplyBackpressure();
   }
 
-  // Method to get processing capacity status - THIS WAS MISSING
+  // Method to get processing capacity status
   getCapacityStatus() {
     const utilization = this.metrics.queueUtilization;
     
@@ -304,6 +358,10 @@ export class PreprocessorWorker {
 
   terminate() {
     try {
+      if (this.readyTimeout) {
+        clearTimeout(this.readyTimeout);
+      }
+
       // Clean up any queued frames
       this.queuedFrames.forEach(({ imageBitmap }) => {
         try { 

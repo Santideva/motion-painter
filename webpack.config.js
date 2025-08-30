@@ -22,6 +22,17 @@ module.exports = {
           }
         }
       },
+      // Add worker file handling
+      {
+        test: /\.worker\.js$/,
+        use: {
+          loader: 'worker-loader',
+          options: {
+            filename: '[name].[contenthash].worker.js',
+            publicPath: '/dist/'
+          }
+        }
+      },
       {
         test: /\.css$/,
         use: ['style-loader', 'css-loader']
@@ -44,13 +55,24 @@ module.exports = {
     }),
     new CopyWebpackPlugin({
       patterns: [
-        { from: 'src/assets', to: 'assets', noErrorOnMissing: true }
+        { from: 'src/assets', to: 'assets', noErrorOnMissing: true },
+        // Copy worker files to be accessible via direct URL
+        { from: 'src/js/core/*.worker.js', to: 'src/js/core/[name][ext]' }
       ]
     })
   ],
   devServer: {
-    static: './dist',
+    static: [
+      './dist',
+      // Serve src directory for worker files during development
+      { directory: path.join(__dirname, 'src'), publicPath: '/src' }
+    ],
     hot: true,
-    server: 'https' // Updated syntax for HTTPS - required for camera access
+    server: 'https', // Updated syntax for HTTPS - required for camera access
+    headers: {
+      // Add proper headers for worker files
+      'Cross-Origin-Embedder-Policy': 'require-corp',
+      'Cross-Origin-Opener-Policy': 'same-origin'
+    }
   }
 };

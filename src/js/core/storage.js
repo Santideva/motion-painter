@@ -1,6 +1,6 @@
 // storage.js
 // IndexedDB-backed Storage Buffer for motion-painter artifacts.
-// Usage: import { initStorage, putInboundArtifact, promoteToWork, reserveArtifact, pinArtifact, releaseReservation, getArtifact, getReadHandle, startEvictor, stopEvictor } from './storage.js';
+// Enhanced for Web Worker compatibility
 
 const DB_NAME = 'motionPainterDB';
 const DB_VERSION = 1;
@@ -17,33 +17,62 @@ let evictIntervalId = null;
 let evictIntervalMs = 10000; // periodic eviction run
 let quotaBytes = DEFAULT_QUOTA_BYTES;
 
+console.log('storage.js: Loading storage module...');
+
 function openDB() {
   if (dbPromise) return dbPromise;
+  
+  console.log('storage.js: Opening IndexedDB...');
   dbPromise = new Promise((resolve, reject) => {
     const req = indexedDB.open(DB_NAME, DB_VERSION);
+    
     req.onupgradeneeded = (ev) => {
+      console.log('storage.js: Upgrading database schema...');
       const db = ev.target.result;
+      
       if (!db.objectStoreNames.contains(ARTIFACTS_STORE)) {
+        console.log('storage.js: Creating artifacts store...');
         const s = db.createObjectStore(ARTIFACTS_STORE, { keyPath: 'key' });
         s.createIndex('srcHash', 'meta.srcHash', { unique: false });
         s.createIndex('pinned', 'meta.pinned', { unique: false });
       }
+      
       if (!db.objectStoreNames.contains(STREAMS_STORE)) {
+        console.log('storage.js: Creating streams store...');
         db.createObjectStore(STREAMS_STORE, { keyPath: 'seq', autoIncrement: true });
         // stream entries: { seq(auto), stream: 'inbound'|'work', key, priority, createdAt }
       }
+      
       if (!db.objectStoreNames.contains(COUNTERS_STORE)) {
+        console.log('storage.js: Creating counters store...');
         db.createObjectStore(COUNTERS_STORE, { keyPath: 'id' });
       }
     };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
+    
+    req.onsuccess = () => {
+      console.log('storage.js: Database opened successfully');
+      resolve(req.result);
+    };
+    
+    req.onerror = () => {
+      console.error('storage.js: Database open failed:', req.error);
+      reject(req.error);
+    };
   });
+  
   return dbPromise;
 }
 
 function ensureBroadcast() {
-  if (!broadcast) broadcast = new BroadcastChannel(BROADCAST_CHANNEL_NAME);
+  if (!broadcast) {
+    try {
+      broadcast = new BroadcastChannel(BROADCAST_CHANNEL_NAME);
+      console.log('storage.js: BroadcastChannel created');
+    } catch (err) {
+      console.warn('storage.js: BroadcastChannel creation failed:', err);
+      broadcast = null;
+    }
+  }
   return broadcast;
 }
 
@@ -69,7 +98,7 @@ async function getCounter(txOrDb, id) {
   // If it's a database (has transaction)
   if (typeof txOrDb.transaction === 'function') {
     const db = txOrDb;
-    return new Promise((resolve, reject) => {
+    return new Promise((resolve) => {
       try {
         const tx = db.transaction(COUNTERS_STORE, 'readonly');
         const req = tx.objectStore(COUNTERS_STORE).get(id);
@@ -105,23 +134,54 @@ async function putCounter(tx, id, value) {
  *  - startEvictor: boolean (start periodic eviction)
  */
 async function initStorage({ quota = DEFAULT_QUOTA_BYTES, startEvictor = true } = {}) {
-  quotaBytes = quota;
-  await openDB();
-  ensureBroadcast();
-  // ensure totalBytes counter exists
-  const db = await openDB();
-  const tx = db.transaction(COUNTERS_STORE, 'readwrite');
-  const s = tx.objectStore(COUNTERS_STORE);
-  const getReq = s.get('totalBytes');
-  getReq.onsuccess = () => {
-    if (!getReq.result) s.put({ id: 'totalBytes', value: 0 });
-  };
-  const pinnedReq = s.get('pinnedBytes');
-  pinnedReq.onsuccess = () => {
-    if (!pinnedReq.result) s.put({ id: 'pinnedBytes', value: 0 });
-  };
-  tx.oncomplete = () => { if (startEvictor) startEvictorLoop(); };
-  tx.onerror = () => { console.warn('initStorage: counters init tx failed'); if (startEvictor) startEvictorLoop(); };
+  console.log('storage.js: Initializing storage with quota:', quota);
+  
+  try {
+    quotaBytes = quota;
+    await openDB();
+    ensureBroadcast();
+    
+    // ensure totalBytes counter exists
+    const db = await openDB();
+    const tx = db.transaction(COUNTERS_STORE, 'readwrite');
+    const s = tx.objectStore(COUNTERS_STORE);
+    
+    const getReq = s.get('totalBytes');
+    getReq.onsuccess = () => {
+      if (!getReq.result) {
+        console.log('storage.js: Initializing totalBytes counter');
+        s.put({ id: 'totalBytes', value: 0 });
+      }
+    };
+    
+    const pinnedReq = s.get('pinnedBytes');
+    pinnedReq.onsuccess = () => {
+      if (!pinnedReq.result) {
+        console.log('storage.js: Initializing pinnedBytes counter');
+        s.put({ id: 'pinnedBytes', value: 0 });
+      }
+    };
+    
+    return new Promise((resolve, reject) => {
+      tx.oncomplete = () => {
+        console.log('storage.js: Storage initialization completed');
+        if (startEvictor) {
+          console.log('storage.js: Starting evictor loop');
+          startEvictorLoop();
+        }
+        resolve();
+      };
+      
+      tx.onerror = () => {
+        console.warn('storage.js: Counters init tx failed:', tx.error);
+        if (startEvictor) startEvictorLoop();
+        reject(tx.error);
+      };
+    });
+  } catch (err) {
+    console.error('storage.js: Storage initialization failed:', err);
+    throw err;
+  }
 }
 
 /**
@@ -166,7 +226,8 @@ async function putInboundArtifact(artifact) {
         artifacts.put(existing);
         tx.oncomplete = () => {
           // find seq for existing inbound entry? We keep idempotent writes simple: broadcast ready
-          ensureBroadcast().postMessage({ event: 'artifact:ready', key: art.key, meta: existing.meta });
+          const bc = ensureBroadcast();
+          if (bc) bc.postMessage({ event: 'artifact:ready', key: art.key, meta: existing.meta });
           resolve({ ok: true, seq: null, reused: true });
         };
         return;
@@ -187,7 +248,8 @@ async function putInboundArtifact(artifact) {
 
       tx.oncomplete = () => {
         // broadcast artifact ready
-        ensureBroadcast().postMessage({ event: 'artifact:ready', key: art.key, meta: art.meta });
+        const bc = ensureBroadcast();
+        if (bc) bc.postMessage({ event: 'artifact:ready', key: art.key, meta: art.meta });
         // schedule eviction check (async)
         checkQuotaAndEvict().catch(err => console.warn('evict check failed', err));
         resolve({ ok: true, seq: streamReq.result });
@@ -239,7 +301,8 @@ async function promoteToWork(key, { consumerId = 'unknown', priority = 0, leaseM
       const addReq = streams.add(entry);
 
       tx.oncomplete = () => {
-        ensureBroadcast().postMessage({ event: 'artifact:promoted', key, consumerId, workSeq: addReq.result });
+        const bc = ensureBroadcast();
+        if (bc) bc.postMessage({ event: 'artifact:promoted', key, consumerId, workSeq: addReq.result });
         resolve({ ok: true, leaseToken, workSeq: addReq.result });
       };
     };
@@ -275,7 +338,8 @@ async function reserveArtifact(key, { owner = 'unknown', leaseMs = 5 * 60 * 1000
       art.meta.leaseToken = leaseToken;
       s.put(art);
       tx.oncomplete = () => {
-        ensureBroadcast().postMessage({ event: 'artifact:reserved', key, owner, reservedUntil: art.meta.reservedUntil });
+        const bc = ensureBroadcast();
+        if (bc) bc.postMessage({ event: 'artifact:reserved', key, owner, reservedUntil: art.meta.reservedUntil });
         resolve({ ok: true, leaseToken, reservedUntil: art.meta.reservedUntil });
       };
     };
@@ -303,7 +367,11 @@ async function releaseReservation(key, leaseToken) {
       art.meta.reservedUntil = 0;
       art.meta.status = 'available';
       s.put(art);
-      tx.oncomplete = () => { ensureBroadcast().postMessage({ event: 'artifact:released', key }); resolve({ ok: true }); };
+      tx.oncomplete = () => { 
+        const bc = ensureBroadcast();
+        if (bc) bc.postMessage({ event: 'artifact:released', key });
+        resolve({ ok: true });
+      };
     };
     req.onerror = () => resolve({ ok: false, reason: 'ERROR' });
   });
@@ -343,7 +411,11 @@ async function pinArtifact(key, { owner = 'user', type = 'soft' } = {}) {
         art.meta.pinOwner = owner;
         artifacts.put(art);
         counters.put({ id: 'pinnedBytes', value: pinnedBytes + size });
-        tx.oncomplete = () => { ensureBroadcast().postMessage({ event: 'artifact:pinned', key, owner, type }); resolve({ ok: true }); };
+        tx.oncomplete = () => { 
+          const bc = ensureBroadcast();
+          if (bc) bc.postMessage({ event: 'artifact:pinned', key, owner, type });
+          resolve({ ok: true });
+        };
       };
       pbReq.onerror = () => resolve({ ok: false, reason: 'ERROR' });
     };
@@ -374,7 +446,11 @@ async function unpinArtifact(key) {
         delete art.meta.pinOwner;
         artifacts.put(art);
         counters.put({ id: 'pinnedBytes', value: Math.max(0, pinnedBytes - size) });
-        tx.oncomplete = () => { ensureBroadcast().postMessage({ event: 'artifact:unpinned', key }); resolve({ ok: true }); };
+        tx.oncomplete = () => { 
+          const bc = ensureBroadcast();
+          if (bc) bc.postMessage({ event: 'artifact:unpinned', key });
+          resolve({ ok: true });
+        };
       };
       pbReq.onerror = () => resolve({ ok: false, reason: 'ERROR' });
     };
@@ -584,7 +660,8 @@ async function checkQuotaAndEvict() {
             const newTotal = Math.max(0, cur - size);
             counters.put({ id: 'totalBytes', value: newTotal });
           };
-          ensureBroadcast().postMessage({ event: 'artifact:evicted', key: art.key, freedBytes: size });
+          const bc = ensureBroadcast();
+          if (bc) bc.postMessage({ event: 'artifact:evicted', key: art.key, freedBytes: size });
           // Stop early if we freed enough
           if ((total - freed) <= quotaBytes || freed >= EVICT_BATCH * 1024 * 1024) {
             const finalTotalReq = counters.get('totalBytes');
@@ -671,8 +748,10 @@ function generateToken() {
   return `${Date.now()}-${Math.random().toString(36).slice(2,9)}`;
 }
 
+console.log('storage.js: All functions defined, setting up exports...');
+
 // Export functions for ES6 modules
-export {
+const storageAPI = {
   initStorage,
   putInboundArtifact,
   promoteToWork,
@@ -689,12 +768,18 @@ export {
   startEvictorLoop,
   stopEvictorLoop,
   getCounter,
-  quotaBytes as currentQuotaBytes
+  quotaBytes: () => quotaBytes
 };
 
+// Export for ES6 modules if available
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = storageAPI;
+}
+
 // Export functions for classic workers (global scope)
-if (typeof self !== 'undefined') {
-  self.initStorage = initStorage;
+if (typeof self !== 'undefined' && typeof importScripts === 'function') {
+  console.log('storage.js: Setting up worker globals...');
+  self.onstorage = initStorage;
   self.putInboundArtifact = putInboundArtifact;
   self.promoteToWork = promoteToWork;
   self.reserveArtifact = reserveArtifact;
@@ -709,4 +794,7 @@ if (typeof self !== 'undefined') {
   self.getStorageStats = getStorageStats;
   self.startEvictorLoop = startEvictorLoop;
   self.stopEvictorLoop = stopEvictorLoop;
+  console.log('storage.js: Worker globals set up successfully');
 }
+
+console.log('storage.js: Module loaded successfully');

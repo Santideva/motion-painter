@@ -78,7 +78,21 @@ export class FrameEvictionHook {
 
     // Adaptive frame skipping based on system load
     if (this._shouldSkipFrame()) {
-      console.debug('FrameEvictionHook: Skipping frame due to adaptive processing');
+      // console.debug('FrameEvictionHook: Skipping frame due to adaptive processing');
+            if (this.preprocessor) {
+        const metrics = this.preprocessor.getMetrics();
+        const capacity = this.preprocessor.getCapacityStatus();
+        const canAccept = this.preprocessor.canAcceptFrames();
+        
+        // console.log('Worker diagnostics:', {
+        //   metrics,
+        //   capacity,
+        //   canAccept,
+        //   workerReady: metrics.workerReady,
+        //   queuedFrames: metrics.queuedFrames,
+        //   backpressureActive: metrics.backpressureActive
+        // });
+      }
       try { imageBitmap.close(); } catch (e) {}
       this.metrics.framesSkipped++;
       return;
@@ -124,11 +138,20 @@ export class FrameEvictionHook {
     // Skip frames based on current frame skip ratio
     this.frameCounter++;
     if (this.frameCounter % this.frameSkipRatio !== 0) {
+      console.debug(`FrameEvictionHook: Skipping frame ${this.frameCounter} (skip ratio ${this.frameSkipRatio})`);
       return true;
     }
 
     // Check preprocessor capacity
-    if (!this.preprocessor.canAcceptFrames()) {
+    const canAccept = this.preprocessor.canAcceptFrames();
+    if (!canAccept) {
+      const metrics = this.preprocessor.getMetrics();
+      // console.debug(`FrameEvictionHook: Skipping frame - preprocessor can't accept frames:`, {
+      //   workerReady: metrics.workerReady,
+      //   backpressureActive: metrics.backpressureActive,
+      //   queueUtilization: metrics.queueUtilization,
+      //   dropRate: metrics.dropRate
+      // }); 
       return true;
     }
 

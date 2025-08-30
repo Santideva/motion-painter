@@ -124,37 +124,37 @@ class MotionPainter {
     }
   }
   
-  setupEventHandlers() {
-    // Controls event handlers
-    this.controls.on('paramChange', (data) => {
-      this.handleParamChange(data);
-    });
-    
-    this.controls.on('action', (data) => {
-      this.handleAction(data.action);
-    });
-    
-    // Media input ready callback
-    this.mediaInput.onSourceReady = () => {
-      this.startRendering();
-    };
-    
-    // Window resize handler
-    window.addEventListener('resize', () => {
-      if (this.isRendering) {
-        this.resizeCanvas();
-      }
-    });
-    
-    // Visibility change handler (pause when tab hidden)
-    document.addEventListener('visibilitychange', () => {
-      if (document.hidden && this.isRendering) {
-        this.pauseRendering();
-      } else if (!document.hidden && this.isRendering && !this.isPaused) {
-        this.resumeRendering();
-      }
-    });
-  }
+    setupEventHandlers() {
+      // Controls event handlers
+      this.controls.on('paramChange', (data) => {
+        this.handleParamChange(data);
+      });
+      
+      this.controls.on('action', (data) => {
+        this.handleAction(data.action);
+      });
+      
+      // Media input ready callback
+      this.mediaInput.onSourceReady = () => {
+        this.startRendering();
+      };
+      
+      // Window resize handler
+      window.addEventListener('resize', () => {
+        if (this.isRendering) {
+          this.resizeCanvas();
+        }
+      });
+      
+      // Visibility change handler (pause when tab hidden)
+      document.addEventListener('visibilitychange', () => {
+        if (document.hidden && this.isRendering) {
+          this.pauseRendering();
+        } else if (!document.hidden && this.isRendering && !this.isPaused) {
+          this.resumeRendering();
+        }
+      });
+    }
   
   handleParamChange(data) {
     const { param, value, allParams } = data;
@@ -374,6 +374,13 @@ displayHardwareLimitations() {
       case 'resetToOptimal':
         this.resetToOptimalSettings();
         break;
+
+      case 'viewportResize':
+        // Handle viewport size changes
+        if (this.isRendering) {
+          this.resizeCanvas();
+        }
+        break;
         
       default:
         console.warn('Unknown action:', action);
@@ -481,13 +488,98 @@ displayHardwareLimitations() {
       return;
     }
     
-    const { width, height } = this.webglRenderer.resizeCanvas(this.video);
+    // Get current viewport configuration
+    const viewportConfig = this.controls.getViewportConfiguration();
+    
+    // Calculate canvas size based on viewport settings and video aspect ratio
+    const videoAspectRatio = this.video.videoWidth / this.video.videoHeight;
+    const canvasPanel = document.querySelector('.canvas-panel');
+    
+    if (!canvasPanel) {
+      // Fallback to original resize behavior
+      const { width, height } = this.webglRenderer.resizeCanvas(this.video);
+      this.frameBuffer.resize(width, height);
+      this.controls.updateBufferInfo(width, height);
+      console.log(`Canvas resized to ${width}x${height}`);
+      return;
+    }
+    
+    // Get available space in canvas panel
+    const panelRect = canvasPanel.getBoundingClientRect();
+    const availableWidth = panelRect.width - 16; // Account for padding
+    const availableHeight = panelRect.height - 16;
+    
+    let targetWidth, targetHeight;
+    
+    // Calculate target size based on viewport mode
+    switch (viewportConfig.size) {
+      case 'small':
+        targetWidth = Math.min(640, availableWidth);
+        targetHeight = targetWidth / videoAspectRatio;
+        if (targetHeight > Math.min(480, availableHeight)) {
+          targetHeight = Math.min(480, availableHeight);
+          targetWidth = targetHeight * videoAspectRatio;
+        }
+        break;
+        
+      case 'medium':
+        targetWidth = Math.min(800, availableWidth);
+        targetHeight = targetWidth / videoAspectRatio;
+        if (targetHeight > Math.min(600, availableHeight)) {
+          targetHeight = Math.min(600, availableHeight);
+          targetWidth = targetHeight * videoAspectRatio;
+        }
+        break;
+        
+      case 'large':
+        targetWidth = Math.min(1200, availableWidth);
+        targetHeight = targetWidth / videoAspectRatio;
+        if (targetHeight > Math.min(900, availableHeight)) {
+          targetHeight = Math.min(900, availableHeight);
+          targetWidth = targetHeight * videoAspectRatio;
+        }
+        break;
+        
+      case 'fullscreen':
+        targetWidth = window.innerWidth;
+        targetHeight = window.innerHeight;
+        // Maintain aspect ratio
+        const screenAspectRatio = targetWidth / targetHeight;
+        if (videoAspectRatio > screenAspectRatio) {
+          targetHeight = targetWidth / videoAspectRatio;
+        } else {
+          targetWidth = targetHeight * videoAspectRatio;
+        }
+        break;
+        
+      case 'fit':
+      default:
+        // Fit to available space while maintaining aspect ratio
+        targetWidth = availableWidth;
+        targetHeight = targetWidth / videoAspectRatio;
+        if (targetHeight > availableHeight) {
+          targetHeight = availableHeight;
+          targetWidth = targetHeight * videoAspectRatio;
+        }
+        break;
+    }
+    
+    // Ensure minimum sizes
+    targetWidth = Math.max(320, Math.floor(targetWidth));
+    targetHeight = Math.max(240, Math.floor(targetHeight));
+    
+    // Store video dimensions for buffer memory calculations
+    this.controls.videoWidth = targetWidth;
+    this.controls.videoHeight = targetHeight;
+    
+    // Apply resize
+    const { width, height } = this.webglRenderer.resizeCanvas(this.video, targetWidth, targetHeight);
     this.frameBuffer.resize(width, height);
     
     // Update memory usage display after resize
-    this.controls.updateBufferInfo();
+    this.controls.updateBufferInfo(width, height);
     
-    console.log(`Canvas resized to ${width}x${height}`);
+    console.log(`Canvas resized to ${width}x${height} (${viewportConfig.size} mode)`);
   }
   
   renderLoop() {
@@ -552,7 +644,10 @@ displayHardwareLimitations() {
       bufferConfiguration: this.compositeRenderer.getBufferConfiguration(),
       optimizationSuggestions: this.compositeRenderer.getOptimizationSuggestions(),
       hardwareLimitations: this.hardwareLimitations,
-      memoryUsage: this.getMemoryUsage()
+      memoryUsage: this.getMemoryUsage(),
+      viewportConfiguration: this.controls.getViewportConfiguration(),
+      preprocessorMetrics: this.preprocessor ? this.preprocessor.getMetrics() : null,
+      processingCapacity: this.preprocessor ? this.preprocessor.getCapacityStatus() : 'unknown'
     };
   }
   

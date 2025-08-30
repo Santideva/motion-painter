@@ -2,81 +2,190 @@
 // Module worker that receives ImageBitmap frames from the main thread wrapper,
 // generates thumbnail + quick phash + manifest, writes artifacts to storage, and notifies main thread.
 
-importScripts('./storage.js');
+console.log('preprocessor.worker: Starting initialization...');
 
-const BROADCAST_CHANNEL = 'motion-painter-store';
-const bc = new BroadcastChannel(BROADCAST_CHANNEL);
-
-// Worker config
+// Define constants first
 const DEFAULT_THUMB_MAX_SIDE = 256;
+const BROADCAST_CHANNEL = 'motion-painter-store';
+const INIT_TIMEOUT_MS = 30000; // 30 seconds
 
-// Worker initialization state
+let bc;
 let storageReady = false;
+let initializationStarted = false;
 const pendingFrames = [];
 
-// Initialize storage from worker side (safe; on first call this will open db)
-self.initStorage({ quota: undefined, startEvictor: true })
-  .then(() => {
-    storageReady = true;
-    console.log('preprocessor.worker: storage initialized, processing pending frames');
-    
-    // Process any queued frames
-    const queued = [...pendingFrames];
-    pendingFrames.length = 0;
-    queued.forEach(frame => processFrame(frame));
-    
-    // Signal main thread that worker is ready
-    postMessage({ event: 'worker:ready' });
-  })
-  .catch(err => {
-    console.error('preprocessor.worker: storage init failed', err);
-    postMessage({ event: 'worker:error', error: err.message });
+// Enhanced error handling for imports
+try {
+  console.log('preprocessor.worker: Attempting to import storage.js...');
+  // Fix: Use absolute path from public folder root
+  importScripts('/src/js/core/storage.js');
+  console.log('preprocessor.worker: storage.js imported successfully');
+} catch (err) {
+  console.error('preprocessor.worker: CRITICAL - Failed to import storage.js', err);
+  postMessage({ 
+    event: 'worker:error', 
+    error: `Import failed: ${err.message}`,
+    details: {
+      name: err.name,
+      stack: err.stack,
+      phase: 'import'
+    }
   });
+}
+
+// Enhanced broadcast channel creation with error handling
+try {
+  bc = new BroadcastChannel(BROADCAST_CHANNEL);
+  console.log('preprocessor.worker: BroadcastChannel created');
+} catch (err) {
+  console.error('preprocessor.worker: Failed to create BroadcastChannel', err);
+  bc = null;
+}
+
+// Add timeout for storage initialization
+const initTimeout = setTimeout(() => {
+  if (!storageReady) {
+    console.error('preprocessor.worker: Storage initialization timed out after 30 seconds');
+    postMessage({ 
+      event: 'worker:error', 
+      error: 'Storage initialization timeout',
+      timeout: INIT_TIMEOUT_MS
+    });
+  }
+}, INIT_TIMEOUT_MS);
+
+// Enhanced storage initialization with better error handling
+function initializeStorage() {
+  console.log('preprocessor.worker: Starting storage initialization...');
+  
+  if (typeof self.onstorage !== 'function') {
+    clearTimeout(initTimeout);
+    const error = 'CRITICAL - onstorage function not found after import';
+    console.error('preprocessor.worker:', error);
+    console.error('preprocessor.worker: Available functions:', Object.keys(self).filter(k => k.includes('Storage') || k.includes('storage')));
+    postMessage({ 
+      event: 'worker:error', 
+      error,
+      availableFunctions: Object.keys(self).filter(k => typeof self[k] === 'function')
+    });
+    return;
+  }
+
+  console.log('preprocessor.worker: onstorage function found, calling...');
+  initializationStarted = true;
+  
+  self.onstorage({ quota: undefined, startEvictor: true })
+    .then(() => {
+      clearTimeout(initTimeout);
+      storageReady = true;
+      console.log('preprocessor.worker: Storage initialized successfully');
+      console.log('preprocessor.worker: Processing', pendingFrames.length, 'pending frames');
+      
+      // Process any queued frames
+      const queued = [...pendingFrames];
+      pendingFrames.length = 0;
+      queued.forEach(frame => {
+        console.log('preprocessor.worker: Processing queued frame', frame.jobId);
+        processFrame(frame);
+      });
+      
+      // Signal main thread that worker is ready
+      console.log('preprocessor.worker: Sending worker:ready message');
+      postMessage({ event: 'worker:ready' });
+    })
+    .catch(err => {
+      clearTimeout(initTimeout);
+      console.error('preprocessor.worker: Storage initialization failed:', err);
+      console.error('preprocessor.worker: Error details:', {
+        name: err.name,
+        message: err.message,
+        stack: err.stack
+      });
+      postMessage({ 
+        event: 'worker:error', 
+        error: err.message,
+        details: {
+          name: err.name,
+          stack: err.stack,
+          phase: 'storage_init'
+        }
+      });
+    });
+}
+
+// Initialize storage immediately if import was successful
+if (typeof self.onstorage === 'function') {
+  initializeStorage();
+} else {
+  // Wait a bit for import to complete, then try again
+  setTimeout(() => {
+    if (typeof self.onstorage === 'function') {
+      initializeStorage();
+    } else {
+      clearTimeout(initTimeout);
+      console.error('preprocessor.worker: onstorage still not available after delay');
+      postMessage({ 
+        event: 'worker:error', 
+        error: 'onstorage function not available after import delay'
+      });
+    }
+  }, 100);
+}
 
 // Utility: average hash (aHash) quick implementation
 async function computeAHashFromBitmap(imageBitmap, hashSize = 8) {
-  // We'll downscale to hashSize x hashSize, grayscale, compare to mean
-  const w = hashSize;
-  const h = hashSize;
-  const off = new OffscreenCanvas(w, h);
-  const ctx = off.getContext('2d');
-  ctx.drawImage(imageBitmap, 0, 0, w, h);
-  const id = ctx.getImageData(0, 0, w, h);
-  const data = id.data;
-  let sum = 0;
-  const vals = new Uint8Array(w * h);
-  for (let i = 0, j = 0; i < data.length; i += 4, j++) {
-    // convert to luminance
-    const r = data[i], g = data[i + 1], b = data[i + 2];
-    const lum = Math.round(0.299 * r + 0.587 * g + 0.114 * b);
-    vals[j] = lum;
-    sum += lum;
+  try {
+    // We'll downscale to hashSize x hashSize, grayscale, compare to mean
+    const w = hashSize;
+    const h = hashSize;
+    const off = new OffscreenCanvas(w, h);
+    const ctx = off.getContext('2d');
+    ctx.drawImage(imageBitmap, 0, 0, w, h);
+    const id = ctx.getImageData(0, 0, w, h);
+    const data = id.data;
+    let sum = 0;
+    const vals = new Uint8Array(w * h);
+    for (let i = 0, j = 0; i < data.length; i += 4, j++) {
+      // convert to luminance
+      const r = data[i], g = data[i + 1], b = data[i + 2];
+      const lum = Math.round(0.299 * r + 0.587 * g + 0.114 * b);
+      vals[j] = lum;
+      sum += lum;
+    }
+    const mean = sum / vals.length;
+    // produce bitstring as hex
+    let bits = 0n;
+    for (let i = 0; i < vals.length; i++) {
+      if (vals[i] >= mean) bits |= (1n << BigInt(i));
+    }
+    // represent as hex string
+    const hex = bits.toString(16);
+    return hex;
+  } catch (err) {
+    console.error('preprocessor.worker: computeAHashFromBitmap failed', err);
+    return 'hash-error';
   }
-  const mean = sum / vals.length;
-  // produce bitstring as hex
-  let bits = 0n;
-  for (let i = 0; i < vals.length; i++) {
-    if (vals[i] >= mean) bits |= (1n << BigInt(i));
-  }
-  // represent as hex string
-  const hex = bits.toString(16);
-  return hex;
 }
 
 // Create thumbnail (returns Blob and width/height)
 async function createThumbnailBlob(imageBitmap, maxSide = DEFAULT_THUMB_MAX_SIDE) {
-  const srcW = imageBitmap.width;
-  const srcH = imageBitmap.height;
-  const scale = Math.min(1, maxSide / Math.max(srcW, srcH));
-  const w = Math.max(1, Math.floor(srcW * scale));
-  const h = Math.max(1, Math.floor(srcH * scale));
-  const off = new OffscreenCanvas(w, h);
-  const ctx = off.getContext('2d');
-  // Optionally handle flipY / orientation here if meta requires
-  ctx.drawImage(imageBitmap, 0, 0, w, h);
-  // convert to blob (png)
-  const blob = await off.convertToBlob({ type: 'image/png' });
-  return { blob, w, h };
+  try {
+    const srcW = imageBitmap.width;
+    const srcH = imageBitmap.height;
+    const scale = Math.min(1, maxSide / Math.max(srcW, srcH));
+    const w = Math.max(1, Math.floor(srcW * scale));
+    const h = Math.max(1, Math.floor(srcH * scale));
+    const off = new OffscreenCanvas(w, h);
+    const ctx = off.getContext('2d');
+    // Optionally handle flipY / orientation here if meta requires
+    ctx.drawImage(imageBitmap, 0, 0, w, h);
+    // convert to blob (png)
+    const blob = await off.convertToBlob({ type: 'image/png' });
+    return { blob, w, h };
+  } catch (err) {
+    console.error('preprocessor.worker: createThumbnailBlob failed', err);
+    throw err;
+  }
 }
 
 // Utility: compute a small motion map if meta provides motion info (not implemented heavy)
@@ -90,6 +199,10 @@ async function processFrame({ jobId, meta = {}, imageBitmap, options = {} }) {
   const startTime = Date.now();
   
   try {
+    if (!imageBitmap) {
+      throw new Error('No imageBitmap provided');
+    }
+
     // Emit progress
     postMessage({ event: 'progress', jobId, stage: 'processing_start', timestamp: startTime });
 
@@ -190,6 +303,12 @@ async function processFrame({ jobId, meta = {}, imageBitmap, options = {} }) {
 
     // Write artifacts to storage
     postMessage({ event: 'progress', jobId, stage: 'writing_storage' });
+    
+    // Check if storage functions are available
+    if (typeof self.putInboundArtifact !== 'function') {
+      throw new Error('putInboundArtifact function not available');
+    }
+    
     await self.putInboundArtifact(thumbArtifact);
     await self.putInboundArtifact(phashArtifact);
     await self.putInboundArtifact(manifestArtifact);
@@ -208,16 +327,26 @@ async function processFrame({ jobId, meta = {}, imageBitmap, options = {} }) {
     };
     
     postMessage(readyData);
-    bc.postMessage(readyData);
+    if (bc) {
+      bc.postMessage(readyData);
+    }
 
     // Close the incoming ImageBitmap to free GPU resources
     try { imageBitmap.close(); } catch (e) {}
     
   } catch (err) {
     console.error('preprocessor.worker: processing failed', err);
-    const errorData = { event: 'artifact:error', jobId, error: String(err), stack: err.stack };
+    const errorData = { 
+      event: 'artifact:error', 
+      jobId, 
+      error: String(err), 
+      stack: err.stack,
+      phase: 'processing'
+    };
     postMessage(errorData);
-    bc.postMessage(errorData);
+    if (bc) {
+      bc.postMessage(errorData);
+    }
     try { imageBitmap.close(); } catch (e) {}
   }
 }
@@ -226,6 +355,11 @@ async function processFrame({ jobId, meta = {}, imageBitmap, options = {} }) {
 async function handleReprocess({ jobId, key, actions = [], priority = 0 }) {
   try {
     postMessage({ event: 'progress', jobId, stage: 'reprocess_start', key, actions });
+
+    // Check if storage functions are available
+    if (typeof self.getArtifact !== 'function') {
+      throw new Error('getArtifact function not available');
+    }
 
     // Get the original artifact
     const artifact = await self.getArtifact(key);
@@ -287,7 +421,8 @@ async function handleReprocess({ jobId, key, actions = [], priority = 0 }) {
       event: 'reprocess:error', 
       jobId, 
       key, 
-      error: String(err) 
+      error: String(err),
+      stack: err.stack 
     });
   }
 }
@@ -296,50 +431,60 @@ async function handleReprocess({ jobId, key, actions = [], priority = 0 }) {
 self.onmessage = async (ev) => {
   const msg = ev.data || {};
   
-  if (msg.op === 'preprocess') {
-    // message should contain { jobId, meta, imageBitmap, options? }
-    const { jobId, meta = {}, options = {} } = msg;
-    // imageBitmap is a transferred ImageBitmap
-    const imageBitmap = msg.imageBitmap || ev.data.imageBitmap || null;
-    
-    if (!imageBitmap) {
-      postMessage({ event: 'artifact:error', jobId, error: 'No ImageBitmap received' });
-      return;
-    }
+  try {
+    if (msg.op === 'preprocess') {
+      // message should contain { jobId, meta, imageBitmap, options? }
+      const { jobId, meta = {}, options = {} } = msg;
+      // imageBitmap is a transferred ImageBitmap
+      const imageBitmap = msg.imageBitmap || ev.data.imageBitmap || null;
+      
+      if (!imageBitmap) {
+        postMessage({ event: 'artifact:error', jobId, error: 'No ImageBitmap received' });
+        return;
+      }
 
-    if (!storageReady) {
-      // Queue the frame for processing once storage is ready
-      pendingFrames.push({ jobId, meta, imageBitmap, options });
-      console.debug('preprocessor.worker: storage not ready, queuing frame', jobId);
-      return;
+      if (!storageReady) {
+        // Queue the frame for processing once storage is ready
+        pendingFrames.push({ jobId, meta, imageBitmap, options });
+        console.debug('preprocessor.worker: storage not ready, queuing frame', jobId);
+        return;
+      }
+      
+      // Process immediately if storage is ready
+      await processFrame({ jobId, meta, imageBitmap, options });
+      
+    } else if (msg.op === 'reprocess') {
+      const { jobId, key, actions, priority } = msg;
+      if (!storageReady) {
+        postMessage({ event: 'reprocess:error', jobId, key, error: 'Storage not ready' });
+        return;
+      }
+      await handleReprocess({ jobId, key, actions, priority });
+      
+    } else if (msg.op === 'shutdown') {
+      // Clean up any pending frames
+      pendingFrames.forEach(({ imageBitmap }) => {
+        try { imageBitmap.close(); } catch (e) {}
+      });
+      pendingFrames.length = 0;
+      
+      // Close broadcast channel
+      try { if (bc) bc.close(); } catch (e) {}
+      
+      postMessage({ event: 'worker:shutdown' });
+      close();
+      
+    } else {
+      // other ops
+      console.debug('preprocessor.worker: unknown op', msg.op);
     }
-    
-    // Process immediately if storage is ready
-    processFrame({ jobId, meta, imageBitmap, options });
-    
-  } else if (msg.op === 'reprocess') {
-    const { jobId, key, actions, priority } = msg;
-    if (!storageReady) {
-      postMessage({ event: 'reprocess:error', jobId, key, error: 'Storage not ready' });
-      return;
-    }
-    handleReprocess({ jobId, key, actions, priority });
-    
-  } else if (msg.op === 'shutdown') {
-    // Clean up any pending frames
-    pendingFrames.forEach(({ imageBitmap }) => {
-      try { imageBitmap.close(); } catch (e) {}
+  } catch (err) {
+    console.error('preprocessor.worker: onmessage error', err);
+    postMessage({
+      event: 'worker:error',
+      error: String(err),
+      stack: err.stack,
+      phase: 'message_handling'
     });
-    pendingFrames.length = 0;
-    
-    // Close broadcast channel
-    try { bc.close(); } catch (e) {}
-    
-    postMessage({ event: 'worker:shutdown' });
-    close();
-    
-  } else {
-    // other ops
-    console.debug('preprocessor.worker: unknown op', msg.op);
   }
 };

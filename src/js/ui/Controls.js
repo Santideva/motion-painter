@@ -22,6 +22,13 @@ export class Controls {
     // Optional fields for real measured video/canvas size
     this.videoWidth = null;
     this.videoHeight = null;
+
+    // Viewport control state
+    this.viewportState = {
+      size: 'fit', // 'small', 'medium', 'large', 'fit', 'fullscreen'
+      panelsVisible: true,
+      panelsCollapsed: false
+    };
   }
   
   init() {
@@ -29,6 +36,13 @@ export class Controls {
     
     // Cache DOM elements
     this.elements = {
+      // Viewport controls
+      viewportControls: document.getElementById('viewportControls'),
+      viewportToggle: document.getElementById('viewportToggle'),
+      viewportSize: document.getElementById('viewportSize'),
+      panelsToggle: document.getElementById('panelsToggle'),
+      fullscreenToggle: document.getElementById('fullscreenToggle'),
+      
       // Buffer controls
       bufferSize: document.getElementById('bufferSize'),
       bufferSizeVal: document.getElementById('bufferSizeVal'),
@@ -57,14 +71,89 @@ export class Controls {
       status: document.getElementById('status')
     };
     
+    this.initViewportControls();
     this.bindEvents();
     this.updateDisplayValues();
     this.updateBufferInfo();
     
     this.isInitialized = true;
   }
+
+  initViewportControls() {
+    // Create viewport controls if not present
+    if (!this.elements.viewportControls) {
+      this.createViewportControls();
+    }
+    
+    // Set initial viewport state
+    this.applyViewportSize(this.viewportState.size);
+  }
+
+  createViewportControls() {
+    // Find a suitable parent (controls container or body)
+    const controlsContainer = document.querySelector('.controls') || document.body;
+    
+    // Create viewport controls container
+    const viewportDiv = document.createElement('div');
+    viewportDiv.id = 'viewportControls';
+    viewportDiv.className = 'control viewport-controls collapsed';
+    
+    viewportDiv.innerHTML = `
+      <div class="viewport-header" id="viewportToggle">
+        <label>Viewport <span class="toggle-icon">▼</span></label>
+      </div>
+      <div class="viewport-content">
+        <div class="row">
+          <select id="viewportSize">
+            <option value="small">Small</option>
+            <option value="medium">Medium</option>
+            <option value="large">Large</option>
+            <option value="fit" selected>Fit</option>
+          </select>
+          <button id="panelsToggle" class="compact">Hide Panels</button>
+          <button id="fullscreenToggle" class="compact">Fullscreen</button>
+        </div>
+      </div>
+    `;
+    
+    // Insert at top of controls
+    controlsContainer.insertBefore(viewportDiv, controlsContainer.firstChild);
+    
+    // Update element references
+    this.elements.viewportControls = viewportDiv;
+    this.elements.viewportToggle = document.getElementById('viewportToggle');
+    this.elements.viewportSize = document.getElementById('viewportSize');
+    this.elements.panelsToggle = document.getElementById('panelsToggle');
+    this.elements.fullscreenToggle = document.getElementById('fullscreenToggle');
+  }
   
   bindEvents() {
+    // Viewport control events
+    if (this.elements.viewportToggle) {
+      this.elements.viewportToggle.onclick = () => {
+        this.toggleViewportControls();
+      };
+    }
+
+    if (this.elements.viewportSize) {
+      this.elements.viewportSize.onchange = () => {
+        const size = this.elements.viewportSize.value;
+        this.setViewportSize(size);
+      };
+    }
+
+    if (this.elements.panelsToggle) {
+      this.elements.panelsToggle.onclick = () => {
+        this.togglePanels();
+      };
+    }
+
+    if (this.elements.fullscreenToggle) {
+      this.elements.fullscreenToggle.onclick = () => {
+        this.toggleFullscreen();
+      };
+    }
+
     // Buffer size controls
     if (this.elements.bufferSize) {
       this.elements.bufferSize.oninput = () => {
@@ -249,8 +338,146 @@ export class Controls {
             this.adjustBufferSize(-1);
           }
           break;
+        // Viewport keyboard shortcuts
+        case '1':
+          if (e.ctrlKey) {
+            e.preventDefault();
+            this.setViewportSize('small');
+          }
+          break;
+        case '2':
+          if (e.ctrlKey) {
+            e.preventDefault();
+            this.setViewportSize('medium');
+          }
+          break;
+        case '3':
+          if (e.ctrlKey) {
+            e.preventDefault();
+            this.setViewportSize('large');
+          }
+          break;
+        case '0':
+          if (e.ctrlKey) {
+            e.preventDefault();
+            this.setViewportSize('fit');
+          }
+          break;
+        case 'h':
+        case 'H':
+          if (e.ctrlKey) {
+            e.preventDefault();
+            this.togglePanels();
+          }
+          break;
+        case 'f':
+        case 'F':
+          if (e.ctrlKey && e.shiftKey) {
+            e.preventDefault();
+            this.toggleFullscreen();
+          }
+          break;
       }
     });
+  }
+
+  // Viewport control methods
+  toggleViewportControls() {
+    if (!this.elements.viewportControls) return;
+    
+    const isCollapsed = this.elements.viewportControls.classList.contains('collapsed');
+    
+    if (isCollapsed) {
+      this.elements.viewportControls.classList.remove('collapsed');
+      this.elements.viewportToggle.querySelector('.toggle-icon').textContent = '▲';
+    } else {
+      this.elements.viewportControls.classList.add('collapsed');
+      this.elements.viewportToggle.querySelector('.toggle-icon').textContent = '▼';
+    }
+  }
+
+  setViewportSize(size) {
+    this.viewportState.size = size;
+    
+    if (this.elements.viewportSize) {
+      this.elements.viewportSize.value = size;
+    }
+    
+    this.applyViewportSize(size);
+    this.notifyChange('viewportSize', size);
+  }
+
+  applyViewportSize(size) {
+    const wrap = document.querySelector('.wrap');
+    const canvasPanel = document.querySelector('.canvas-panel');
+    const controls = document.querySelector('.controls');
+    
+    if (!wrap || !canvasPanel) return;
+    
+    // Remove existing viewport classes
+    wrap.classList.remove('viewport-small', 'viewport-medium', 'viewport-large', 'viewport-fit', 'viewport-fullscreen');
+    
+    // Apply new viewport class
+    switch (size) {
+      case 'small':
+        wrap.classList.add('viewport-small');
+        break;
+      case 'medium':
+        wrap.classList.add('viewport-medium');
+        break;
+      case 'large':
+        wrap.classList.add('viewport-large');
+        break;
+      case 'fit':
+        wrap.classList.add('viewport-fit');
+        break;
+      case 'fullscreen':
+        wrap.classList.add('viewport-fullscreen');
+        break;
+    }
+    
+    // Trigger resize event for canvas
+    this.notifyAction('viewportResize');
+  }
+
+  togglePanels() {
+    this.viewportState.panelsVisible = !this.viewportState.panelsVisible;
+    
+    const controls = document.querySelector('.controls');
+    if (!controls) return;
+    
+    if (this.viewportState.panelsVisible) {
+      controls.classList.remove('hidden');
+      if (this.elements.panelsToggle) {
+        this.elements.panelsToggle.textContent = 'Hide Panels';
+      }
+    } else {
+      controls.classList.add('hidden');
+      if (this.elements.panelsToggle) {
+        this.elements.panelsToggle.textContent = 'Show Panels';
+      }
+    }
+    
+    this.notifyAction('viewportResize');
+  }
+
+  toggleFullscreen() {
+    if (this.viewportState.size === 'fullscreen') {
+      this.setViewportSize('fit');
+    } else {
+      this.viewportState.size = 'fullscreen';
+      this.applyViewportSize('fullscreen');
+      
+      // Also hide panels in fullscreen
+      if (this.viewportState.panelsVisible) {
+        this.togglePanels();
+      }
+    }
+    
+    if (this.elements.fullscreenToggle) {
+      this.elements.fullscreenToggle.textContent = 
+        this.viewportState.size === 'fullscreen' ? 'Exit Fullscreen' : 'Fullscreen';
+    }
   }
   
   setBufferSize(size) {
@@ -501,6 +728,16 @@ export class Controls {
           b: this.params.bOff
         }
       }
+    };
+  }
+
+  /**
+   * Get current viewport configuration
+   * @returns {Object} Viewport state info
+   */
+  getViewportConfiguration() {
+    return {
+      ...this.viewportState
     };
   }
   
