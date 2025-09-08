@@ -487,30 +487,32 @@ displayHardwareLimitations() {
     if (!this.video || !this.mediaInput.isVideoReady()) {
       return;
     }
-    
+
     // Get current viewport configuration
     const viewportConfig = this.controls.getViewportConfiguration();
-    
+
     // Calculate canvas size based on viewport settings and video aspect ratio
     const videoAspectRatio = this.video.videoWidth / this.video.videoHeight;
     const canvasPanel = document.querySelector('.canvas-panel');
-    
+
     if (!canvasPanel) {
-      // Fallback to original resize behavior
-      const { width, height } = this.webglRenderer.resizeCanvas(this.video);
-      this.frameBuffer.resize(width, height);
-      this.controls.updateBufferInfo(width, height);
-      console.log(`Canvas resized to ${width}x${height}`);
+      // Fallback to original resize behavior but use drawing-buffer sizes
+      const sizes = this.webglRenderer.resizeCanvas(this.video);
+      // pass drawing-buffer pixel sizes into FrameBuffer
+      this.frameBuffer.resize(sizes.drawingWidth, sizes.drawingHeight);
+      this.controls.updateBufferInfo(sizes.drawingWidth, sizes.drawingHeight);
+      console.log(`Canvas resized to ${sizes.drawingWidth}x${sizes.drawingHeight} (fallback)`);
       return;
     }
-    
+
     // Get available space in canvas panel
     const panelRect = canvasPanel.getBoundingClientRect();
+    console.log('panelRect', panelRect, 'videoAspect', videoAspectRatio, 'viewport', viewportConfig);
     const availableWidth = panelRect.width - 16; // Account for padding
     const availableHeight = panelRect.height - 16;
-    
+
     let targetWidth, targetHeight;
-    
+
     // Calculate target size based on viewport mode
     switch (viewportConfig.size) {
       case 'small':
@@ -521,7 +523,7 @@ displayHardwareLimitations() {
           targetWidth = targetHeight * videoAspectRatio;
         }
         break;
-        
+
       case 'medium':
         targetWidth = Math.min(800, availableWidth);
         targetHeight = targetWidth / videoAspectRatio;
@@ -530,7 +532,7 @@ displayHardwareLimitations() {
           targetWidth = targetHeight * videoAspectRatio;
         }
         break;
-        
+
       case 'large':
         targetWidth = Math.min(1200, availableWidth);
         targetHeight = targetWidth / videoAspectRatio;
@@ -539,7 +541,7 @@ displayHardwareLimitations() {
           targetWidth = targetHeight * videoAspectRatio;
         }
         break;
-        
+
       case 'fullscreen':
         targetWidth = window.innerWidth;
         targetHeight = window.innerHeight;
@@ -551,7 +553,7 @@ displayHardwareLimitations() {
           targetWidth = targetHeight * videoAspectRatio;
         }
         break;
-        
+
       case 'fit':
       default:
         // Fit to available space while maintaining aspect ratio
@@ -563,23 +565,30 @@ displayHardwareLimitations() {
         }
         break;
     }
-    
+
     // Ensure minimum sizes
     targetWidth = Math.max(320, Math.floor(targetWidth));
     targetHeight = Math.max(240, Math.floor(targetHeight));
-    
+
     // Store video dimensions for buffer memory calculations
     this.controls.videoWidth = targetWidth;
     this.controls.videoHeight = targetHeight;
-    
-    // Apply resize
-    const { width, height } = this.webglRenderer.resizeCanvas(this.video, targetWidth, targetHeight);
-    this.frameBuffer.resize(width, height);
-    
-    // Update memory usage display after resize
-    this.controls.updateBufferInfo(width, height);
-    
-    console.log(`Canvas resized to ${width}x${height} (${viewportConfig.size} mode)`);
+
+    // --- key change: capture the full sizes object from renderer ---
+    // webglRenderer.resizeCanvas(...) now returns:
+    // { cssWidth, cssHeight, drawingWidth, drawingHeight }
+    const sizes = this.webglRenderer.resizeCanvas(this.video, targetWidth, targetHeight);
+
+    // Optional: keep debug copy on renderer
+    this.webglRenderer.lastResizeResult = sizes;
+
+    // IMPORTANT: pass drawing-buffer pixel sizes to FrameBuffer (device pixels)
+    this.frameBuffer.resize(sizes.drawingWidth, sizes.drawingHeight);
+
+    // Update memory usage display after resize (pass pixel dims)
+    this.controls.updateBufferInfo(sizes.drawingWidth, sizes.drawingHeight);
+
+    console.log(`Canvas resized to ${sizes.drawingWidth}x${sizes.drawingHeight} (${viewportConfig.size} mode)`);
   }
   
   renderLoop() {

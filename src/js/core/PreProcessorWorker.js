@@ -3,7 +3,7 @@
 
 export class PreprocessorWorker {
   constructor() {
-    console.log('PreprocessorWorker: Creating worker...');
+    // Only log worker creation, not the verbose "Creating worker..." message
     
     // Initialize all properties first
     this.jobCounter = 0;
@@ -32,7 +32,7 @@ export class PreprocessorWorker {
     try {
       // Fix: Use absolute path from public folder root
       this.worker = new Worker('/src/js/core/preprocessor.worker.js');
-      console.log('PreprocessorWorker: Worker created successfully');
+      // Silenced: console.log('PreprocessorWorker: Worker created successfully');
     } catch (err) {
       console.error('PreprocessorWorker: Failed to create worker', err);
       throw err;
@@ -42,6 +42,7 @@ export class PreprocessorWorker {
     this.readyTimeout = setTimeout(() => {
       if (!this.workerReady) {
         console.error('PreprocessorWorker: Worker failed to become ready within 10 seconds');
+        // Only show state info if there's actually an error
         console.log('PreprocessorWorker: Current state:', {
           workerReady: this.workerReady,
           queuedFrames: this.queuedFrames.length,
@@ -53,21 +54,18 @@ export class PreprocessorWorker {
     // Set up message handler
     this.worker.onmessage = (ev) => {
       const data = ev.data || {};
-      console.log('PreprocessorWorker: Received message:', data.event, data);
+      // Silenced recurring debug: console.log('PreprocessorWorker: Received message:', data.event, data);
       
       if (data.event === 'worker:ready') {
         clearTimeout(this.readyTimeout);
         this.workerReady = true;
-        console.log('PreprocessorWorker: worker is ready, processing queued frames');
+        // Silenced: console.log('PreprocessorWorker: worker is ready, processing queued frames');
         
-        // Add detailed startup diagnostics
-        const metrics = this.getMetrics();
-        console.log('Worker startup diagnostics:', {
-          queuedFrames: metrics.queuedFrames,
-          maxQueueSize: metrics.maxQueueSize,
-          capacity: this.getCapacityStatus(),
-          canAccept: this.canAcceptFrames()
-        });
+        // Only show detailed diagnostics if there are queued frames or issues
+        const queuedCount = this.queuedFrames.length;
+        if (queuedCount > 0) {
+          console.log(`PreprocessorWorker: Processing ${queuedCount} queued frames`);
+        }
         this._processQueuedFrames();
         
       } else if (data.event === 'worker:error') {
@@ -76,7 +74,7 @@ export class PreprocessorWorker {
         clearTimeout(this.readyTimeout);
         
       } else if (data.event === 'artifact:ready') {
-        console.info('PreprocessorWorker: artifact ready', data.jobId, data.keys || data.key);
+        // Silenced recurring info: console.info('PreprocessorWorker: artifact ready', data.jobId, data.keys || data.key);
         this._updateProcessingMetrics(data);
         this.pending.delete(data.jobId);
         
@@ -85,7 +83,7 @@ export class PreprocessorWorker {
         this.pending.delete(data.jobId);
         
       } else {
-        console.debug('PreprocessorWorker:onmessage', data);
+        // Silenced debug: console.debug('PreprocessorWorker:onmessage', data);
       }
     };
 
@@ -151,7 +149,7 @@ export class PreprocessorWorker {
   }
 
   _queueFrame(imageBitmap, meta, options) {
-    console.debug('PreprocessorWorker: worker not ready, queuing frame');
+    // Silenced debug: console.debug('PreprocessorWorker: worker not ready, queuing frame');
     
     // Enhanced queue management with priority
     const frameData = { 
@@ -238,7 +236,7 @@ export class PreprocessorWorker {
 
   _enqueueFrameImmediate(imageBitmap, meta = {}, options = {}) {
     const jobId = `pre-${Date.now()}-${(this.jobCounter++).toString(36)}`;
-    console.debug('PreprocessorWorker.enqueueFrame', jobId, meta, options);
+    // Silenced recurring debug: console.debug('PreprocessorWorker.enqueueFrame', jobId, meta, options);
     
     this.pending.set(jobId, { 
       meta, 

@@ -150,16 +150,71 @@ export class WebGLRenderer {
     };
   }
   
-  resizeCanvas(video) {
-    const { width, height } = getOptimalCanvasSize(video);
-    
-    this.canvas.width = width;
-    this.canvas.height = height;
-    
-    this.gl.viewport(0, 0, width, height);
-    
-    return { width, height };
+
+/**
+ * Resize the canvas.
+ * - If the caller provides numeric width/height (CSS px), we use them.
+ * - Otherwise we compute CSS size from the canvas parent (fits the panel).
+ * Returns an object with both CSS sizes and drawing-buffer sizes:
+ *   { cssWidth, cssHeight, drawingWidth, drawingHeight }
+ */
+resizeCanvas(videoOrCssWidth = null, optCssHeight = null) {
+  const canvas = this.canvas;
+  const gl = this.gl;
+
+  // Determine CSS pixel size (prefer explicit numeric args)
+  let cssWidth, cssHeight;
+
+  if (typeof videoOrCssWidth === 'number' && typeof optCssHeight === 'number') {
+    cssWidth = Math.max(1, Math.floor(videoOrCssWidth));
+    cssHeight = Math.max(1, Math.floor(optCssHeight));
+  } else {
+    // If a video element was passed (or nothing), compute from parent container
+    const parentRect = (canvas.parentElement && canvas.parentElement.getBoundingClientRect())
+      || canvas.getBoundingClientRect();
+    // Optional: account for panel padding — adjust if your layout uses different padding
+    const padX = 16; // matches main.js earlier logic; change if you use different padding
+    const padY = 16;
+    cssWidth = Math.max(1, Math.floor(parentRect.width - padX));
+    cssHeight = Math.max(1, Math.floor(parentRect.height - padY));
+
+    // As a fallback, if parent rect is 0 (rare), fall back to viewport-fit
+    if (cssWidth <= 0 || cssHeight <= 0) {
+      cssWidth = Math.max(1, window.innerWidth);
+      cssHeight = Math.max(1, window.innerHeight);
+    }
   }
+
+  // Apply CSS size explicitly (so layout is deterministic)
+  canvas.style.width = `${cssWidth}px`;
+  canvas.style.height = `${cssHeight}px`;
+
+  // Compute device-pixel drawing buffer size
+  const DPR = window.devicePixelRatio || 1;
+  const drawingWidth  = Math.max(1, Math.floor(cssWidth  * DPR));
+  const drawingHeight = Math.max(1, Math.floor(cssHeight * DPR));
+
+  // Update canvas drawing buffer only if it changed — avoids realloc overhead
+  if (canvas.width !== drawingWidth || canvas.height !== drawingHeight) {
+    canvas.width  = drawingWidth;
+    canvas.height = drawingHeight;
+  }
+
+  // Ensure GL viewport matches the drawing buffer immediately
+  try {
+    gl.viewport(0, 0, canvas.width, canvas.height);
+  } catch (err) {
+    // Non-fatal: log for debugging but don't throw
+    console.warn('WebGLRenderer.resizeCanvas: viewport call failed', err);
+  }
+
+  return {
+    cssWidth,
+    cssHeight,
+    drawingWidth,
+    drawingHeight
+  };
+}
   
   renderComposite(frameTextures, uniforms = {}) {
     const gl = this.gl;

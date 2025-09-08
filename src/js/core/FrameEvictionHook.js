@@ -47,7 +47,7 @@ export class FrameEvictionHook {
     this.frameBuffer.onEvict = (imageBitmap, meta) => this._handler(imageBitmap, meta);
     this.isAttached = true;
 
-    console.log('FrameEvictionHook attached to FrameBuffer');
+    // Silenced: console.log('FrameEvictionHook attached to FrameBuffer');
     
     // Start adaptive monitoring
     this._startAdaptiveMonitoring();
@@ -62,7 +62,7 @@ export class FrameEvictionHook {
     this.isAttached = false;
     this._stopAdaptiveMonitoring();
     
-    console.log('FrameEvictionHook detached from FrameBuffer');
+    // Silenced: console.log('FrameEvictionHook detached from FrameBuffer');
   }
 
   _handler(imageBitmap, meta) {
@@ -70,7 +70,7 @@ export class FrameEvictionHook {
     
     // Check if preprocessor exists and can accept frames
     if (!this.preprocessor) {
-      console.debug('FrameEvictionHook: No preprocessor available, closing ImageBitmap');
+      // Silenced: console.debug('FrameEvictionHook: No preprocessor available, closing ImageBitmap');
       try { imageBitmap.close(); } catch (e) {}
       this.metrics.framesDropped++;
       return;
@@ -78,12 +78,13 @@ export class FrameEvictionHook {
 
     // Adaptive frame skipping based on system load
     if (this._shouldSkipFrame()) {
-      // console.debug('FrameEvictionHook: Skipping frame due to adaptive processing');
-            if (this.preprocessor) {
+      // Silenced: console.debug('FrameEvictionHook: Skipping frame due to adaptive processing');
+      if (this.preprocessor) {
         const metrics = this.preprocessor.getMetrics();
         const capacity = this.preprocessor.getCapacityStatus();
         const canAccept = this.preprocessor.canAcceptFrames();
         
+        // Silenced diagnostic logs:
         // console.log('Worker diagnostics:', {
         //   metrics,
         //   capacity,
@@ -101,7 +102,7 @@ export class FrameEvictionHook {
     // Throttle processing rate
     const now = Date.now();
     if (now - this.lastProcessTime < this.minProcessInterval) {
-      console.debug('FrameEvictionHook: Throttling frame processing');
+      // Silenced: console.debug('FrameEvictionHook: Throttling frame processing');
       try { imageBitmap.close(); } catch (e) {}
       this.metrics.framesSkipped++;
       return;
@@ -122,10 +123,10 @@ export class FrameEvictionHook {
     if (result.ok) {
       this.metrics.framesProcessed++;
       this.lastProcessTime = now;
-      console.debug('FrameEvictionHook: Frame enqueued successfully', result.jobId);
+      // Silenced: console.debug('FrameEvictionHook: Frame enqueued successfully', result.jobId);
     } else {
       this.metrics.framesDropped++;
-      console.debug('FrameEvictionHook: Frame rejected by preprocessor', result.reason);
+      // Silenced: console.debug('FrameEvictionHook: Frame rejected by preprocessor', result.reason);
       // ImageBitmap already closed by preprocessor on failure
     }
   }
@@ -138,7 +139,7 @@ export class FrameEvictionHook {
     // Skip frames based on current frame skip ratio
     this.frameCounter++;
     if (this.frameCounter % this.frameSkipRatio !== 0) {
-      console.debug(`FrameEvictionHook: Skipping frame ${this.frameCounter} (skip ratio ${this.frameSkipRatio})`);
+      // Silenced: console.debug(`FrameEvictionHook: Skipping frame ${this.frameCounter} (skip ratio ${this.frameSkipRatio})`);
       return true;
     }
 
@@ -146,6 +147,7 @@ export class FrameEvictionHook {
     const canAccept = this.preprocessor.canAcceptFrames();
     if (!canAccept) {
       const metrics = this.preprocessor.getMetrics();
+      // Silenced diagnostic logs:
       // console.debug(`FrameEvictionHook: Skipping frame - preprocessor can't accept frames:`, {
       //   workerReady: metrics.workerReady,
       //   backpressureActive: metrics.backpressureActive,
@@ -302,9 +304,9 @@ export class FrameEvictionHook {
     this.downsampleScale = Math.max(this.minDownsampleScale, 
                                    Math.min(this.maxDownsampleScale, this.downsampleScale));
     
-    // Log adaptation changes
+    // Only log adaptation changes if there's a significant change
     if (this.frameSkipRatio !== oldSkipRatio) {
-      console.log(`FrameEvictionHook: Adapted processing - skip ratio: ${oldSkipRatio} → ${this.frameSkipRatio}, downsample: ${this.downsampleScale.toFixed(2)}, capacity: ${capacity}`);
+      // Silenced: console.log(`FrameEvictionHook: Adapted processing - skip ratio: ${oldSkipRatio} → ${this.frameSkipRatio}, downsample: ${this.downsampleScale.toFixed(2)}, capacity: ${capacity}`);
     }
   }
 
@@ -317,7 +319,7 @@ export class FrameEvictionHook {
     }
     
     this.processingMode = mode;
-    console.log(`FrameEvictionHook: Processing mode set to ${mode}`);
+    // Silenced: console.log(`FrameEvictionHook: Processing mode set to ${mode}`);
     
     // Immediate adaptation based on new mode
     this._adaptProcessingParameters();
@@ -336,7 +338,7 @@ export class FrameEvictionHook {
       this.minProcessInterval = 16;
     }
     
-    console.log(`FrameEvictionHook: Adaptive processing ${enabled ? 'enabled' : 'disabled'}`);
+    // Silenced: console.log(`FrameEvictionHook: Adaptive processing ${enabled ? 'enabled' : 'disabled'}`);
   }
 
   getMetrics() {
@@ -364,7 +366,7 @@ export class FrameEvictionHook {
   // Force immediate adaptation (useful for debugging/testing)
   forceAdaptation() {
     this._adaptProcessingParameters();
-    console.log('FrameEvictionHook: Forced adaptation completed', this.getMetrics());
+    // Silenced: console.log('FrameEvictionHook: Forced adaptation completed', this.getMetrics());
   }
 
   // Reset metrics
@@ -376,6 +378,6 @@ export class FrameEvictionHook {
       framesDropped: 0,
       avgFrameSize: 0
     };
-    console.log('FrameEvictionHook: Metrics reset');
+    // Silenced: console.log('FrameEvictionHook: Metrics reset');
   }
 }
