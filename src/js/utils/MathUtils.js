@@ -184,14 +184,12 @@ export function getOptimalBufferSize(availableMemoryMB = 100, width = 1920, heig
   };
   
   const targetMB = targetMemoryUsage[performanceTarget] || targetMemoryUsage.medium;
-  const bytesPerFrame = width * height * 4;
+  const bytesPerFrame = Math.max(1, width) * Math.max(1, height) * 4;
   const maxFrames = Math.floor((targetMB * 1024 * 1024) / bytesPerFrame);
-  
-  // Respect both memory and hardware constraints
-  return Math.max(
-    CONFIG.MIN_BUFFER_SIZE, 
-    Math.min(CONFIG.MAX_BUFFER_SIZE, maxFrames)
-  );
+
+  // Respect both memory and hardware constraints; ensure integer and minimum
+  const recommended = Math.max(CONFIG.MIN_BUFFER_SIZE, Math.min(CONFIG.MAX_BUFFER_SIZE, Math.max(0, Math.floor(maxFrames))));
+  return recommended;
 }
 
 /**
@@ -201,22 +199,45 @@ export function getOptimalBufferSize(availableMemoryMB = 100, width = 1920, heig
  * @returns {Object} Validation result
  */
 export function validateBufferSize(bufferSize, hardwareMaxTextureUnits = CONFIG.HARDWARE_MAX_TEXTURE_UNITS) {
-  const size = Math.round(bufferSize);
-  const isValid = size >= CONFIG.MIN_BUFFER_SIZE && size <= CONFIG.MAX_BUFFER_SIZE;
+  // Defensive coercion
+  let parsed = bufferSize;
+  if (typeof parsed === 'string') {
+    parsed = parsed.trim();
+  }
+  parsed = Number(parsed);
+
+  // If invalid, fallback to DEFAULT_BUFFER_SIZE and report a warning
+  if (!Number.isFinite(parsed)) {
+    const fallback = CONFIG.DEFAULT_BUFFER_SIZE;
+    return {
+      isValid: false,
+      originalSize: bufferSize,
+      clampedSize: fallback,
+      isHardwareLimited: false,
+      warning: `Invalid buffer size requested (${String(bufferSize)}). Using default ${fallback}.`
+    };
+  }
+
+  // Round and ensure integer
+  const size = Math.max(0, Math.round(parsed));
+
+  // Compute clamped value respecting min/max hardware limits
   const clamped = Math.max(CONFIG.MIN_BUFFER_SIZE, Math.min(CONFIG.MAX_BUFFER_SIZE, size));
-  const isHardwareLimited = size > hardwareMaxTextureUnits;
-  
+
+  // Hardware limitation detection (compare clamped vs hardware capacity)
+  const isHardwareLimited = clamped > hardwareMaxTextureUnits;
+
   let warning = null;
   if (size < CONFIG.MIN_BUFFER_SIZE) {
-    warning = `Buffer size must be at least ${CONFIG.MIN_BUFFER_SIZE}`;
+    warning = `Buffer size must be at least ${CONFIG.MIN_BUFFER_SIZE}; using ${clamped}.`;
   } else if (isHardwareLimited) {
-    warning = `Buffer size limited to ${Math.min(CONFIG.MAX_BUFFER_SIZE, hardwareMaxTextureUnits)} by WebGL texture unit constraints`;
-  } else if (!isValid) {
-    warning = `Buffer size must be between ${CONFIG.MIN_BUFFER_SIZE} and ${CONFIG.MAX_BUFFER_SIZE}`;
+    warning = `Buffer size limited to ${Math.min(CONFIG.MAX_BUFFER_SIZE, hardwareMaxTextureUnits)} by WebGL texture unit constraints.`;
+  } else if (size > CONFIG.MAX_BUFFER_SIZE) {
+    warning = `Requested buffer size exceeds max (${CONFIG.MAX_BUFFER_SIZE}); clamped to ${clamped}.`;
   }
-  
+
   return {
-    isValid,
+    isValid: size >= CONFIG.MIN_BUFFER_SIZE && size <= CONFIG.MAX_BUFFER_SIZE,
     originalSize: bufferSize,
     clampedSize: clamped,
     isHardwareLimited,

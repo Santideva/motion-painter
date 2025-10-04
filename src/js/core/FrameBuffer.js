@@ -4,203 +4,317 @@ import { CONFIG, getSpiralBufferIndices } from '../utils/MathUtils.js';
 export class FrameBuffer {
   constructor(gl, initialSize = CONFIG.DEFAULT_BUFFER_SIZE) {
     this.gl = gl;
-    // Enforce 16 frame hardware limit
+    // Enforce application hardware limit
     this.bufferSize = Math.max(CONFIG.MIN_BUFFER_SIZE, Math.min(CONFIG.MAX_BUFFER_SIZE, initialSize));
-    this.textures = [];
-    this.framebuffers = [];
+
+    // TEXTURE_2D_ARRAY approach
+    this.frameArrayTexture = null;  // Single TEXTURE_2D_ARRAY for all frames
+    this.framebuffers = [];         // Individual FBOs for each layer (for rendering)
+
     this.writeIndex = 0;
     this.width = 0;
     this.height = 0;
-    this.frameCount = 0; // Total frames processed
-    this.readTextures = null; // Read-ordered view computed by rotateBuffers (do not mutate this.textures)
+    this.frameCount = 0;
+    this.readTextures = null; // Cached read-ordered array of layer indices
     this.onEvict = null; // callback(ImageBitmap or null, meta)
-
 
     // Spiral buffer configuration
     this.useSpiralRetention = true;
-    this.spiralIndices = null; // Cached spiral indices for current buffer size
+    this.spiralIndices = null;
 
-    // Eviction readback config (max side length for downsampled readback)
-    this.evictReadMaxSide = 256; // tune this: lower => cheaper readback
+    // Eviction readback config
+    this.evictReadMaxSide = 256;
 
     // Hardware validation
     this.validateHardwareLimits();
   }
 
   validateHardwareLimits() {
-    const maxTextureUnits = this.gl.getParameter(this.gl.MAX_TEXTURE_IMAGE_UNITS);
+    const gl = this.gl;
+    let maxTextureUnits = 0;
+    try {
+      maxTextureUnits = gl.getParameter(gl.MAX_TEXTURE_IMAGE_UNITS);
+    } catch (e) {
+      console.warn('FrameBuffer: unable to query MAX_TEXTURE_IMAGE_UNITS', e);
+    }
 
-    if (this.bufferSize > maxTextureUnits) {
-      console.warn(`Buffer size ${this.bufferSize} exceeds hardware limit ${maxTextureUnits}. Clamping to ${Math.min(CONFIG.MAX_BUFFER_SIZE, maxTextureUnits)}.`);
-      this.bufferSize = Math.min(CONFIG.MAX_BUFFER_SIZE, maxTextureUnits);
+    // With TEXTURE_2D_ARRAY we expect 1 unit for the array + extras for calibration
+    const minimumRequired = 4;
+    if (maxTextureUnits && maxTextureUnits < minimumRequired) {
+      console.warn(`Hardware supports only ${maxTextureUnits} texture units, minimum recommended is ${minimumRequired}.`);
     }
 
     if (this.bufferSize > CONFIG.MAX_BUFFER_SIZE) {
-      console.warn(`Buffer size ${this.bufferSize} exceeds application limit ${CONFIG.MAX_BUFFER_SIZE}. Clamping to ${CONFIG.MAX_BUFFER_SIZE}.`);
+      console.warn(`Buffer size ${this.bufferSize} exceeds application limit ${CONFIG.MAX_BUFFER_SIZE}. Clamping.`);
       this.bufferSize = CONFIG.MAX_BUFFER_SIZE;
     }
   }
 
-  createTexture(width, height) {
+  createArrayTexture(width, height, layers) {
     const gl = this.gl;
+
+    if (!gl.TEXTURE_2D_ARRAY) {
+      throw new Error('TEXTURE_2D_ARRAY not supported - WebGL2 required');
+    }
+
     const texture = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, texture);
 
-    gl.bindTexture(gl.TEXTURE_2D, texture);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    // Allocate storage for the whole array texture
+    gl.texImage3D(
+      gl.TEXTURE_2D_ARRAY,
+      0,
+      gl.RGBA,
+      width,
+      height,
+      layers,
+      0,
+      gl.RGBA,
+      gl.UNSIGNED_BYTE,
+      null
+    );
 
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+    // Unbind
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, null);
+
+    console.log(`[FB] createArrayTexture: created TEXTURE_2D_ARRAY ${width}x${height} layers=${layers}`);
     return texture;
   }
 
   setBufferSize(newSize) {
-    // Enforce hardware limits
     const clampedSize = Math.max(CONFIG.MIN_BUFFER_SIZE, Math.min(CONFIG.MAX_BUFFER_SIZE, newSize));
 
-    if (clampedSize === this.bufferSize) {
-      return; // No change needed
-    }
+    if (clampedSize === this.bufferSize) return;
 
-    // Warn if size was clamped
     if (clampedSize !== newSize) {
-      console.warn(`Requested buffer size ${newSize} clamped to ${clampedSize} due to hardware/application limits.`);
+      console.warn(`Requested buffer size ${newSize} clamped to ${clampedSize} due to application limits.`);
     }
 
     const wasInitialized = this.width > 0 && this.height > 0;
-    const oldTextures = [...this.textures];
-
     this.bufferSize = clampedSize;
-    this.spiralIndices = null; // Reset cached indices
+    this.spiralIndices = null;
+    this.readTextures = null;
 
     if (wasInitialized) {
-      // Preserve existing textures where possible and resize
-      this.resize(this.width, this.height, oldTextures);
+      // Recreate array texture with new layer count
+      this.resize(this.width, this.height);
     }
   }
 
   setSpiralRetention(enabled) {
     this.useSpiralRetention = enabled;
-    this.spiralIndices = null; // Reset cached indices
-    // Reset read-ordered view so consumers recalc according to new retention policy
+    this.spiralIndices = null;
     this.readTextures = null;
   }
 
   resize(width, height, preserveTextures = null) {
+    // If no change and not requested to preserve, skip
     if (this.width === width && this.height === height && !preserveTextures) {
-      return; // No change needed
+      return;
     }
 
     this.width = width;
     this.height = height;
 
     const gl = this.gl;
-    const oldTextures = preserveTextures || this.textures;
-    const oldFramebuffers = this.framebuffers;
 
-    // Clean up excess resources if downsizing
-    if (oldTextures.length > this.bufferSize) {
-      for (let i = this.bufferSize; i < oldTextures.length; i++) {
-        if (oldTextures[i]) gl.deleteTexture(oldTextures[i]);
-        if (oldFramebuffers[i]) gl.deleteFramebuffer(oldFramebuffers[i]);
-      }
+    // Clean up old resources
+    if (this.frameArrayTexture) {
+      try { gl.deleteTexture(this.frameArrayTexture); } catch (e) {}
+      this.frameArrayTexture = null;
     }
 
-    // Initialize new arrays
-    this.textures = [];
+    this.framebuffers.forEach(fb => {
+      if (fb) {
+        try { gl.deleteFramebuffer(fb); } catch (e) {}
+      }
+    });
     this.framebuffers = [];
 
-    // Create new textures and framebuffers - limited to bufferSize (max 16)
-    for (let i = 0; i < this.bufferSize; i++) {
-      let texture;
-
-      if (i < oldTextures.length && oldTextures[i]) {
-        // Reuse existing texture, update its data
-        texture = oldTextures[i];
-        gl.bindTexture(gl.TEXTURE_2D, texture);
-        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
-      } else {
-        // Create new texture
-        texture = this.createTexture(width, height);
-      }
-
-      this.textures.push(texture);
-
-      const framebuffer = gl.createFramebuffer();
-      gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
-      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0);
-      this.framebuffers.push(framebuffer);
-
-      // Check framebuffer completeness
-      if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) {
-        console.error('Framebuffer not complete for texture', i);
-      }
+    // Create new array texture
+    try {
+      this.frameArrayTexture = this.createArrayTexture(width, height, this.bufferSize);
+    } catch (err) {
+      console.error('FrameBuffer.resize: failed to create array texture', err);
+      this.frameArrayTexture = null;
+      return;
     }
 
-    // Clean up remaining old resources that weren't reused
-    if (!preserveTextures) {
-      oldFramebuffers.forEach(fb => {
-        if (fb) gl.deleteFramebuffer(fb);
-      });
+    // Create framebuffer per layer
+    for (let i = 0; i < this.bufferSize; i++) {
+      const framebuffer = gl.createFramebuffer();
+      gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+
+      gl.framebufferTextureLayer(
+        gl.FRAMEBUFFER,
+        gl.COLOR_ATTACHMENT0,
+        this.frameArrayTexture,
+        0,
+        i
+      );
+
+      // Optional: check status
+      const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+      if (status !== gl.FRAMEBUFFER_COMPLETE) {
+        console.error('Framebuffer not complete for layer', i, 'status:', status);
+      }
+
+      this.framebuffers.push(framebuffer);
     }
 
     // Restore default framebuffer
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 
-    // Reset spiral indices cache
     this.spiralIndices = null;
-    // Reset read-ordered view cache so subsequent getTextures() recomputes it
     this.readTextures = null;
+
+    console.log(`[FB] resize: created ${this.bufferSize} framebuffers for array texture`);
   }
 
-    uploadVideoFrame(video) {
-      const gl = this.gl;
-      const targetTexture = this.textures[this.writeIndex];
-      if (!targetTexture) return;
+    // FrameBuffer.js Upload the current video frame into the array texture at `this.writeIndex`.
+    //  Returns true on success, false on failure.
+    //  Callers must `await` it and only advance
+    // writeIndex / rotate buffers after it resolves successfully.
+    async uploadVideoFrame(video, opts = {}) {
+    const gl = this.gl;
+    const allowBitmapFallback = opts.allowBitmapFallback !== false; // default true
 
-      if (video.readyState < 2) {
-        console.warn("uploadVideoFrame: video not ready, skipping");
-        return;
-      }
-
-      gl.bindTexture(gl.TEXTURE_2D, targetTexture);
-      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
-
-      try {
-        // Ensure correct allocation
-        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA,
-                      video.videoWidth, video.videoHeight, 0,
-                      gl.RGBA, gl.UNSIGNED_BYTE, null);
-
-        // Upload pixels
-        gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0,
-                        gl.RGBA, gl.UNSIGNED_BYTE, video);
-
-        console.log("uploadVideoFrame: uploaded", video.videoWidth, "x", video.videoHeight);
-
-      } catch (err) {
-        console.error("uploadVideoFrame: upload failed", err);
-      } finally {
-        gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
-      }
-
-      this.frameCount++;
-      this.readTextures = null;
+    if (!video) return false;
+    if (video.readyState < 2) {
+      console.warn('[FB] uploadVideoFrame: video not ready, skipping');
+      return false;
     }
+
+    // Source dimensions (video native)
+    const srcW = video.videoWidth || CONFIG.DEFAULT_RESOLUTION.width;
+    const srcH = video.videoHeight || CONFIG.DEFAULT_RESOLUTION.height;
+
+    // If we don't have an array texture or size changed, recreate it at video native size.
+    // NOTE: recreating will lose prior frames in the buffer.
+    if (!this.frameArrayTexture || this.width !== srcW || this.height !== srcH) {
+      console.log(`[FB] uploadVideoFrame: creating/resizing array texture to ${srcW}x${srcH} (was ${this.width}x${this.height})`);
+      try {
+        // This will allocate a new texture and FBOs for each layer.
+        this.resize(srcW, srcH);
+      } catch (err) {
+        console.error('[FB] uploadVideoFrame: resize failed', err);
+        return false;
+      }
+    }
+
+    // Update remembered dims
+    this.width = srcW;
+    this.height = srcH;
+
+    // Bind and set pixel store state
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, this.frameArrayTexture);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+
+    let success = false;
+
+    try {
+      // Try direct upload from the HTMLVideoElement — simplest & fastest when supported.
+      gl.texSubImage3D(
+        gl.TEXTURE_2D_ARRAY,
+        0,
+        0,
+        0,
+        this.writeIndex,
+        srcW,
+        srcH,
+        1,
+        gl.RGBA,
+        gl.UNSIGNED_BYTE,
+        video
+      );
+
+      const err = gl.getError();
+      if (err === gl.NO_ERROR) {
+        success = true;
+        console.log(`[FB] uploadVideoFrame: texSubImage3D(video) ok -> layer ${this.writeIndex} ${srcW}x${srcH}`);
+      } else {
+        console.warn('[FB] uploadVideoFrame: texSubImage3D(video) reported gl.getError() =', err);
+        success = false;
+      }
+    } catch (ex) {
+      // Some browsers will throw when passing HTMLVideoElement into texSubImage3D for TEXTURE_2D_ARRAY.
+      console.warn('[FB] uploadVideoFrame: direct texSubImage3D(video) threw, will try bitmap fallback. err=', ex);
+      success = false;
+    }
+
+    // Fallback: createImageBitmap then upload (slower but widely compatible)
+    if (!success && allowBitmapFallback) {
+      try {
+        // createImageBitmap can accept a video and is usually supported; this is async.
+        // Optionally we could use {imageOrientation: 'none'|'flipY'} — keep default and we already used UNPACK_FLIP_Y_WEBGL.
+        const bmp = await createImageBitmap(video);
+        try {
+          gl.texSubImage3D(
+            gl.TEXTURE_2D_ARRAY,
+            0,
+            0,
+            0,
+            this.writeIndex,
+            srcW,
+            srcH,
+            1,
+            gl.RGBA,
+            gl.UNSIGNED_BYTE,
+            bmp
+          );
+          const err2 = gl.getError();
+          if (err2 === gl.NO_ERROR) {
+            success = true;
+            console.log(`[FB] uploadVideoFrame: texSubImage3D(bitmap) ok -> layer ${this.writeIndex} ${srcW}x${srcH}`);
+          } else {
+            console.error('[FB] uploadVideoFrame: texSubImage3D(bitmap) gl.getError() =', err2);
+            success = false;
+          }
+        } finally {
+          // close ImageBitmap if supported to free resources
+          try { bmp.close && bmp.close(); } catch (e) {}
+        }
+      } catch (bmpErr) {
+        console.error('[FB] uploadVideoFrame: createImageBitmap fallback failed', bmpErr);
+        success = false;
+      }
+    }
+
+    // Restore pixel store and unbind
+    try {
+      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+    } catch (e) {}
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, null);
+
+    if (success) {
+      // Update bookkeeping but do NOT advance writeIndex here.
+      // Caller should advance write index atomically after upload returns.
+      this.frameCount = Math.max(this.frameCount + 1, 1);
+      this.readTextures = null;
+      console.log('[FB] uploadVideoFrame: uploaded to layer', this.writeIndex, 'frameCount=', this.frameCount);
+      return true;
+    } else {
+      console.warn('[FB] uploadVideoFrame: failed to upload frame to layer', this.writeIndex);
+      return false;
+    }
+  }
 
   getSpiralIndices() {
     if (!this.spiralIndices) {
       this.spiralIndices = getSpiralBufferIndices(this.bufferSize);
+      console.log('[FB] getSpiralIndices:', this.spiralIndices);
     }
     return this.spiralIndices;
   }
 
   rotateBuffers() {
-    // Build a read-ordered view (newest-first) and store in this.readTextures.
-    // IMPORTANT: do NOT reorder this.textures array because writeIndex is the
-    // canonical ring-buffer mapping. Consumers should call getTextures() to
-    // receive the read-ordered textures after rotation.
     if (this.useSpiralRetention) {
       this._buildSpiralReadView();
     } else {
@@ -209,58 +323,89 @@ export class FrameBuffer {
   }
 
   _buildLinearReadView() {
-    // Newest-first: index 0 -> newest frame
     const ordered = [];
-    if (!this.textures || this.textures.length === 0) {
+    if (this.bufferSize === 0) {
       this.readTextures = ordered;
+      console.log('[FB] rotateBuffers (linear): readTextures =', this.readTextures);
       return;
     }
+
     const newestIdx = (this.writeIndex - 1 + this.bufferSize) % this.bufferSize;
     for (let i = 0; i < this.bufferSize; i++) {
       const idx = (newestIdx - i + this.bufferSize) % this.bufferSize;
-      ordered.push(this.textures[idx]);
+      ordered.push(idx);
     }
     this.readTextures = ordered;
+
+    console.log('[FB] rotateBuffers (linear): readTextures =', this.readTextures);
   }
 
-  _buildSpiralReadView() {
-    // Build read-ordered list following spiral indices (lookback offsets).
-    const spiralIndices = this.getSpiralIndices();
-    const ordered = [];
-    if (!this.textures || this.textures.length === 0) {
-      this.readTextures = ordered;
-      return;
+  // FrameBuffer.js — replace your spiral builder with this robust version
+_buildSpiralReadView() {
+  const spiralIndices = this.getSpiralIndices() || [];
+  const ordered = [];
+  const used = new Set();
+
+  const bufSize = this.bufferSize;
+  const newestFrameNumber = Math.max(0, this.frameCount - 1);
+
+  // Helper to push an index if valid and not used
+  const tryPush = (idx) => {
+    if (!Number.isFinite(idx)) return false;
+    const clamped = Math.max(0, Math.min(Math.floor(idx), bufSize - 1));
+    if (!used.has(clamped)) {
+      used.add(clamped);
+      ordered.push(clamped);
+      return true;
     }
-    // newest is writeIndex - 1
-    const newestFrameNumber = this.frameCount - 1;
-    for (let i = 0; i < this.bufferSize; i++) {
-      // spiralIndices[i] is a look-back offset (0 = newest)
-      const lookback = spiralIndices[i] !== undefined ? spiralIndices[i] : i;
-      let bufferIndex;
+    return false;
+  };
+
+  // 1) Try to satisfy spiralIndices entries (prefer them)
+  for (let i = 0; i < bufSize; i++) {
+    const lookback = (i < spiralIndices.length && Number.isFinite(spiralIndices[i])) ? spiralIndices[i] : null;
+    if (lookback !== null) {
       const targetFrame = newestFrameNumber - lookback;
       if (targetFrame >= 0) {
-        bufferIndex = ((targetFrame % this.bufferSize) + this.bufferSize) % this.bufferSize;
-      } else {
-        // If we don't have that many historical frames, fallback to linear recent mapping
-        bufferIndex = ((this.writeIndex - 1 - i) + this.bufferSize) % this.bufferSize;
+        const bufferIndex = ((targetFrame % bufSize) + bufSize) % bufSize;
+        tryPush(bufferIndex);
       }
-      ordered.push(this.textures[bufferIndex]);
     }
-    this.readTextures = ordered;
   }
 
-// -------------------- NEW: eviction readback helper --------------------
-// Read a texture slot into an ImageBitmap. Optionally downsamples to this.evictReadMaxSide
-async _readTextureToImageBitmap(texture, srcWidth, srcHeight) {
+  // 2) Fill remaining slots with newest-first monotonic fallback
+  for (let k = 0; ordered.length < bufSize && k < bufSize; k++) {
+    const lookback = k; // 0 = newest, 1 = previous, ...
+    const targetFrame = newestFrameNumber - lookback;
+    if (targetFrame >= 0) {
+      const bufferIndex = ((targetFrame % bufSize) + bufSize) % bufSize;
+      tryPush(bufferIndex);
+    }
+  }
+
+  // 3) As a last resort, fill any still-empty slots with safe sequential indices
+  for (let i = 0; ordered.length < bufSize; i++) {
+    const candidate = i % bufSize;
+    tryPush(candidate);
+  }
+
+  this.readTextures = ordered;
+  console.log('[FB] rotateBuffers (spiral): readTextures =', this.readTextures);
+}
+
+
+// Read a layer to ImageBitmap (downsample if necessary)
+async _readTextureToImageBitmap(layerIndex, srcWidth, srcHeight) {
   const gl = this.gl;
 
-  if (!texture) return null;
+  if (!this.frameArrayTexture || layerIndex < 0 || layerIndex >= this.bufferSize) {
+    return null;
+  }
 
-  // --- SAVE STATE ---
+  // Save state
   const prevFb = gl.getParameter(gl.FRAMEBUFFER_BINDING);
-  const prevViewport = gl.getParameter(gl.VIEWPORT);
+  const prevViewport = gl.getParameter(gl.VIEWPORT); // returns Int32Array in many browsers
 
-  // If the source is already small enough, read directly; otherwise downsample via an FBO
   const maxSide = this.evictReadMaxSide || 256;
   let readW = srcWidth;
   let readH = srcHeight;
@@ -271,164 +416,190 @@ async _readTextureToImageBitmap(texture, srcWidth, srcHeight) {
     readH = Math.max(1, Math.floor(srcHeight * scale));
   }
 
-  // Create temporary readback texture & framebuffer
-  const tmpTex = this.createTexture(readW, readH);
-  const tmpFb = gl.createFramebuffer();
-  gl.bindFramebuffer(gl.FRAMEBUFFER, tmpFb);
-  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tmpTex, 0);
-
   try {
-    // If the texture has an associated framebuffer in this.framebuffers array, we can read from it directly.
-    let srcFb = null;
-    const idx = this.textures.indexOf(texture);
-    if (idx >= 0 && this.framebuffers[idx]) srcFb = this.framebuffers[idx];
-
-    if (srcFb && srcWidth === readW && srcHeight === readH) {
-      // identical size => read straight from existing framebuffer
-      gl.bindFramebuffer(gl.FRAMEBUFFER, srcFb);
-    } else {
-      // Fallback: render src texture into tmpFb (requires blit helper)
-      gl.bindFramebuffer(gl.FRAMEBUFFER, tmpFb);
-      gl.viewport(0, 0, readW, readH);
-      // TODO: call your renderer.blitTexture(texture, targetFb=tmpFb, targetSize=[readW, readH]);
+    const targetFb = this.framebuffers[layerIndex];
+    if (!targetFb) {
+      console.warn(`No framebuffer available for layer ${layerIndex}`);
+      return null;
     }
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, targetFb);
+
+    // Read at the requested (possibly downsampled) resolution
+    gl.viewport(0, 0, readW, readH);
 
     const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
     if (status !== gl.FRAMEBUFFER_COMPLETE) {
-      console.warn('FrameBuffer.readback: framebuffer incomplete', status);
+      console.warn('FrameBuffer._readTextureToImageBitmap: framebuffer incomplete', status);
+      // restore framebuffer & viewport
+      try {
+        gl.bindFramebuffer(gl.FRAMEBUFFER, prevFb);
+        if (prevViewport && prevViewport.length === 4) {
+          gl.viewport(prevViewport[0], prevViewport[1], prevViewport[2], prevViewport[3]);
+        }
+      } catch (e) { /* best-effort restore; ignore */ }
+      return null;
     }
 
     const pixels = new Uint8Array(readW * readH * 4);
-    // readPixels reads bottom-left origin — callers should account for flip if needed
     gl.readPixels(0, 0, readW, readH, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
 
-    // --- RESTORE STATE ---
-    gl.bindFramebuffer(gl.FRAMEBUFFER, prevFb);
-    gl.viewport(prevViewport[0], prevViewport[1], prevViewport[2], prevViewport[3]);
+    // Restore framebuffer and viewport
+    try {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, prevFb);
+      if (prevViewport && prevViewport.length === 4) {
+        gl.viewport(prevViewport[0], prevViewport[1], prevViewport[2], prevViewport[3]);
+      }
+    } catch (e) { /* best-effort restore; ignore */ }
 
-    try { gl.deleteFramebuffer(tmpFb); } catch (e) {}
-    try { gl.deleteTexture(tmpTex); } catch (e) {}
-
-    // Convert bytes to ImageBitmap (transferable)
+    // Convert to ImageBitmap
     const clamped = new Uint8ClampedArray(pixels.buffer);
     const imageData = new ImageData(clamped, readW, readH);
     return await createImageBitmap(imageData);
+
   } catch (err) {
-    // --- RESTORE EVEN ON ERROR ---
-    gl.bindFramebuffer(gl.FRAMEBUFFER, prevFb);
-    gl.viewport(prevViewport[0], prevViewport[1], prevViewport[2], prevViewport[3]);
-
-    try { gl.deleteFramebuffer(tmpFb); } catch (e) {}
-    try { gl.deleteTexture(tmpTex); } catch (e) {}
-
+    // Attempt to restore state on error, then rethrow
+    try {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, prevFb);
+      if (prevViewport && prevViewport.length === 4) {
+        gl.viewport(prevViewport[0], prevViewport[1], prevViewport[2], prevViewport[3]);
+      }
+    } catch (e) { /* swallow restore errors */ }
     console.warn('FrameBuffer._readTextureToImageBitmap failed', err);
     throw err;
   }
 }
 
-  // -------------------- UPDATED: advanceWriteIndex triggers async eviction readback --------------------
   advanceWriteIndex() {
-    const evictedIndex = this.writeIndex; // about to overwrite this slot
+    const evictedIndex = this.writeIndex;
 
-    // Trigger eviction hook: convert old GL texture -> ImageBitmap then call onEvict(imageBitmap, meta)
-    if (this.onEvict && this.textures[evictedIndex]) {
+    console.log(`[FB] advanceWriteIndex: evicting layer = ${evictedIndex}`);
+
+    // Eviction: read back the layer being overwritten
+    if (this.onEvict && this.frameArrayTexture) {
       try {
-        // console.debug('evict:readback-start', { index: evictedIndex, frameNumber: this.frameCount });
-        // Capture reference sizes
         const srcWidth = this.width || CONFIG.DEFAULT_RESOLUTION.width;
         const srcHeight = this.height || CONFIG.DEFAULT_RESOLUTION.height;
 
-        // initiate async readback (do not await here — we don't block main loop).
-        this._readTextureToImageBitmap(this.textures[evictedIndex], srcWidth, srcHeight)
+        console.log(`[FB] advanceWriteIndex: scheduling eviction readback for layer ${evictedIndex}`);
+        this._readTextureToImageBitmap(evictedIndex, srcWidth, srcHeight)
           .then(imageBitmap => {
             if (!imageBitmap) {
-              console.warn('evict:readback produced no bitmap', evictedIndex);
+              console.warn('evict: readback produced no bitmap', evictedIndex);
               return;
             }
-            const meta = { index: evictedIndex, frameNumber: this.frameCount, timestamp: Date.now(), readW: imageBitmap.width, readH: imageBitmap.height };
+            const meta = {
+              index: evictedIndex,
+              frameNumber: this.frameCount,
+              timestamp: Date.now(),
+              readW: imageBitmap.width,
+              readH: imageBitmap.height
+            };
             try {
-              // console.debug('evict:forwarding', meta);
-              // Ownership of imageBitmap moves to the hook/consumer (transferable). Consumer must close when done.
               this.onEvict(imageBitmap, meta);
             } catch (err) {
-              console.error('evict:handler threw', err);
+              console.error('evict: handler threw', err);
               try { imageBitmap.close(); } catch (e) {}
             }
           })
           .catch(err => {
-            console.warn('evict:readback failed', { index: evictedIndex, err });
+            console.warn('evict: readback failed', { index: evictedIndex, err });
           });
       } catch (err) {
         console.warn('Eviction callback scheduling error:', err);
       }
     }
 
-    // Advance the write index — this invalidates readTextures cache
     this.writeIndex = (this.writeIndex + 1) % this.bufferSize;
     this.readTextures = null;
+
+    console.log(`[FB] advanceWriteIndex: new writeIndex = ${this.writeIndex}`);
   }
 
+  /**
+   * getTextures()
+   * Returns an **array** (newest-first) of descriptors:
+   *   [{ arrayTexture, layerIndex }, ...]
+   *
+   * Internally uses this.readTextures (indices only).
+   */
   getTextures() {
-    // Return read-ordered textures (newest-first). If rotateBuffers()
-    // has been called it will populate this.readTextures. Otherwise compute on demand.
-    if (Array.isArray(this.readTextures) && this.readTextures.length === this.bufferSize) {
-      return this.readTextures;
+    const arrayTexture = this.frameArrayTexture;
+
+    let layerIndices = Array.isArray(this.readTextures) ? this.readTextures : null;
+    if (!layerIndices || layerIndices.length !== this.bufferSize) {
+      this.rotateBuffers(); // rebuilds indices into this.readTextures
+      layerIndices = this.readTextures || [];
+      console.log('[FB] getTextures: rebuilt readTextures =', layerIndices);
     }
-    // Compute newest-first view on demand without mutating this.textures
-    const ordered = [];
-    if (!this.textures || this.textures.length === 0) return ordered;
-    const newestIdx = (this.writeIndex - 1 + this.bufferSize) % this.bufferSize;
-    for (let i = 0; i < this.bufferSize; i++) {
-      const idx = (newestIdx - i + this.bufferSize) % this.bufferSize;
-      ordered.push(this.textures[idx]);
-    }
-    return ordered;
+
+    const descriptors = layerIndices.map(idx => ({ arrayTexture, layerIndex: idx }));
+    // Lightweight trace: only print first few indices to avoid spamming
+    console.log('[FB] getTextures: descriptors (first 8) =', descriptors.slice(0, 8));
+    return descriptors;
   }
 
   getCurrentTexture() {
-    const t = this.getTextures();
-    return t[0] || null;
+    const textures = this.getTextures();
+    return textures[0] || { arrayTexture: this.frameArrayTexture, layerIndex: 0 };
   }
 
   getPreviousTexture(offset = 1) {
-    const t = this.getTextures();
-    const index = Math.min(offset, this.bufferSize - 1);
-    return t[index] || null;
+    const textures = this.getTextures();
+    const index = Math.min(Math.max(0, offset), Math.max(0, textures.length - 1));
+    return textures[index] || { arrayTexture: this.frameArrayTexture, layerIndex: 0 };
   }
 
   initializeWithFrame(video) {
-    // Ensure textures allocated
-    if (!this.textures || this.textures.length !== this.bufferSize) {
-      // Allocate textures/framebuffers for current dimensions (if width/height known)
-      this.resize(this.width || CONFIG.DEFAULT_RESOLUTION.width, this.height || CONFIG.DEFAULT_RESOLUTION.height);
+    const srcW = video.videoWidth || CONFIG.DEFAULT_RESOLUTION.width;
+    const srcH = video.videoHeight || CONFIG.DEFAULT_RESOLUTION.height;
+
+    console.log(`[FB] initializeWithFrame: filling layers 0..${this.bufferSize - 1} with first frame (${srcW}x${srcH})`);
+
+    this.width = srcW;
+    this.height = srcH;
+
+    if (!this.frameArrayTexture) {
+      this.resize(srcW, srcH);
     }
 
-    for (let i = 0; i < this.bufferSize; i++) {
-      const texture = this.textures[i];
-      this.gl.bindTexture(this.gl.TEXTURE_2D, texture);
-      // Flip during initialization so textures are upright
-      this.gl.pixelStorei(this.gl.UNPACK_FLIP_Y_WEBGL, true);
-      try {
-        // Prefer texSubImage2D if texture storage already allocated
-        this.gl.texSubImage2D(this.gl.TEXTURE_2D, 0, 0, 0, this.gl.RGBA, this.gl.UNSIGNED_BYTE, video);
-      } catch (e) {
-        try {
-          this.gl.texImage2D(this.gl.TEXTURE_2D, 0, this.gl.RGBA, this.gl.RGBA, this.gl.UNSIGNED_BYTE, video);
-        } catch (err) {
-          console.warn('Could not initialize frame buffer texture', i, err);
-        }
-      } finally {
-        this.gl.pixelStorei(this.gl.UNPACK_FLIP_Y_WEBGL, false);
+    const gl = this.gl;
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, this.frameArrayTexture);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+
+    try {
+      for (let i = 0; i < this.bufferSize; i++) {
+        gl.texSubImage3D(
+          gl.TEXTURE_2D_ARRAY,
+          0,
+          0,
+          0,
+          i,
+          srcW,
+          srcH,
+          1,
+          gl.RGBA,
+          gl.UNSIGNED_BYTE,
+          video
+        );
       }
+    } catch (err) {
+      console.warn('Could not initialize frame buffer array texture', err);
+    } finally {
+      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+      gl.bindTexture(gl.TEXTURE_2D_ARRAY, null);
     }
 
-    // Set frameCount to at least bufferSize to represent initialized history
     this.frameCount = this.bufferSize;
-    // Reset read view so callers will get newest-first view on next access
     this.readTextures = null;
   }
 
   getBufferInfo() {
+    let maxTextureUnits = 0;
+    try {
+      maxTextureUnits = this.gl.getParameter(this.gl.MAX_TEXTURE_IMAGE_UNITS);
+    } catch (e) {}
+
     return {
       bufferSize: this.bufferSize,
       maxBufferSize: CONFIG.MAX_BUFFER_SIZE,
@@ -436,9 +607,10 @@ async _readTextureToImageBitmap(texture, srcWidth, srcHeight) {
       useSpiralRetention: this.useSpiralRetention,
       spiralIndices: this.useSpiralRetention ? this.getSpiralIndices() : null,
       dimensions: { width: this.width, height: this.height },
+      arrayTextureApproach: true,
       hardwareLimits: {
-        maxTextureUnits: this.gl.getParameter(this.gl.MAX_TEXTURE_IMAGE_UNITS),
-        isHardwareLimited: this.bufferSize === CONFIG.MAX_BUFFER_SIZE
+        maxTextureUnits,
+        textureUnitsRequired: 4 // 1 for frame array + 3 for calibration
       }
     };
   }
@@ -446,19 +618,21 @@ async _readTextureToImageBitmap(texture, srcWidth, srcHeight) {
   destroy() {
     const gl = this.gl;
 
-    // Clean up textures
-    this.textures.forEach(texture => {
-      if (texture) gl.deleteTexture(texture);
-    });
+    if (this.frameArrayTexture) {
+      try { gl.deleteTexture(this.frameArrayTexture); } catch (e) {}
+      this.frameArrayTexture = null;
+    }
 
-    // Clean up framebuffers
     this.framebuffers.forEach(framebuffer => {
-      if (framebuffer) gl.deleteFramebuffer(framebuffer);
+      if (framebuffer) {
+        try { gl.deleteFramebuffer(framebuffer); } catch (e) {}
+      }
     });
 
-    this.textures = [];
     this.framebuffers = [];
     this.spiralIndices = null;
     this.readTextures = null;
+
+    console.log('[FB] destroy: cleaned up frame buffer resources');
   }
 }

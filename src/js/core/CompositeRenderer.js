@@ -22,6 +22,12 @@ export class CompositeRenderer {
     
     this.showMotionMask = false;
     
+    // Calibration meta stored at renderer-level (main may call setCalibration)
+    this.calibrationMeta = null;        // manifest data
+    this.calibrationMetaKey = null;     // canonical persisted key (string)
+    this.calibrationBiasArray = null;   // Float32Array if fetched to main and passed here (optional)
+    // webglRenderer holds the actual GL textures
+
     // Validate initial parameters
     this.validateAndClampParameters();
   }
@@ -74,16 +80,68 @@ export class CompositeRenderer {
   setShowMotionMask(show) {
     this.showMotionMask = show;
   }
+
+  /**
+   * Set calibration for rendering.
+   * - main can call this with either:
+   *     { darkFrame: ImageBitmap, flatFrame: ImageBitmap, biasArray: Float32Array, resolution: {width,height}, meta, metaKey }
+   *   or call with only meta/metaKey and then use loadPersistedCalibrationImages + getCalibrationBias to fetch images/bias from storage
+   *
+   * This method uploads textures into the WebGLRenderer (best-effort) and stores meta references.
+   */
+  setCalibration({ darkFrame = null, flatFrame = null, biasArray = null, resolution = null, meta = null, metaKey = null } = {}) {
+    try {
+      // Preserve meta info for later (useful for UI)
+      if (meta) this.calibrationMeta = meta;
+      if (metaKey) this.calibrationMetaKey = metaKey;
+      if (biasArray) this.calibrationBiasArray = biasArray;
+
+      // Ask webglRenderer to create GL textures for the dark/flat/bias
+      this.webglRenderer.setCalibrationTextures({
+        darkBitmap: darkFrame,
+        flatBitmap: flatFrame,
+        biasArray,
+        resolution,
+        metaKey
+      });
+
+      console.log('CompositeRenderer: calibration set (metaKey=', this.calibrationMetaKey, ')');
+    } catch (err) {
+      console.error('CompositeRenderer.setCalibration failed', err);
+      throw err;
+    }
+  }
+
+  /**
+   * Clear calibration (delete GL textures and clear stored meta).
+   */
+  clearCalibration() {
+    try {
+      // Clear GL textures
+      this.webglRenderer.clearCalibrationTextures();
+
+      // Clear stored meta/bias references (main may hold its own copies separately)
+      this.calibrationMeta = null;
+      this.calibrationMetaKey = null;
+      this.calibrationBiasArray = null;
+
+      console.log('CompositeRenderer: calibration cleared');
+    } catch (err) {
+      console.warn('CompositeRenderer.clearCalibration failed', err);
+    }
+  }
   
   render() {
     const frameTextures = this.frameBuffer.getTextures();
+    console.log('[CR] render(): got frameTextures (top-level). length=', frameTextures.length);
     
     // Ensure we don't exceed hardware limits
     const effectiveTextures = frameTextures.slice(0, CONFIG.MAX_BUFFER_SIZE);
     
     if (this.showMotionMask) {
-      this.renderMotionDebug(effectiveTextures);
+      this.renderMotionDebug(effectiveTextures, {});
     } else {
+      // Provide time/flipY/delta uniforms if you have that data (main may pass in opts)
       this.renderComposite(effectiveTextures);
     }
   }
@@ -91,34 +149,166 @@ export class CompositeRenderer {
   /**
    * New rendering entry: accept textures and uniforms
    */
-  renderComposite(frameTextures, uniforms = {}) {
-    // Ensure WebGL renderer is aware of current buffer size
-    const effectiveSize = Math.min(frameTextures.length, CONFIG.MAX_BUFFER_SIZE);
-    this.webglRenderer.updateBufferSize(effectiveSize);
-    
-    // Validate parameters one more time before rendering
-    const validatedParams = this.getValidatedParams(effectiveSize);
-    // Merge shader-time uniforms
-    const renderUniforms = {
-      ...validatedParams,
-      // allow overrides passed via uniforms (time, delta, flipY, etc.)
-      ...uniforms
-    };
-    
-    this.webglRenderer.renderComposite(frameTextures, renderUniforms);
+
+/**
+ * CompositeRenderer.js
+ * Updated renderComposite with descriptor normalization
+ */
+renderComposite(frameTextures, uniforms = {}) {
+  console.log('[CR] renderComposite: called. frameTextures type=', typeof frameTextures, 'isArrayLike=', (!!frameTextures && typeof frameTextures.length === 'number'));
+  // Defensive: ensure we can accept both shapes:
+  //  - array-like: [{ arrayTexture, layerIndex }, ...]
+  //  - normalized object: { arrayTexture, layerIndices: [...] }
+  const isArrayLike = frameTextures && (typeof frameTextures.length === 'number');
+
+  // Normalize into { arrayTexture, layerIndices: [] }
+  let arrayTexture = null;
+  let layerIndices = null;
+
+  if (!frameTextures) {
+    // nothing to do — inform renderer and bail out safely
+    if (!this._warnedInvalidFrameTextures) {
+      console.error('CompositeRenderer.renderComposite: no frameTextures provided (null/undefined).');
+      this._warnedInvalidFrameTextures = true;
+    }
+    try { this.webglRenderer && typeof this.webglRenderer.updateBufferSize === 'function' && this.webglRenderer.updateBufferSize(0); } catch(e) {}
+    return;
   }
-  
-  renderMotionDebug(frameTextures) {
-    const currentTexture = frameTextures[0];
-    const previousTexture = frameTextures[1] || currentTexture; // Fallback if only one frame
-    
-    // Pass optional flip/uniforms as part of the motion shader path if provided
-    this.webglRenderer.renderMotionMask(
-      currentTexture, 
-      previousTexture, 
-      this.params.motionThresh,
-      // motion shader doesn't change other uniforms currently
-    );
+
+  // Case A: already normalized object { arrayTexture, layerIndices }
+  if (!isArrayLike && typeof frameTextures === 'object') {
+    arrayTexture = frameTextures.arrayTexture || null;
+    layerIndices = Array.isArray(frameTextures.layerIndices) ? frameTextures.layerIndices.slice() : null;
+  }
+  // Case B: array-like (likely FrameBuffer.getTextures())
+  else if (isArrayLike) {
+    // frameTextures is an array. Each entry hopefully is { arrayTexture, layerIndex }.
+    const arr = Array.from(frameTextures);
+    layerIndices = [];
+
+    for (let i = 0; i < arr.length; i++) {
+      const e = arr[i];
+      if (e && typeof e === 'object') {
+        // descriptor object
+        if (!arrayTexture && e.arrayTexture) arrayTexture = e.arrayTexture;
+        if (typeof e.layerIndex === 'number') {
+          // ensure integer
+          layerIndices.push(Math.max(0, Math.floor(e.layerIndex)));
+        } else {
+          // fallback: if descriptor doesn't hold layerIndex, attempt to treat the index order as layer index
+          layerIndices.push(i);
+        }
+      } else if (typeof e === 'number') {
+        // array of numeric indices
+        layerIndices.push(Math.max(0, Math.floor(e)));
+      } else {
+        // unknown entry, skip
+      }
+    }
+  } else {
+    // Unexpected shape
+    if (!this._warnedInvalidFrameTextures) {
+      console.error('CompositeRenderer.renderComposite: invalid frameTextures (unexpected type). Received:', frameTextures);
+      this._warnedInvalidFrameTextures = true;
+    }
+    try { this.webglRenderer && typeof this.webglRenderer.updateBufferSize === 'function' && this.webglRenderer.updateBufferSize(0); } catch(e) {}
+    return;
+  }
+
+  // Clear one-time warning if we got a usable value now
+  this._warnedInvalidFrameTextures = false;
+  console.log('[CR] renderComposite: normalized -> arrayTexture=', !!arrayTexture, ', layerIndices.length=', Array.isArray(layerIndices) ? layerIndices.length : 0, ', layerIndices(first8)=', Array.isArray(layerIndices) ? layerIndices.slice(0,8) : null);
+
+  // Validate we have an arrayTexture and layerIndices
+  if (!arrayTexture) {
+    // Missing arrayTexture is fatal for sampler2DArray path; warn and bail
+    console.warn('CompositeRenderer.renderComposite: no arrayTexture (nothing to bind).');
+    try { this.webglRenderer && typeof this.webglRenderer.updateBufferSize === 'function' && this.webglRenderer.updateBufferSize(0); } catch(e) {}
+    return;
+  }
+  if (!Array.isArray(layerIndices) || layerIndices.length === 0) {
+    // Nothing to render (no layers). Inform renderer and bail
+    try { this.webglRenderer && typeof this.webglRenderer.updateBufferSize === 'function' && this.webglRenderer.updateBufferSize(0); } catch(e) {}
+    return;
+  }
+
+  // Compute effective size (clamped to application max)
+  let effectiveSize = Math.min(layerIndices.length, CONFIG.MAX_BUFFER_SIZE);
+  effectiveSize = Number.isFinite(effectiveSize) ? Math.max(0, Math.floor(effectiveSize)) : 0;
+  console.log('[CR] renderComposite: effectiveSize=', effectiveSize);
+
+  if (!Number.isFinite(effectiveSize) || Number.isNaN(effectiveSize)) {
+    console.error('CompositeRenderer.renderComposite: computed invalid effectiveSize:', effectiveSize, 'layerIndices.length=', layerIndices.length);
+    try { this.webglRenderer && typeof this.webglRenderer.updateBufferSize === 'function' && this.webglRenderer.updateBufferSize(0); } catch(e) {}
+    return;
+  }
+
+  // Notify WebGLRenderer of buffer size (guarded call)
+  try {
+    if (this.webglRenderer && typeof this.webglRenderer.updateBufferSize === 'function') {
+      this.webglRenderer.updateBufferSize(effectiveSize);
+      console.log('[CR] renderComposite: webglRenderer.updateBufferSize called with', effectiveSize);
+    }
+  } catch (err) {
+    console.error('CompositeRenderer.renderComposite: webglRenderer.updateBufferSize failed', err);
+    return;
+  }
+
+  // If there are no frames to render after clamping, return early
+  if (effectiveSize === 0) {
+    return;
+  }
+
+  // Use validated params for uniforms
+  const validatedParams = this.getValidatedParams(effectiveSize);
+
+  // Merge runtime uniforms supplied by caller
+  const renderUniforms = {
+    ...validatedParams,
+    ...uniforms
+  };
+
+  // Ensure useCalibration flag reflects renderer state
+  renderUniforms.useCalibration = !!(this.webglRenderer && typeof this.webglRenderer.hasCalibration === 'function' && this.webglRenderer.hasCalibration());
+
+  // Build normalized frameBufferData expected by WebGLRenderer
+  const normalizedFrameBufferData = {
+    arrayTexture,
+    layerIndices: layerIndices.slice(0, effectiveSize)
+  };
+  console.log('[CR] renderComposite: normalizedFrameBufferData.layerIndices(first8)=', normalizedFrameBufferData.layerIndices.slice(0,8));
+
+  // Call into WebGLRenderer with normalized data
+  try {
+    if (this.webglRenderer && typeof this.webglRenderer.renderComposite === 'function') {
+      console.log('[CR] renderComposite: invoking webglRenderer.renderComposite (arrayTexture bound?), layerIndices.length=', normalizedFrameBufferData.layerIndices.length);
+      this.webglRenderer.renderComposite(normalizedFrameBufferData, renderUniforms);
+      console.log('[CR] renderComposite: webglRenderer.renderComposite returned (no exception)');
+    } else {
+      console.warn('CompositeRenderer.renderComposite: webglRenderer.renderComposite is not available');
+    }
+  } catch (renderErr) {
+    console.error('CompositeRenderer.renderComposite: webglRenderer.renderComposite threw an error', renderErr);
+  }
+}
+
+  renderMotionDebug(frameTextures, uniforms = {}) {
+    // Defensive normalization: frameTextures is array of descriptors
+    const currentDesc = frameTextures[0];
+    const previousDesc = frameTextures[1] || currentDesc;
+
+    // Build the { arrayTexture, layerIndices } shape expected by WebGLRenderer
+    const motionFrameBufferData = {
+      arrayTexture: currentDesc && currentDesc.arrayTexture ? currentDesc.arrayTexture : null,
+      layerIndices: [
+        (currentDesc && typeof currentDesc.layerIndex === 'number') ? currentDesc.layerIndex : 0,
+        (previousDesc && typeof previousDesc.layerIndex === 'number') ? previousDesc.layerIndex : 0
+      ]
+    };
+
+    const flipY = !!(uniforms.flipY ?? this.params.flipY);
+    // Call webglRenderer with the normalized frameBufferData
+    this.webglRenderer.renderMotionMask(motionFrameBufferData, this.params.motionThresh, flipY);
   }
   
   /**
@@ -142,35 +332,56 @@ export class CompositeRenderer {
    * @param {HTMLVideoElement} video - Video source
    * @param {Object} opts - { time: seconds, delta: seconds, flipY: boolean }
    */
-  processFrame(video, opts = {}) {
-    try {
-      // Upload current frame to buffer at writeIndex
-      this.frameBuffer.uploadVideoFrame(video);
-
-      // Advance write index so newest frame is considered at read-time index 0
-      this.frameBuffer.advanceWriteIndex();
-
-      // Build read-ordered view according to retention policy
-      this.frameBuffer.rotateBuffers();
-
-      // Get read-ordered textures (newest first)
-      const frameTextures = this.frameBuffer.getTextures();
-
-      // Render using validated params and pass time/flipY
-      const validatedParams = this.getValidatedParams(Math.min(frameTextures.length, CONFIG.MAX_BUFFER_SIZE));
-      const renderUniforms = {
-        ...validatedParams,
-        time: opts.time ?? 0.0,
-        delta: opts.delta ?? 0.0,
-        flipY: !!opts.flipY
-      };
-      this.renderComposite(frameTextures, renderUniforms);
-
-    } catch (error) {
-      console.error('Error processing frame:', error);
-      throw error; // Re-throw to allow caller to handle
-    }
+  async processFrame(video, opts = {}) {
+  // Prevent re-entrancy / overlapping frames
+  if (this._processingFrame) {
+    // Skip this frame if a previous frame is still being processed.
+    // This avoids races with writeIndex/texture uploads.
+    console.warn('[CR] processFrame: previous frame still processing — skipping this tick');
+    return;
   }
+  this._processingFrame = true;
+
+  try {
+    console.log('[CR] processFrame: start — writeIndex(before upload)=', this.frameBuffer.writeIndex, 'frameCount=', this.frameBuffer.frameCount);
+
+    // Upload current frame to buffer at writeIndex and await completion.
+    const ok = await this.frameBuffer.uploadVideoFrame(video, { allowBitmapFallback: true });
+    if (!ok) {
+      console.warn('[CR] processFrame: uploadVideoFrame failed — skipping advance/render for this frame');
+      return;
+    }
+    console.log('[CR] processFrame: uploaded frame to layer (post-upload writeIndex still)=', this.frameBuffer.writeIndex, 'frameCount=', this.frameBuffer.frameCount);
+
+    // Advance write index so newest frame becomes index 0 in read view
+    this.frameBuffer.advanceWriteIndex();
+    console.log('[CR] processFrame: advanceWriteIndex done — new writeIndex=', this.frameBuffer.writeIndex);
+
+    // Build read-ordered view according to retention policy (spiral/linear)
+    this.frameBuffer.rotateBuffers();
+    console.log('[CR] processFrame: rotateBuffers done — readTextures=', this.frameBuffer.readTextures ? this.frameBuffer.readTextures.slice(0,8) : null);
+
+    // Get read-ordered textures (newest first)
+    const frameTextures = this.frameBuffer.getTextures();
+    console.log('[CR] processFrame: frameTextures descriptors (first 8)=', frameTextures.slice(0,8));
+
+    // Render using validated params and pass time/flipY
+    const validatedParams = this.getValidatedParams(Math.min(frameTextures.length, CONFIG.MAX_BUFFER_SIZE));
+    const renderUniforms = {
+      ...validatedParams,
+      time: opts.time ?? 0.0,
+      delta: opts.delta ?? 0.0,
+      flipY: !!opts.flipY
+    };
+    this.renderComposite(frameTextures, renderUniforms);
+
+  } catch (error) {
+    console.error('Error processing frame:', error);
+    throw error; // Re-throw so callers can observe failures if they want
+  } finally {
+    this._processingFrame = false;
+  }
+}
   
   initializeBuffer(video) {
     try {
@@ -206,6 +417,11 @@ export class CompositeRenderer {
         maxBufferSize: CONFIG.MAX_BUFFER_SIZE,
         isLimited: bufferInfo.bufferSize === CONFIG.MAX_BUFFER_SIZE,
         actualTextureUnits: rendererCaps.maxTextureUnits
+      },
+      calibration: {
+        metaKey: this.calibrationMetaKey,
+        meta: this.calibrationMeta,
+        hasGLCalibration: this.webglRenderer.hasCalibration()
       }
     };
   }
@@ -408,7 +624,7 @@ export class CompositeRenderer {
    */
   resetToOptimal() {
     const optimalSize = Math.min(
-      this.webglRenderer.getOptimalBufferSize(),
+      this.webglRenderer.getOptimalBufferSize ? this.webglRenderer.getOptimalBufferSize() : CONFIG.MAX_BUFFER_SIZE,
       CONFIG.MAX_BUFFER_SIZE
     );
     
@@ -441,7 +657,7 @@ export class CompositeRenderer {
     };
     
     // Check basic hardware support
-    if (!caps.hardwareValidation.isSupported) {
+    if (!caps.validation.isValid) {
       validation.isSupported = false;
       validation.errors.push('Hardware does not meet minimum requirements');
     }

@@ -219,19 +219,49 @@ async function putInboundArtifact(artifact) {
     getReq.onsuccess = () => {
       const existing = getReq.result;
       if (existing) {
-        // Already exists: update meta if needed but avoid duplicate FIFO entries
-        existing.meta = { ...existing.meta, ...art.meta };
-        if (art.blob) existing.blob = art.blob;
-        if (art.data) existing.data = art.data;
-        artifacts.put(existing);
-        tx.oncomplete = () => {
-          // find seq for existing inbound entry? We keep idempotent writes simple: broadcast ready
-          const bc = ensureBroadcast();
-          if (bc) bc.postMessage({ event: 'artifact:ready', key: art.key, meta: existing.meta });
-          resolve({ ok: true, seq: null, reused: true });
-        };
+        // Already exists: update meta/blob/data and adjust totalBytes accounting to keep counters accurate.
+        try {
+          const oldSize = existing.meta?.sizeBytes || (existing.blob ? existing.blob.size : 0);
+          const newSize = art.meta.sizeBytes || (art.blob ? art.blob.size : 0);
+          // Merge meta + replace blob/data as appropriate
+          existing.meta = { ...existing.meta, ...art.meta };
+          if (art.blob) existing.blob = art.blob;
+          if (art.data) existing.data = art.data;
+          // update sizeBytes to the new estimate
+          existing.meta.sizeBytes = newSize;
+          // persist
+          artifacts.put(existing);
+
+          // Adjust totalBytes counter by (new - old)
+          const totalReq = counters.get('totalBytes');
+          totalReq.onsuccess = () => {
+            const cur = totalReq.result ? totalReq.result.value : 0;
+            const adjusted = Math.max(0, cur - oldSize + newSize);
+            counters.put({ id: 'totalBytes', value: adjusted });
+          };
+
+          // If this artifact was pinned, adjust pinnedBytes by the same delta
+          if (existing.meta && existing.meta.pinned) {
+            const pinnedReq = counters.get('pinnedBytes');
+            pinnedReq.onsuccess = () => {
+              const curPinned = pinnedReq.result ? pinnedReq.result.value : 0;
+              const newPinned = Math.max(0, curPinned - oldSize + newSize);
+              counters.put({ id: 'pinnedBytes', value: newPinned });
+            };
+          }
+
+          tx.oncomplete = () => {
+            const bc = ensureBroadcast();
+            if (bc) bc.postMessage({ event: 'artifact:ready', key: art.key, meta: existing.meta });
+            resolve({ ok: true, seq: null, reused: true });
+          };
+        } catch (e) {
+          tx.abort();
+          reject(e);
+        }
         return;
       }
+
 
       // New artifact: add artifact and stream entry (inbound)
       artifacts.put(art);
@@ -387,38 +417,52 @@ async function pinArtifact(key, { owner = 'user', type = 'soft' } = {}) {
     const tx = db.transaction([ARTIFACTS_STORE, COUNTERS_STORE], 'readwrite');
     const artifacts = tx.objectStore(ARTIFACTS_STORE);
     const counters = tx.objectStore(COUNTERS_STORE);
-    const req = artifacts.get(key);
-    req.onsuccess = async () => {
-      const art = req.result;
-      if (!art) { tx.abort(); return resolve({ ok: false, reason: 'NOT_FOUND' }); }
-      const size = art.meta?.sizeBytes || (art.blob ? art.blob.size : 0);
-      // check current pinned bytes
-      const pbReq = counters.get('pinnedBytes');
-      pbReq.onsuccess = () => {
-        const pinnedBytes = pbReq.result ? pbReq.result.value : 0;
-        // pin budget enforcement: simple soft budget 30% of quota
-        const softBudget = Math.floor(quotaBytes * 0.3);
-        if (pinnedBytes + size > softBudget && type === 'soft') {
-          // attempt to demote soft pins (not implemented here fully)
-          // For simplicity, reject if pin would exceed soft budget.
-          tx.abort();
-          return resolve({ ok: false, reason: 'PIN_BUDGET_EXCEEDED' });
-        }
-        // proceed to pin
-        art.meta = art.meta || {};
-        art.meta.pinned = true;
-        art.meta.pinType = type;
+  const req = artifacts.get(key);
+  req.onsuccess = async () => {
+    const art = req.result;
+    if (!art) { tx.abort(); return resolve({ ok: false, reason: 'NOT_FOUND' }); }
+    const size = art.meta?.sizeBytes || (art.blob ? art.blob.size : 0);
+    // check current pinned bytes
+    const pbReq = counters.get('pinnedBytes');
+    pbReq.onsuccess = () => {
+      const pinnedBytes = pbReq.result ? pbReq.result.value : 0;
+      // pin budget enforcement: simple soft budget 30% of quota
+      const softBudget = Math.floor(quotaBytes * 0.3);
+
+      // If already pinned, do nothing (avoid double-count)
+      if (art.meta && art.meta.pinned) {
+        // update meta to reflect new owner/type if requested, but do not change counters
+        art.meta.pinType = art.meta.pinType || type;
         art.meta.pinOwner = owner;
         artifacts.put(art);
-        counters.put({ id: 'pinnedBytes', value: pinnedBytes + size });
-        tx.oncomplete = () => { 
+        tx.oncomplete = () => {
           const bc = ensureBroadcast();
-          if (bc) bc.postMessage({ event: 'artifact:pinned', key, owner, type });
-          resolve({ ok: true });
+          if (bc) bc.postMessage({ event: 'artifact:pinned', key, owner, type, reused: true });
+          resolve({ ok: true, reused: true });
         };
+        return;
+      }
+
+      if (pinnedBytes + size > softBudget && type === 'soft') {
+        // For simplicity, reject if pin would exceed soft budget.
+        tx.abort();
+        return resolve({ ok: false, reason: 'PIN_BUDGET_EXCEEDED' });
+      }
+      // proceed to pin: compute delta and update pinnedBytes
+      art.meta = art.meta || {};
+      art.meta.pinned = true;
+      art.meta.pinType = type;
+      art.meta.pinOwner = owner;
+      artifacts.put(art);
+      counters.put({ id: 'pinnedBytes', value: pinnedBytes + size });
+      tx.oncomplete = () => { 
+        const bc = ensureBroadcast();
+        if (bc) bc.postMessage({ event: 'artifact:pinned', key, owner, type });
+        resolve({ ok: true });
       };
-      pbReq.onerror = () => resolve({ ok: false, reason: 'ERROR' });
     };
+    pbReq.onerror = () => resolve({ ok: false, reason: 'ERROR' });
+  };
     req.onerror = () => resolve({ ok: false, reason: 'ERROR' });
   });
 }
@@ -439,13 +483,30 @@ async function unpinArtifact(key) {
       const size = art.meta?.sizeBytes || (art.blob ? art.blob.size : 0);
       const pbReq = counters.get('pinnedBytes');
       pbReq.onsuccess = () => {
-        const pinnedBytes = pbReq.result ? pbReq.result.value : 0;
+        let pinnedBytes = pbReq.result ? pbReq.result.value : 0;
         art.meta = art.meta || {};
+
+        if (!art.meta.pinned) {
+          // nothing to do, avoid touching pinned counter
+          tx.oncomplete = () => {
+            const bc = ensureBroadcast();
+            if (bc) bc.postMessage({ event: 'artifact:unpinned', key, reused: true });
+            resolve({ ok: true, reused: true });
+          };
+          // still persist meta cleanup to ensure consistent state
+          artifacts.put(art);
+          return;
+        }
+
+        // Only decrement if it was pinned
         delete art.meta.pinned;
         delete art.meta.pinType;
         delete art.meta.pinOwner;
         artifacts.put(art);
-        counters.put({ id: 'pinnedBytes', value: Math.max(0, pinnedBytes - size) });
+
+        pinnedBytes = Math.max(0, pinnedBytes - size);
+        counters.put({ id: 'pinnedBytes', value: pinnedBytes });
+
         tx.oncomplete = () => { 
           const bc = ensureBroadcast();
           if (bc) bc.postMessage({ event: 'artifact:unpinned', key });
@@ -550,9 +611,14 @@ async function getSimilar(srcMeta, { timeWindow = 5000, phashThreshold = 0.85 } 
       if (art.meta?.srcHash === srcMeta.srcHash) {
         results.push(art);
       } else if (srcMeta.timestamp && art.meta?.timestamp) {
-        const timeDiff = Math.abs(art.meta.timestamp - srcMeta.timestamp);
-        if (timeDiff <= timeWindow) {
-          results.push(art);
+        // Support both numeric ms timestamps and ISO strings
+        const tA = (typeof art.meta.timestamp === 'number') ? art.meta.timestamp : Date.parse(art.meta.timestamp);
+        const tB = (typeof srcMeta.timestamp === 'number') ? srcMeta.timestamp : Date.parse(srcMeta.timestamp);
+        if (!Number.isNaN(tA) && !Number.isNaN(tB)) {
+          const timeDiff = Math.abs(tA - tB);
+          if (timeDiff <= timeWindow) {
+            results.push(art);
+          }
         }
       }
       
@@ -614,7 +680,7 @@ async function checkQuotaAndEvict() {
     const streams = tx.objectStore(STREAMS_STORE);
     const artifacts = tx.objectStore(ARTIFACTS_STORE);
     const counters = tx.objectStore(COUNTERS_STORE);
-
+    let evictedCount = 0;
     const cursorReq = streams.openCursor(null, 'next'); // oldest-first
     cursorReq.onsuccess = async (ev) => {
       const cursor = ev.target.result;
@@ -653,6 +719,7 @@ async function checkQuotaAndEvict() {
           artifacts.delete(art.key);
           cursor.delete();
           freed += size;
+          evictedCount++;
           // decrement counter
           const totalReq = counters.get('totalBytes');
           totalReq.onsuccess = () => {
@@ -663,7 +730,8 @@ async function checkQuotaAndEvict() {
           const bc = ensureBroadcast();
           if (bc) bc.postMessage({ event: 'artifact:evicted', key: art.key, freedBytes: size });
           // Stop early if we freed enough
-          if ((total - freed) <= quotaBytes || freed >= EVICT_BATCH * 1024 * 1024) {
+          // Stop early if we freed enough or hit the item-count limit
+          if ((total - freed) <= quotaBytes || evictedCount >= EVICT_BATCH) {
             const finalTotalReq = counters.get('totalBytes');
             finalTotalReq.onsuccess = () => resolve({ ok: true, freed });
             finalTotalReq.onerror = () => resolve({ ok: false, freed });
@@ -796,5 +864,22 @@ if (typeof self !== 'undefined' && typeof importScripts === 'function') {
   self.stopEvictorLoop = stopEvictorLoop;
   console.log('storage.js: Worker globals set up successfully');
 }
+
+// --- Expose storageAPI for ES Modules and window (safe, non-breaking) ---
+
+// If environment supports ES module exports (browsers using import), export default
+// This keeps the file compatible both as a worker-global script (self.onstorage...) and as an ES import.
+try {
+  // attach to window for simpler debugging & backwards-compat
+  if (typeof window !== 'undefined') {
+    window.storageAPI = storageAPI;
+  }
+} catch (e) {
+  // no-op
+}
+
+// ES module default export (non-breaking if bundler supports it)
+export default storageAPI;
+export { storageAPI };
 
 console.log('storage.js: Module loaded successfully');

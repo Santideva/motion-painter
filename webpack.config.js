@@ -22,17 +22,6 @@ module.exports = {
           }
         }
       },
-      // Add worker file handling
-      {
-        test: /\.worker\.js$/,
-        use: {
-          loader: 'worker-loader',
-          options: {
-            filename: '[name].[contenthash].worker.js',
-            publicPath: '/dist/'
-          }
-        }
-      },
       {
         test: /\.css$/,
         use: ['style-loader', 'css-loader']
@@ -53,13 +42,12 @@ module.exports = {
       template: './public/index.html',
       title: 'Motion Painter'
     }),
-    new CopyWebpackPlugin({
-      patterns: [
-        { from: 'src/assets', to: 'assets', noErrorOnMissing: true },
-        // Copy worker files to be accessible via direct URL
-        { from: 'src/js/core/*.worker.js', to: 'src/js/core/[name][ext]' }
-      ]
-    })
+  new CopyWebpackPlugin({
+    patterns: [
+      { from: 'src/assets', to: 'assets', noErrorOnMissing: true }
+      // worker files are bundled by webpack as module workers (do not copy raw worker sources)
+    ]
+  })
   ],
   devServer: {
     static: [

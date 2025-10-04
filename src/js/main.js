@@ -1,15 +1,17 @@
-// Import styles
+// Import styles 
 import '../styles/main.css';
 import '../styles/controls.css';
 import '../styles/layout.css';
 
 // Import core modules
-import { WebGLRenderer } from './core/WebGLRenderer.js';
+// near top imports
+import { addFrameBufferDiagnostics, addWebGLRendererDiagnostics } from './core/diagnostics.js';
+import { WebGLRenderer } from './core/webGLRenderer.js';
 import { FrameBuffer } from './core/FrameBuffer.js';
 import { MotionDetector } from './core/MotionDetector.js';
 import { CompositeRenderer } from './core/CompositeRenderer.js';
 import { FrameEvictionHook } from './core/FrameEvictionHook.js';
-import { PreprocessorWorker } from './core/PreprocessorWorker.js';
+import { PreprocessorWorker } from './core/PreProcessorWorker.js';
 
 // Import UI modules
 import { Controls } from './ui/Controls.js';
@@ -17,6 +19,9 @@ import { MediaInput } from './ui/MediaInput.js';
 
 // Import utilities
 import { CONFIG, validateBufferSize } from './utils/MathUtils.js';
+
+// Import storage API (storage.js exports storageAPI for main thread use)
+import storageAPI from './core/storage.js';
 
 class MotionPainter {
   constructor() {
@@ -32,6 +37,17 @@ class MotionPainter {
     // Preprocessor + evictionHook will be created in init() once frameBuffer exists
     this.preprocessor = null;
     this.evictionHook = null;
+    
+    // Calibration state (main-side)
+    // Note: the canonical persisted metaKey is owned/pinned by the worker when computeCalibration succeeds.
+    // The wrapper (PreprocessorWorker instance) will also store the canonical metaKey in this.preprocessor.calibrationMetaKey
+    this.calibration = {
+      metaKey: null,     // canonical persisted calibration manifest key
+      meta: null,        // calibration metadata (resolution/frameCount/version...)
+      darkFrame: null,   // ImageBitmap (if worker returned it on compute)
+      flatFrame: null    // ImageBitmap (if worker returned it on compute)
+      // Note: bias buffer (Float32Array) is intentionally NOT stored here unless explicitly fetched from storage
+    };
     
     this.isRendering = false;
     this.isPaused = false;
@@ -51,7 +67,10 @@ class MotionPainter {
       
       // Initialize core components with enhanced buffer support
       this.webglRenderer = new WebGLRenderer(this.canvas);
-      
+
+      // Diagnostics: attach renderer-level diagnostics (dev only)
+      addWebGLRendererDiagnostics(this.webglRenderer, {devMode: true});
+
       // Check hardware capabilities immediately after WebGL initialization
       this.hardwareLimitations = this.webglRenderer.getCapabilities();
       
@@ -60,10 +79,13 @@ class MotionPainter {
       const initialBufferSize = validation.clampedSize;
       
       this.frameBuffer = new FrameBuffer(this.webglRenderer.gl, initialBufferSize);
+
+      // DIAGNOSTICS: attach FrameBuffer diagnostics (wrap upload + validation)
+      addFrameBufferDiagnostics(this.frameBuffer, { devMode: true });
       
       // --- set up preprocessor + eviction hook AFTER FrameBuffer exists ---
       try {
-        // create wrapper; worker URL should point to your worker module
+        // create wrapper; the wrapper implementation resolves promises on calibration ready.
         this.preprocessor = new PreprocessorWorker('./core/preprocessor.worker.js');
 
         // create and attach the eviction hook (FrameEvictionHook is defensive if frameBuffer is null)
@@ -118,43 +140,48 @@ class MotionPainter {
         }
       }
       
+      // Expose calibration helpers for debugging / UI (optional)
+      window.fetchCalibrationBias = (metaKey) => this.getCalibrationBias(metaKey);
+      window.loadPersistedCalibrationImages = (metaKey) => this.loadPersistedCalibrationImages(metaKey);
+      window.clearCalibration = () => this.clearCalibration();
+      
     } catch (error) {
       console.error('Failed to initialize Motion Painter:', error);
       alert('Initialization failed: ' + error.message);
     }
   }
   
-    setupEventHandlers() {
-      // Controls event handlers
-      this.controls.on('paramChange', (data) => {
-        this.handleParamChange(data);
-      });
-      
-      this.controls.on('action', (data) => {
-        this.handleAction(data.action);
-      });
-      
-      // Media input ready callback
-      this.mediaInput.onSourceReady = () => {
-        this.startRendering();
-      };
-      
-      // Window resize handler
-      window.addEventListener('resize', () => {
-        if (this.isRendering) {
-          this.resizeCanvas();
-        }
-      });
-      
-      // Visibility change handler (pause when tab hidden)
-      document.addEventListener('visibilitychange', () => {
-        if (document.hidden && this.isRendering) {
-          this.pauseRendering();
-        } else if (!document.hidden && this.isRendering && !this.isPaused) {
-          this.resumeRendering();
-        }
-      });
-    }
+  setupEventHandlers() {
+    // Controls event handlers
+    this.controls.on('paramChange', (data) => {
+      this.handleParamChange(data);
+    });
+    
+    this.controls.on('action', (data) => {
+      this.handleAction(data.action);
+    });
+    
+    // Media input ready callback
+    this.mediaInput.onSourceReady = () => {
+      this.startRendering();
+    };
+    
+    // Window resize handler
+    window.addEventListener('resize', () => {
+      if (this.isRendering) {
+        this.resizeCanvas();
+      }
+    });
+    
+    // Visibility change handler (pause when tab hidden)
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden && this.isRendering) {
+        this.pauseRendering();
+      } else if (!document.hidden && this.isRendering && !this.isPaused) {
+        this.resumeRendering();
+      }
+    });
+  }
   
   handleParamChange(data) {
     const { param, value, allParams } = data;
@@ -498,10 +525,14 @@ displayHardwareLimitations() {
     if (!canvasPanel) {
       // Fallback to original resize behavior but use drawing-buffer sizes
       const sizes = this.webglRenderer.resizeCanvas(this.video);
-      // pass drawing-buffer pixel sizes into FrameBuffer
-      this.frameBuffer.resize(sizes.drawingWidth, sizes.drawingHeight);
-      this.controls.updateBufferInfo(sizes.drawingWidth, sizes.drawingHeight);
-      console.log(`Canvas resized to ${sizes.drawingWidth}x${sizes.drawingHeight} (fallback)`);
+
+      // Prefer the video's native pixel resolution for the frame array texture
+      const fbWidth  = (this.video && this.video.videoWidth)  ? this.video.videoWidth  : sizes.drawingWidth;
+      const fbHeight = (this.video && this.video.videoHeight) ? this.video.videoHeight : sizes.drawingHeight;
+
+      this.frameBuffer.resize(fbWidth, fbHeight);
+      this.controls.updateBufferInfo(fbWidth, fbHeight);
+      console.log(`Canvas resized to ${sizes.drawingWidth}x${sizes.drawingHeight} (fallback). FrameBuffer allocated at ${fbWidth}x${fbHeight}`);
       return;
     }
 
@@ -574,32 +605,32 @@ displayHardwareLimitations() {
     this.controls.videoWidth = targetWidth;
     this.controls.videoHeight = targetHeight;
 
-    // --- key change: capture the full sizes object from renderer ---
-    // webglRenderer.resizeCanvas(...) now returns:
-    // { cssWidth, cssHeight, drawingWidth, drawingHeight }
+  // Ask renderer to compute drawing sizes (canvas sized to target)
     const sizes = this.webglRenderer.resizeCanvas(this.video, targetWidth, targetHeight);
 
-    // Optional: keep debug copy on renderer
+  // keep debug copy
     this.webglRenderer.lastResizeResult = sizes;
 
-    // IMPORTANT: pass drawing-buffer pixel sizes to FrameBuffer (device pixels)
-    this.frameBuffer.resize(sizes.drawingWidth, sizes.drawingHeight);
+  // --- Use the VIDEO native pixel size for the FrameBuffer texture where possible ---
+    const fbWidth  = (this.video && this.video.videoWidth)  ? this.video.videoWidth  : sizes.drawingWidth;
+    const fbHeight = (this.video && this.video.videoHeight) ? this.video.videoHeight : sizes.drawingHeight;
 
-    // Update memory usage display after resize (pass pixel dims)
-    this.controls.updateBufferInfo(sizes.drawingWidth, sizes.drawingHeight);
+    this.frameBuffer.resize(fbWidth, fbHeight);
+    this.controls.updateBufferInfo(fbWidth, fbHeight);
 
-    console.log(`Canvas resized to ${sizes.drawingWidth}x${sizes.drawingHeight} (${viewportConfig.size} mode)`);
+    console.log(`Canvas resized to ${sizes.drawingWidth}x${sizes.drawingHeight} (${viewportConfig.size} mode). FrameBuffer allocated at ${fbWidth}x${fbHeight} (video native preferred).`);
   }
   
-  renderLoop() {
+  // main.js (MotionPainter) — updated renderLoop to await processFrame
+  async renderLoop() {
     if (!this.isRendering) {
       return;
     }
-    
+
     if (!this.isPaused && this.mediaInput.isVideoReady()) {
       try {
-        // Process current video frame
-        this.compositeRenderer.processFrame(this.video);
+        // Await processing of current video frame (upload + buffer management + render)
+        await this.compositeRenderer.processFrame(this.video);
       } catch (error) {
         console.error('Render error:', error);
         this.controls.updateStatus('Render error: ' + error.message);
@@ -607,7 +638,7 @@ displayHardwareLimitations() {
         return;
       }
     }
-    
+
     // Schedule next frame
     this.animationId = requestAnimationFrame(() => this.renderLoop());
   }
@@ -656,7 +687,8 @@ displayHardwareLimitations() {
       memoryUsage: this.getMemoryUsage(),
       viewportConfiguration: this.controls.getViewportConfiguration(),
       preprocessorMetrics: this.preprocessor ? this.preprocessor.getMetrics() : null,
-      processingCapacity: this.preprocessor ? this.preprocessor.getCapacityStatus() : 'unknown'
+      processingCapacity: this.preprocessor ? this.preprocessor.getCapacityStatus() : 'unknown',
+      calibrationMetaKey: this.preprocessor ? this.preprocessor.calibrationMetaKey : (this.calibration.metaKey || null)
     };
   }
   
@@ -721,7 +753,166 @@ displayHardwareLimitations() {
     
     return validation;
   }
-  
+
+  // ------------------ CALIBRATION: main-thread helpers ------------------
+
+  /**
+   * requestCalibrationFromWorker(frames, framesNeeded, resolution)
+   *
+   * Ask the preprocessor wrapper to compute a calibration set.
+   * NOTE: ImageBitmaps passed in `frames` will be **transferred** to the worker (become unusable here).
+   *
+   * On success the wrapper resolves with { darkFrame, flatFrame, meta }.
+   * The wrapper also stores the canonical persisted metaKey (if persisted) on
+   * preprocessor.calibrationMetaKey (set from the worker's calibration:ready message).
+   */
+  async requestCalibrationFromWorker(frames, framesNeeded = 10, resolution) {
+    if (!this.preprocessor) {
+      throw new Error('Preprocessor not initialized');
+    }
+    try {
+      // This will transfer the ImageBitmaps into the worker.
+      const result = await this.preprocessor.requestCalibration(frames, framesNeeded, resolution);
+      // The wrapper has already set this.preprocessor.calibrationMetaKey (if persistence happened)
+      this.calibration.darkFrame = result.darkFrame || null;
+      this.calibration.flatFrame = result.flatFrame || null;
+      this.calibration.meta = result.meta || null;
+      this.calibration.metaKey = this.preprocessor.calibrationMetaKey || null;
+
+      console.log('Main: Calibration computed. metaKey=', this.calibration.metaKey, 'meta=', this.calibration.meta);
+
+      // IMPORTANT: do not fetch bias buffer here. If the main or renderer needs it, call getCalibrationBias(metaKey).
+      return {
+        darkFrame: this.calibration.darkFrame,
+        flatFrame: this.calibration.flatFrame,
+        meta: this.calibration.meta,
+        metaKey: this.calibration.metaKey
+      };
+
+    } catch (err) {
+      console.error('Main: requestCalibrationFromWorker failed', err);
+      throw err;
+    }
+  }
+
+  /**
+   * loadPersistedCalibrationImages(metaKey)
+   *
+   * If you only have a persisted metaKey and want the dark/flat bitmaps locally in main,
+   * load them from storage directly (the worker stores dark/flat as blobs).
+   *
+   * Returns: { darkFrame: ImageBitmap|null, flatFrame: ImageBitmap|null, meta }
+   */
+  async loadPersistedCalibrationImages(metaKey = null) {
+    try {
+      const key = metaKey || (this.calibration.metaKey || (this.preprocessor && this.preprocessor.calibrationMetaKey));
+      if (!key) throw new Error('No calibration metaKey provided');
+
+      // Get manifest artifact
+      const metaArt = await storageAPI.getArtifact(key);
+      if (!metaArt || !metaArt.data) {
+        throw new Error(`Calibration manifest not found for key ${key}`);
+      }
+
+      const { darkKey, flatKey } = metaArt.data;
+
+      // Fetch dark/flat artifacts
+      const darkArt = darkKey ? await storageAPI.getArtifact(darkKey) : null;
+      const flatArt = flatKey ? await storageAPI.getArtifact(flatKey) : null;
+
+      const darkBitmap = (darkArt && darkArt.blob) ? await createImageBitmap(darkArt.blob) : null;
+      const flatBitmap = (flatArt && flatArt.blob) ? await createImageBitmap(flatArt.blob) : null;
+
+      // store locally for main/UI use (don't store bias)
+      this.calibration.darkFrame = darkBitmap;
+      this.calibration.flatFrame = flatBitmap;
+      this.calibration.meta = metaArt.data;
+      this.calibration.metaKey = key;
+
+      console.log('Main: Loaded persisted calibration images for', key);
+      return { darkFrame: darkBitmap, flatFrame: flatBitmap, meta: metaArt.data };
+
+    } catch (err) {
+      console.error('Main: loadPersistedCalibrationImages failed', err);
+      throw err;
+    }
+  }
+
+  /**
+   * getCalibrationBias(metaKey)
+   *
+   * If you need the bias normalization array (Float32Array), fetch it from storage.
+   * - This intentionally fetches the bias blob and converts to Float32Array on main thread.
+   *
+   * Returns Float32Array or null if not present.
+   */
+  async getCalibrationBias(metaKey = null) {
+    try {
+      const key = metaKey || (this.calibration.metaKey || (this.preprocessor && this.preprocessor.calibrationMetaKey));
+      if (!key) throw new Error('No calibration metaKey provided');
+
+      // read manifest
+      const metaArt = await storageAPI.getArtifact(key);
+      if (!metaArt || !metaArt.data) throw new Error('Calibration manifest not found');
+
+      const biasKey = metaArt.data.biasKey;
+      if (!biasKey) {
+        console.warn('Main: No biasKey present in calibration meta');
+        return null;
+      }
+
+      const biasArt = await storageAPI.getArtifact(biasKey);
+      if (!biasArt || !biasArt.blob) {
+        console.warn('Main: bias artifact missing for key', biasKey);
+        return null;
+      }
+
+      const ab = await biasArt.blob.arrayBuffer();
+      const biasArray = new Float32Array(ab);
+      return biasArray;
+
+    } catch (err) {
+      console.error('Main: getCalibrationBias failed', err);
+      throw err;
+    }
+  }
+
+  /**
+   * clearCalibration()
+   *
+   * Clear/close any ImageBitmaps held by main for calibration and request worker invalidate.
+   * Worker will attempt to unpin the persisted metaKey when it is safe (deferred if necessary).
+   */
+  async clearCalibration() {
+    try {
+      // Close any ImageBitmaps main holds
+      try {
+        if (this.calibration.darkFrame) { this.calibration.darkFrame.close(); }
+      } catch (_) {}
+      try {
+        if (this.calibration.flatFrame) { this.calibration.flatFrame.close(); }
+      } catch (_) {}
+
+      this.calibration.darkFrame = null;
+      this.calibration.flatFrame = null;
+      this.calibration.meta = null;
+      // Do not locally unpin; worker owns pin and will unpin on invalidate (deferred if required)
+      this.calibration.metaKey = null;
+
+      if (this.compositeRenderer) this.compositeRenderer.clearCalibration();
+
+      if (this.preprocessor) {
+        this.preprocessor.invalidateCalibration(); // instruct worker to unpin/invalidate (worker defers if frames in-flight)
+      }
+
+      console.log('Main: Cleared main-side calibration and requested worker invalidation');
+    } catch (err) {
+      console.warn('Main: clearCalibration error', err);
+    }
+  }
+
+  // ------------------ end calibration helpers ------------------
+
   destroy() {
     this.stopRendering();
     
@@ -736,6 +927,15 @@ displayHardwareLimitations() {
       this.preprocessor = null;
     }
     
+    // Release main-held calibration bitmaps
+    try {
+      if (this.calibration.darkFrame) this.calibration.darkFrame.close();
+    } catch (e) {}
+    try {
+      if (this.calibration.flatFrame) this.calibration.flatFrame.close();
+    } catch (e) {}
+    this.calibration = { metaKey: null, meta: null, darkFrame: null, flatFrame: null };
+
     if (this.mediaInput) {
       this.mediaInput.destroy();
     }
