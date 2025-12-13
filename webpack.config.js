@@ -8,13 +8,37 @@ module.exports = {
   output: {
     path: path.resolve(__dirname, 'dist'),
     filename: 'bundle.[contenthash].js',
-    clean: true
+    clean: true,
+    // Important: Enable proper module worker support
+    globalObject: 'self'
   },
   module: {
     rules: [
+      // IMPORTANT: Worker files must be processed BEFORE the general JS rule
+      // This prevents Babel from transpiling workers
+      {
+        test: /\.worker\.js$/,
+        use: {
+          loader: 'worker-loader',
+          options: {
+            // Use ES modules (not classic workers)
+            esModule: true,
+            // Keep worker files as separate chunks
+            filename: '[name].[contenthash].worker.js',
+            // Important: use module worker type
+            worker: {
+              type: 'module'
+            }
+          }
+        }
+      },
+      // General JS files (but NOT workers due to the rule above)
       {
         test: /\.js$/,
-        exclude: /node_modules/,
+        exclude: [
+          /node_modules/,
+          /\.worker\.js$/ // CRITICAL: Exclude worker files from Babel
+        ],
         use: {
           loader: 'babel-loader',
           options: {
@@ -42,12 +66,11 @@ module.exports = {
       template: './public/index.html',
       title: 'Motion Painter'
     }),
-  new CopyWebpackPlugin({
-    patterns: [
-      { from: 'src/assets', to: 'assets', noErrorOnMissing: true }
-      // worker files are bundled by webpack as module workers (do not copy raw worker sources)
-    ]
-  })
+    new CopyWebpackPlugin({
+      patterns: [
+        { from: 'src/assets', to: 'assets', noErrorOnMissing: true }
+      ]
+    })
   ],
   devServer: {
     static: [
@@ -56,11 +79,17 @@ module.exports = {
       { directory: path.join(__dirname, 'src'), publicPath: '/src' }
     ],
     hot: true,
-    server: 'https', // Updated syntax for HTTPS - required for camera access
+    server: 'https',
     headers: {
-      // Add proper headers for worker files
+      // Critical headers for SharedArrayBuffer and module workers
       'Cross-Origin-Embedder-Policy': 'require-corp',
-      'Cross-Origin-Opener-Policy': 'same-origin'
+      'Cross-Origin-Opener-Policy': 'same-origin',
+      // Add this to ensure proper MIME types for workers
+      'Service-Worker-Allowed': '/'
     }
+  },
+  // Add experiments flag for module workers
+  experiments: {
+    topLevelAwait: true // Needed for top-level await in workers
   }
 };

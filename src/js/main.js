@@ -4,7 +4,7 @@ import '../styles/controls.css';
 import '../styles/layout.css';
 
 // Import core modules
-// near top imports
+import featureFlags from '../config/featureFlags.js';
 import { addFrameBufferDiagnostics, addWebGLRendererDiagnostics } from './core/diagnostics.js';
 import { WebGLRenderer } from './core/webGLRenderer.js';
 import { FrameBuffer } from './core/FrameBuffer.js';
@@ -13,6 +13,9 @@ import { CompositeRenderer } from './core/CompositeRenderer.js';
 import { FrameEvictionHook } from './core/FrameEvictionHook.js';
 import { PreprocessorWorker } from './core/PreProcessorWorker.js';
 
+// MotionWorkerWrapper (wraps /src/js/core/motion.worker.js)
+import MotionWorkerWrapper from './core/MotionWorkerWrapper.js';
+
 // Import UI modules
 import { Controls } from './ui/Controls.js';
 import { MediaInput } from './ui/MediaInput.js';
@@ -20,7 +23,7 @@ import { MediaInput } from './ui/MediaInput.js';
 // Import utilities
 import { CONFIG, validateBufferSize } from './utils/MathUtils.js';
 
-// Import storage API (storage.js exports storageAPI for main thread use)
+// Import storage API (main may still use storageAPI for other needs)
 import storageAPI from './core/storage.js';
 
 class MotionPainter {
@@ -38,17 +41,19 @@ class MotionPainter {
     this.preprocessor = null;
     this.evictionHook = null;
     
-    // Calibration state (main-side)
-    // Note: the canonical persisted metaKey is owned/pinned by the worker when computeCalibration succeeds.
-    // The wrapper (PreprocessorWorker instance) will also store the canonical metaKey in this.preprocessor.calibrationMetaKey
-    this.calibration = {
-      metaKey: null,     // canonical persisted calibration manifest key
-      meta: null,        // calibration metadata (resolution/frameCount/version...)
-      darkFrame: null,   // ImageBitmap (if worker returned it on compute)
-      flatFrame: null    // ImageBitmap (if worker returned it on compute)
-      // Note: bias buffer (Float32Array) is intentionally NOT stored here unless explicitly fetched from storage
-    };
+    // MotionWorker (wrapper instance) - created on demand when calibration is requested
+    this.motionWorker = null;
+
+    // BroadcastChannel used for cross-worker signaling (listen for release_request etc.)
+    this._bc = null;
+
+    // IMPORTANT: main no longer keeps calibration artifacts or bias arrays.
+    // The canonical persisted metaKey and tokens are owned/pinned by the preprocessor.worker.
+    // Main's role: detect the need for calibration and instruct preprocessor to compute it.
     
+    // Track unsubscribers for MotionDetector listeners so we can clean them up on destroy()
+    this._motionDetectorUnsubs = [];
+
     this.isRendering = false;
     this.isPaused = false;
     this.animationId = null;
@@ -86,8 +91,33 @@ class MotionPainter {
       // --- set up preprocessor + eviction hook AFTER FrameBuffer exists ---
       try {
         // create wrapper; the wrapper implementation resolves promises on calibration ready.
-        this.preprocessor = new PreprocessorWorker('./core/preprocessor.worker.js');
+        this.preprocessor = new PreprocessorWorker();
 
+        // Broadcast initial flags snapshot only after the wrapper indicates the worker is ready.
+        // This avoids races where worker hasn't attached its BC listener yet and misses the initial snapshot.
+        try {
+          // Prefer wrapper readiness callback if available
+          if (this.preprocessor && typeof this.preprocessor.onReady === 'function') {
+            this.preprocessor.onReady(() => {
+              try {
+                featureFlags.broadcastCurrentFlags();
+              } catch (e) {
+                console.warn('featureFlags.broadcastCurrentFlags failed (onReady)', e);
+              }
+            });
+          } else {
+            // Fallback: try an immediate broadcast (keeps behavior compatible with older wrappers)
+            try {
+              featureFlags.broadcastCurrentFlags();
+            } catch (e) {
+              console.warn('featureFlags.broadcastCurrentFlags failed (fallback)', e);
+            }
+          }
+        } catch (e) {
+          console.warn('Failed to schedule initial featureFlags broadcast', e);
+          try { featureFlags.broadcastCurrentFlags(); } catch (err) { console.warn('featureFlags.broadcastCurrentFlags failed (fallback2)', err); }
+        }
+        
         // create and attach the eviction hook (FrameEvictionHook is defensive if frameBuffer is null)
         this.evictionHook = new FrameEvictionHook(this.preprocessor);
         this.evictionHook.attach(this.frameBuffer);
@@ -109,13 +139,108 @@ class MotionPainter {
       // Initialize UI components
       this.controls = new Controls();
       this.controls.init();
+
+      // store unsubscribe callbacks so we can clean up on destroy()
+      this._flagUnsubs = [];
+
+      // 1) dev panels visibility
+      try {
+        const unsubDev = featureFlags.subscribeKey('enableDevPanels', ({ key, value }) => {
+          try {
+            const devPanel = document.querySelector('.dev-panel');
+            if (devPanel) devPanel.style.display = value ? 'block' : 'none';
+            // also toggle renderer/diagnostics panel state if your components support it
+            if (this.webglRenderer && typeof this.webglRenderer.setDebugVisible === 'function') {
+              this.webglRenderer.setDebugVisible(!!value);
+            }
+          } catch (err) {
+            console.warn('Dev panel toggle handler failed', err);
+          }
+        });
+        this._flagUnsubs.push(unsubDev);
+      } catch (e) { console.warn('subscribeKey enableDevPanels failed', e); }
+
+      // 2) enableFlux — when on/off we update an internal flag; the worker(s) will learn via BC.
+      //    We also add a small console log and status update.
+      try {
+        this._fluxEnabled = !!featureFlags.getFlag('enableFlux');
+        const unsubFlux = featureFlags.subscribeKey('enableFlux', ({ key, value }) => {
+          this._fluxEnabled = !!value;
+          console.log('featureFlags: enableFlux ->', this._fluxEnabled);
+          if (this.controls) {
+            this.controls.updateStatus(`Flux ${this._fluxEnabled ? 'enabled' : 'disabled'}`);
+          }
+          // Optional: nudge preprocessor to recompute flux if wrapper exposes such API
+          if (this._fluxEnabled && this.preprocessor && typeof this.preprocessor.triggerFluxOnNextFrame === 'function') {
+            try { this.preprocessor.triggerFluxOnNextFrame(); } catch (e) {}
+          }
+        });
+        this._flagUnsubs.push(unsubFlux);
+      } catch (e) { console.warn('subscribeKey enableFlux failed', e); }
+
+      // 3) fluxMode / other flux parameters — update an internal config snapshot
+      try {
+        this._fluxConfig = {
+          fluxMode: featureFlags.getFlag('fluxMode'),
+          fluxDivisor: featureFlags.getFlag('fluxComputeResolutionDivisor'),
+          fluxQuant: featureFlags.getFlag('fluxQuantization')
+        };
+        const unsubFluxConfig = featureFlags.subscribe((payload) => {
+          // refresh config snapshot (cheap)
+          this._fluxConfig = {
+            fluxMode: featureFlags.getFlag('fluxMode'),
+            fluxDivisor: featureFlags.getFlag('fluxComputeResolutionDivisor'),
+            fluxQuant: featureFlags.getFlag('fluxQuantization'),
+            enableFlux: featureFlags.getFlag('enableFlux')
+          };
+          // You might surface this to the controls UI so users see current flux settings
+          if (this.controls && typeof this.controls.updateFluxSettings === 'function') {
+            try { this.controls.updateFluxSettings(this._fluxConfig); } catch (e) {}
+          }
+        });
+        this._flagUnsubs.push(unsubFluxConfig);
+      } catch (e) { console.warn('subscribe flux config failed', e); }
       
       const statusElement = document.getElementById('status');
       this.mediaInput = new MediaInput(this.video, statusElement);
       
       // Set up event handlers
       this.setupEventHandlers();
-      
+
+      // Initialize BroadcastChannel for cross-worker coordination (release requests, etc.)
+      try {
+        // Use the same channel name as the preprocessor.worker to keep events consistent
+        this._bc = new BroadcastChannel('motion-painter-store');
+        this._bc.addEventListener('message', (ev) => {
+          const msg = ev.data || {};
+          // Forward release requests from MotionWorker (or any worker) to the preprocessor wrapper
+          if (msg && msg.event === 'calibration:release_request') {
+            const token = msg.releaseToken || msg.token || null;
+            const metaKey = msg.metaKey || null;
+            if (!token) {
+              console.warn('Main: received calibration:release_request with no token', msg);
+              return;
+            }
+            if (this.preprocessor && typeof this.preprocessor.releaseCalibrationToken === 'function') {
+              try {
+                this.preprocessor.releaseCalibrationToken(token);
+                console.log('Main: forwarded release token to preprocessor', { token, metaKey });
+              } catch (e) {
+                console.warn('Main: failed to forward release token to preprocessor', e, msg);
+              }
+            } else {
+              console.warn('Main: no preprocessor wrapper available to handle release token', token);
+            }
+          }
+        });
+      } catch (e) {
+        console.warn('Main: failed to create BroadcastChannel for orchestration', e);
+        this._bc = null;
+      }
+
+      // Set up MotionDetector -> Main calibration orchestration (main only orchestrates; it won't store artifacts)
+      this.setupCalibrationOrchestration();
+
       // Update UI with initial buffer info and hardware limitations
       this.updateBufferSizeDisplay();
       this.displayHardwareLimitations();
@@ -140,10 +265,7 @@ class MotionPainter {
         }
       }
       
-      // Expose calibration helpers for debugging / UI (optional)
-      window.fetchCalibrationBias = (metaKey) => this.getCalibrationBias(metaKey);
-      window.loadPersistedCalibrationImages = (metaKey) => this.loadPersistedCalibrationImages(metaKey);
-      window.clearCalibration = () => this.clearCalibration();
+      // NOTE: main intentionally exposes no calibration helpers — preprocessor and MotionWorker are the canonical actors.
       
     } catch (error) {
       console.error('Failed to initialize Motion Painter:', error);
@@ -532,7 +654,7 @@ displayHardwareLimitations() {
 
       this.frameBuffer.resize(fbWidth, fbHeight);
       this.controls.updateBufferInfo(fbWidth, fbHeight);
-      console.log(`Canvas resized to ${sizes.drawingWidth}x${sizes.drawingHeight} (fallback). FrameBuffer allocated at ${fbWidth}x${fbHeight}`);
+      console.log(`Canvas resized to ${sizes.drawingWidth}x${sizes.drawingHeight} (fallback). FrameBuffer allocated at ${fbWidth}x${fbHeight}`); 
       return;
     }
 
@@ -688,7 +810,9 @@ displayHardwareLimitations() {
       viewportConfiguration: this.controls.getViewportConfiguration(),
       preprocessorMetrics: this.preprocessor ? this.preprocessor.getMetrics() : null,
       processingCapacity: this.preprocessor ? this.preprocessor.getCapacityStatus() : 'unknown',
-      calibrationMetaKey: this.preprocessor ? this.preprocessor.calibrationMetaKey : (this.calibration.metaKey || null)
+      // main intentionally does not store calibration artifacts; report wrapper's canonical metaKey if present
+      calibrationMetaKey: this.preprocessor ? this.preprocessor.calibrationMetaKey : null,
+      featureFlags: featureFlags.getFlags()
     };
   }
   
@@ -754,167 +878,371 @@ displayHardwareLimitations() {
     return validation;
   }
 
-  // ------------------ CALIBRATION: main-thread helpers ------------------
+  // ------------------ CALIBRATION: orchestration-only helpers ------------------
 
   /**
    * requestCalibrationFromWorker(frames, framesNeeded, resolution)
    *
-   * Ask the preprocessor wrapper to compute a calibration set.
-   * NOTE: ImageBitmaps passed in `frames` will be **transferred** to the worker (become unusable here).
+   * Orchestrates a calibration computation by transferring frames to the preprocessor wrapper.
+   * Main will NOT keep returned dark/flat bitmaps or tokens. It will accept the worker's response
+   * only to ensure the call completed and to release/close any returned ImageBitmaps immediately.
    *
-   * On success the wrapper resolves with { darkFrame, flatFrame, meta }.
-   * The wrapper also stores the canonical persisted metaKey (if persisted) on
-   * preprocessor.calibrationMetaKey (set from the worker's calibration:ready message).
+   * On success this returns an object with minimal info: { metaKey?:string } if worker provided it,
+   * but main will not persist bitmaps or manage releaseTokens.
    */
   async requestCalibrationFromWorker(frames, framesNeeded = 10, resolution) {
     if (!this.preprocessor) {
       throw new Error('Preprocessor not initialized');
     }
     try {
-      // This will transfer the ImageBitmaps into the worker.
+      // Transfer frames into the worker; wrapper returns a result but main discards bitmaps.
       const result = await this.preprocessor.requestCalibration(frames, framesNeeded, resolution);
-      // The wrapper has already set this.preprocessor.calibrationMetaKey (if persistence happened)
-      this.calibration.darkFrame = result.darkFrame || null;
-      this.calibration.flatFrame = result.flatFrame || null;
-      this.calibration.meta = result.meta || null;
-      this.calibration.metaKey = this.preprocessor.calibrationMetaKey || null;
 
-      console.log('Main: Calibration computed. metaKey=', this.calibration.metaKey, 'meta=', this.calibration.meta);
+      // Defensive cleanup: worker may return ImageBitmaps (darkFrame/flatFrame). Close them immediately.
+      try {
+        if (result && result.darkFrame) {
+          try { result.darkFrame.close(); } catch (e) {}
+        }
+        if (result && result.flatFrame) {
+          try { result.flatFrame.close(); } catch (e) {}
+        }
+      } catch (cleanupErr) {
+        console.warn('Main: failed to close returned calibration bitmaps', cleanupErr);
+      }
 
-      // IMPORTANT: do not fetch bias buffer here. If the main or renderer needs it, call getCalibrationBias(metaKey).
-      return {
-        darkFrame: this.calibration.darkFrame,
-        flatFrame: this.calibration.flatFrame,
-        meta: this.calibration.meta,
-        metaKey: this.calibration.metaKey
-      };
+      // Optionally return only canonical metaKey (if provided). Do not store it locally.
+      return { metaKey: result && result.metaKey ? result.metaKey : null };
 
     } catch (err) {
       console.error('Main: requestCalibrationFromWorker failed', err);
+      // If frames were not transferred successfully, caller is responsible for closing them.
       throw err;
     }
   }
 
   /**
-   * loadPersistedCalibrationImages(metaKey)
-   *
-   * If you only have a persisted metaKey and want the dark/flat bitmaps locally in main,
-   * load them from storage directly (the worker stores dark/flat as blobs).
-   *
-   * Returns: { darkFrame: ImageBitmap|null, flatFrame: ImageBitmap|null, meta }
+   * Ensure MotionWorker exists and is minimally initialized so it can listen/ query storage.
+   * We create a MotionWorkerWrapper which manages the worker lifecycle and communications.
+   * This is non-blocking: we create the wrapper and attach basic handlers so it can listen on BC.
    */
-  async loadPersistedCalibrationImages(metaKey = null) {
+  _ensureMotionWorker() {
+    if (this.motionWorker) return;
+
     try {
-      const key = metaKey || (this.calibration.metaKey || (this.preprocessor && this.preprocessor.calibrationMetaKey));
-      if (!key) throw new Error('No calibration metaKey provided');
+      // Instantiate the wrapper which will create the underlying worker.
+      // Use absolute path that maps to project layout so the wrapper can resolve URL reliably.
+      this.motionWorker = new MotionWorkerWrapper('/src/js/core/motion.worker.js', { readyTimeoutMs: 8000 });
 
-      // Get manifest artifact
-      const metaArt = await storageAPI.getArtifact(key);
-      if (!metaArt || !metaArt.data) {
-        throw new Error(`Calibration manifest not found for key ${key}`);
-      }
-
-      const { darkKey, flatKey } = metaArt.data;
-
-      // Fetch dark/flat artifacts
-      const darkArt = darkKey ? await storageAPI.getArtifact(darkKey) : null;
-      const flatArt = flatKey ? await storageAPI.getArtifact(flatKey) : null;
-
-      const darkBitmap = (darkArt && darkArt.blob) ? await createImageBitmap(darkArt.blob) : null;
-      const flatBitmap = (flatArt && flatArt.blob) ? await createImageBitmap(flatArt.blob) : null;
-
-      // store locally for main/UI use (don't store bias)
-      this.calibration.darkFrame = darkBitmap;
-      this.calibration.flatFrame = flatBitmap;
-      this.calibration.meta = metaArt.data;
-      this.calibration.metaKey = key;
-
-      console.log('Main: Loaded persisted calibration images for', key);
-      return { darkFrame: darkBitmap, flatFrame: flatBitmap, meta: metaArt.data };
-
-    } catch (err) {
-      console.error('Main: loadPersistedCalibrationImages failed', err);
-      throw err;
-    }
-  }
-
-  /**
-   * getCalibrationBias(metaKey)
-   *
-   * If you need the bias normalization array (Float32Array), fetch it from storage.
-   * - This intentionally fetches the bias blob and converts to Float32Array on main thread.
-   *
-   * Returns Float32Array or null if not present.
-   */
-  async getCalibrationBias(metaKey = null) {
-    try {
-      const key = metaKey || (this.calibration.metaKey || (this.preprocessor && this.preprocessor.calibrationMetaKey));
-      if (!key) throw new Error('No calibration metaKey provided');
-
-      // read manifest
-      const metaArt = await storageAPI.getArtifact(key);
-      if (!metaArt || !metaArt.data) throw new Error('Calibration manifest not found');
-
-      const biasKey = metaArt.data.biasKey;
-      if (!biasKey) {
-        console.warn('Main: No biasKey present in calibration meta');
-        return null;
-      }
-
-      const biasArt = await storageAPI.getArtifact(biasKey);
-      if (!biasArt || !biasArt.blob) {
-        console.warn('Main: bias artifact missing for key', biasKey);
-        return null;
-      }
-
-      const ab = await biasArt.blob.arrayBuffer();
-      const biasArray = new Float32Array(ab);
-      return biasArray;
-
-    } catch (err) {
-      console.error('Main: getCalibrationBias failed', err);
-      throw err;
-    }
-  }
-
-  /**
-   * clearCalibration()
-   *
-   * Clear/close any ImageBitmaps held by main for calibration and request worker invalidate.
-   * Worker will attempt to unpin the persisted metaKey when it is safe (deferred if necessary).
-   */
-  async clearCalibration() {
-    try {
-      // Close any ImageBitmaps main holds
+      // Minimal ready hook so we can log; wrapper will broadcast flags when it becomes ready.
       try {
-        if (this.calibration.darkFrame) { this.calibration.darkFrame.close(); }
-      } catch (_) {}
-      try {
-        if (this.calibration.flatFrame) { this.calibration.flatFrame.close(); }
-      } catch (_) {}
-
-      this.calibration.darkFrame = null;
-      this.calibration.flatFrame = null;
-      this.calibration.meta = null;
-      // Do not locally unpin; worker owns pin and will unpin on invalidate (deferred if required)
-      this.calibration.metaKey = null;
-
-      if (this.compositeRenderer) this.compositeRenderer.clearCalibration();
-
-      if (this.preprocessor) {
-        this.preprocessor.invalidateCalibration(); // instruct worker to unpin/invalidate (worker defers if frames in-flight)
+        this.motionWorker.onReady(() => {
+          try {
+            console.log('MotionPainter: MotionWorkerWrapper is ready');
+            // optionally request metrics to warm the worker
+            try {
+              this.motionWorker.requestMetrics().then(m => {
+                if (m) console.debug('MotionWorker metrics:', m);
+              }).catch(() => {});
+            } catch (e) {}
+          } catch (e) {
+            console.warn('MotionPainter: motionWorker onReady handler error', e);
+          }
+        });
+      } catch (e) {
+        // ignore if onReady isn't present (defensive)
       }
 
-      console.log('Main: Cleared main-side calibration and requested worker invalidation');
+      // Note: we intentionally do not send any calibration/artifacts from main.
+      // MotionWorker will use the BroadcastChannel or storage API to obtain persisted artifacts.
+
+      console.log('MotionPainter: MotionWorkerWrapper created (non-blocking)');
     } catch (err) {
-      console.warn('Main: clearCalibration error', err);
+      console.error('MotionPainter: Failed to create MotionWorkerWrapper', err);
+      try { if (this.motionWorker && typeof this.motionWorker.terminate === 'function') this.motionWorker.terminate(); } catch (_) {}
+      this.motionWorker = null;
     }
   }
 
-  // ------------------ end calibration helpers ------------------
+  /**
+   * Teardown MotionWorker if present (called during destroy)
+   */
+  _teardownMotionWorker() {
+    try {
+      if (this.motionWorker) {
+        // prefer wrapper terminate if available
+        try {
+          if (typeof this.motionWorker.terminate === 'function') {
+            // terminate may be async — call but do not await in destroy path
+            try { this.motionWorker.terminate(); } catch (e) {}
+          } else {
+            // fallback for older raw worker usage (unlikely)
+            try { if (this.motionWorker.postMessage) this.motionWorker.postMessage({ op: 'shutdown' }); } catch (e) {}
+            try { if (this.motionWorker.terminate) this.motionWorker.terminate(); } catch (e) {}
+          }
+        } catch (e) {
+          console.warn('MotionPainter: error terminating motionWorker', e);
+        }
+        this.motionWorker = null;
+      }
+    } catch (err) {
+      console.warn('MotionPainter: error tearing down MotionWorker', err);
+      this.motionWorker = null;
+    }
+  }
+
+  /**
+   * Register MotionDetector event handlers and calibration orchestration.
+   * This function tries to support multiple event patterns (on/ addEventListener / property).
+   * It records unsubscribe handlers so destroy() can clean them up.
+   */
+  setupCalibrationOrchestration() {
+    // Defensive no-op if no motionDetector present
+    if (!this.motionDetector) return;
+
+    const handler = (payload) => {
+      // Payload may be { count, resolution, reason } or a boolean
+      try {
+        // Normalize payload into object
+        const info = (typeof payload === 'object' && payload) ? payload : {};
+        // Kick off calibration request
+        this._handleCalibrationRequest(info).catch(err => {
+          console.warn('Calibration request failed:', err);
+          // Surface a UI status
+          if (this.controls) this.controls.updateStatus('Calibration failed: ' + (err && err.message ? err.message : String(err)));
+        });
+      } catch (err) {
+        console.warn('Calibration handler exception:', err);
+      }
+    };
+
+    try {
+      // EventEmitter-style: .on/.off or .addListener/.removeListener
+      if (typeof this.motionDetector.on === 'function') {
+        // Attach both common event names and record unsubs
+        try {
+          this.motionDetector.on('calibrationNeeded', handler);
+          this._motionDetectorUnsubs.push(() => {
+            try {
+              if (typeof this.motionDetector.off === 'function') {
+                this.motionDetector.off('calibrationNeeded', handler);
+              } else if (typeof this.motionDetector.removeListener === 'function') {
+                this.motionDetector.removeListener('calibrationNeeded', handler);
+              }
+            } catch (e) { /* ignore */ }
+          });
+        } catch (e) {
+          console.warn('Failed to attach calibrationNeeded via .on', e);
+        }
+
+        try {
+          this.motionDetector.on('needCalibration', handler);
+          this._motionDetectorUnsubs.push(() => {
+            try {
+              if (typeof this.motionDetector.off === 'function') {
+                this.motionDetector.off('needCalibration', handler);
+              } else if (typeof this.motionDetector.removeListener === 'function') {
+                this.motionDetector.removeListener('needCalibration', handler);
+              }
+            } catch (e) { /* ignore */ }
+          });
+        } catch (e) {
+          // swallow - not all detectors emit both names
+        }
+
+      } else if (typeof this.motionDetector.addEventListener === 'function') {
+        // DOM/EventTarget style
+        try {
+          this.motionDetector.addEventListener('calibrationNeeded', handler);
+          this._motionDetectorUnsubs.push(() => {
+            try { this.motionDetector.removeEventListener('calibrationNeeded', handler); } catch (e) {}
+          });
+        } catch (e) {
+          console.warn('Failed to attach calibrationNeeded via addEventListener', e);
+        }
+
+        try {
+          this.motionDetector.addEventListener('needCalibration', handler);
+          this._motionDetectorUnsubs.push(() => {
+            try { this.motionDetector.removeEventListener('needCalibration', handler); } catch (e) {}
+          });
+        } catch (e) {
+          // swallow
+        }
+
+      } else {
+        // Property-based callback or custom registration function
+        if (typeof this.motionDetector.requestCalibration === 'function') {
+          try {
+            const maybeUnsub = this.motionDetector.requestCalibration(handler);
+            if (typeof maybeUnsub === 'function') {
+              this._motionDetectorUnsubs.push(() => {
+                try { maybeUnsub(); } catch (e) {}
+              });
+            } else {
+              this._motionDetectorUnsubs.push(() => {});
+            }
+          } catch (e) {
+            console.warn('motionDetector.requestCalibration threw while registering', e);
+          }
+        } else {
+          try {
+            const prev = this.motionDetector.onCalibrationNeeded;
+            this.motionDetector.onCalibrationNeeded = handler;
+            this._motionDetectorUnsubs.push(() => {
+              try { this.motionDetector.onCalibrationNeeded = prev; } catch (e) {}
+            });
+          } catch (e) {
+            console.warn('MotionPainter: MotionDetector does not expose standard event API for calibration signals', e);
+          }
+        }
+      }
+    } catch (err) {
+      console.warn('MotionPainter: failed to hook MotionDetector calibration events', err);
+    }
+  }
+
+  /**
+   * Internal handler: MotionDetector requested calibration.
+   *
+   * Flow:
+   *  - ensure MotionWorker exists (so it can listen to BC or query storage)
+   *  - start a short capture window via evictionHook.startCalibrationCapture(...)
+   *  - register one-shot callback via evictionHook.registerCalibrationCallback(...)
+   *  - callback transfers clones to preprocessor.requestCalibration(frames,...)
+   *  - main does NOT keep returned artifacts; it closes them immediately to avoid holding copies.
+   */
+  async _handleCalibrationRequest({ count = 16, resolution = null, reason = 'motion-trigger' } = {}) {
+    if (!this.evictionHook) {
+      throw new Error('EvictionHook not initialized (cannot capture calibration frames)');
+    }
+    if (!this.preprocessor) {
+      throw new Error('Preprocessor wrapper not initialized (cannot compute calibration)');
+    }
+
+    // Defensive: if a capture is already in progress, ignore duplicate triggers
+    if (this.evictionHook.captureCalibration) {
+      console.log('Calibration capture already in progress — ignoring duplicate request');
+      return;
+    }
+
+    console.log('Calibration requested by MotionDetector:', { count, resolution, reason });
+    this.controls && this.controls.updateStatus('Calibration requested...');
+
+    // Ensure MotionWorker exists so it will receive BC messages or can query storage
+    try {
+      this._ensureMotionWorker();
+    } catch (err) {
+      console.warn('Main: failed to ensure MotionWorker; continuing but MotionWorker may miss calibration ready event', err);
+    }
+
+    // Register one-shot callback
+    let unsub = null;
+    let calledBack = false;
+
+    const cb = async (frames, info) => {
+      // frames: array of ImageBitmap clones (ownership expected to be transferred)
+      try {
+        calledBack = true;
+        // Unsubscribe immediately to ensure one-shot semantics
+        try { if (typeof unsub === 'function') unsub(); } catch (_) {}
+
+        if (!Array.isArray(frames) || frames.length === 0) {
+          console.warn('Calibration callback invoked with no frames');
+          return false;
+        }
+
+        // Transfer clones to preprocessor for calibration computation.
+        // Main will await completion to ensure the transfer succeeded and then close any returned bitmaps.
+        try {
+          const res = resolution || { width: (this.video && this.video.videoWidth) || frames[0].width, height: (this.video && this.video.videoHeight) || frames[0].height };
+          const callResult = await this.preprocessor.requestCalibration(frames, count, res);
+
+          // Immediately close any ImageBitmaps returned by worker (we don't retain them).
+          try {
+            if (callResult && callResult.darkFrame) { try { callResult.darkFrame.close(); } catch (e) {} }
+            if (callResult && callResult.flatFrame) { try { callResult.flatFrame.close(); } catch (e) {} }
+          } catch (closeErr) {
+            console.warn('Main: error closing returned calibration ImageBitmaps', closeErr);
+          }
+
+          // We do not manage releaseTokens or pins here — consumers (MotionWorker) will fetch persisted artifacts and manage lifecycle.
+          console.log('Main: Preprocessor accepted calibration frames; orchestration complete.');
+          return true;
+
+        } catch (err) {
+          console.error('Preprocessor.requestCalibration rejected', err);
+          // If transfer failed and frames were not consumed, ensure we close the clones to avoid leaks
+          try {
+            frames.forEach(f => { try { f.close(); } catch (e) {} });
+          } catch (_) {}
+          throw err;
+        }
+
+      } catch (err) {
+        console.error('Calibration callback error:', err);
+        // Defensive cleanup of frames if something went wrong.
+        try {
+          if (Array.isArray(frames)) {
+            for (const f of frames) {
+              try { f.close(); } catch (e) {}
+            }
+          }
+        } catch (_) {}
+        return false;
+      }
+    }; // end cb
+
+    // register the callback and start capture
+    try {
+      unsub = this.evictionHook.registerCalibrationCallback(cb);
+
+      // Start capture: clones will be created on evictions until count reached or timeout triggers
+      this.evictionHook.startCalibrationCapture({
+        count,
+        resolution: resolution || null,
+        timeoutMs: 30_000,
+        forceFull: true
+      });
+
+      console.log('Main: started calibration capture (evictionHook)');
+
+      // The callback will run asynchronously when the hook collected enough clones;
+      // We return and let the callback handle the rest.
+    } catch (err) {
+      // cleanup if registration failed
+      try { if (typeof unsub === 'function') unsub(); } catch (_) {}
+      console.error('Main: failed to register calibration callback', err);
+      // Stop capture proactively
+      try { this.evictionHook.stopCalibrationCapture(); } catch (_) {}
+      throw err;
+    }
+  }
+
+  // ------------------ end MotionDetector calibration orchestration ------------------
 
   destroy() {
     this.stopRendering();
+
+    if (Array.isArray(this._flagUnsubs)) {
+      try {
+        this._flagUnsubs.forEach(unsub => {
+          try { if (typeof unsub === 'function') unsub(); } catch (e) {}
+        });
+      } catch (e) { console.warn('Failed to cleanup flag subscriptions', e); }
+      this._flagUnsubs = [];
+    }
+
+    // Clean up MotionDetector listeners we registered
+    try {
+      if (Array.isArray(this._motionDetectorUnsubs) && this._motionDetectorUnsubs.length > 0) {
+        this._motionDetectorUnsubs.forEach(unsubFn => {
+          try { if (typeof unsubFn === 'function') unsubFn(); } catch (e) {}
+        });
+        this._motionDetectorUnsubs = [];
+      }
+    } catch (e) {
+      console.warn('Failed to cleanup motionDetector listeners', e);
+    }
     
     // Detach eviction hook and terminate preprocessor worker (if present)
     if (this.evictionHook && typeof this.evictionHook.detach === 'function') {
@@ -926,15 +1254,24 @@ displayHardwareLimitations() {
       try { this.preprocessor.worker.terminate(); } catch (e) { console.warn('Error terminating preprocessor worker', e); }
       this.preprocessor = null;
     }
+
+    // Teardown MotionWorker and close BroadcastChannel
+    try {
+      this._teardownMotionWorker();
+    } catch (e) {
+      console.warn('Failed to teardown MotionWorker', e);
+    }
+
+    try {
+      if (this._bc) {
+        try { this._bc.close(); } catch (e) {}
+        this._bc = null;
+      }
+    } catch (e) {
+      console.warn('Failed to close BroadcastChannel', e);
+    }
     
-    // Release main-held calibration bitmaps
-    try {
-      if (this.calibration.darkFrame) this.calibration.darkFrame.close();
-    } catch (e) {}
-    try {
-      if (this.calibration.flatFrame) this.calibration.flatFrame.close();
-    } catch (e) {}
-    this.calibration = { metaKey: null, meta: null, darkFrame: null, flatFrame: null };
+    // Main intentionally does not hold calibration ImageBitmaps — nothing to close here.
 
     if (this.mediaInput) {
       this.mediaInput.destroy();

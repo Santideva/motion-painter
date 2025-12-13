@@ -1,13 +1,106 @@
-// preprocessor.worker.js
+// preprocessor.worker.js 
 // Module worker that receives ImageBitmap frames from the main thread wrapper,
 // generates thumbnail + quick phash + manifest, writes artifacts to storage, and notifies main thread.
 
-// VERY top-level sanity log (must run as soon as the worker file is parsed)
+// ============================================================================
+// CRITICAL: Enhanced Error Catching for Debugging
+// ============================================================================
+console.log('[WORKER] Script file loaded and parsing started');
+console.log('[WORKER] Location:', self.location.href);
+console.log('[WORKER] Is secure context:', self.isSecureContext);
+console.log('[WORKER] Cross-origin isolated:', self.crossOriginIsolated);
+
+// Catch ALL uncaught errors
+self.addEventListener('error', (e) => {
+  console.error('[WORKER GLOBAL ERROR]', {
+    message: e.message || 'no message',
+    filename: e.filename || 'no filename',
+    lineno: e.lineno || 'no lineno',
+    colno: e.colno || 'no colno',
+    error: e.error ? {
+      name: e.error.name,
+      message: e.error.message,
+      stack: e.error.stack
+    } : 'no error object'
+  });
+  
+  try {
+    postMessage({
+      event: 'worker:fatal_error',
+      phase: 'global_error',
+      message: e.message,
+      filename: e.filename,
+      lineno: e.lineno,
+      stack: e.error?.stack
+    });
+  } catch (postErr) {
+    console.error('[WORKER] Could not post error to main:', postErr);
+  }
+  
+  e.preventDefault();
+});
+
+// Catch unhandled promise rejections
+self.addEventListener('unhandledrejection', (e) => {
+  console.error('[WORKER UNHANDLED REJECTION]', {
+    reason: String(e.reason),
+    stack: e.reason?.stack
+  });
+  
+  try {
+    postMessage({
+      event: 'worker:fatal_error',
+      phase: 'promise_rejection',
+      reason: String(e.reason),
+      stack: e.reason?.stack
+    });
+  } catch (postErr) {
+    console.error('[WORKER] Could not post rejection:', postErr);
+  }
+  
+  e.preventDefault();
+});
+
+console.log('[WORKER] Error handlers installed');
+
+// ============================================================================
+// Original Worker Code with Enhanced Logging
+// ============================================================================
+
 try {
   console.log('preprocessor.worker: (top) module evaluation starting...');
 } catch (e) {
   // console may be unavailable in some edge cases; silence
 }
+
+// --- worker-side global error/rejection handlers (diagnostic helpers) ---
+self.addEventListener('error', (e) => {
+  try {
+    postMessage({
+      event: 'worker:error',
+      phase: 'uncaught_exception',
+      message: e?.message ?? null,
+      filename: e?.filename ?? null,
+      lineno: e?.lineno ?? null,
+      colno: e?.colno ?? null,
+      error: e?.error ? (e.error.message || String(e.error)) : null,
+      stack: e?.error && e.error.stack ? e.error.stack : null,
+      timestamp: Date.now()
+    });
+  } catch (_) { /* silent fallback */ }
+});
+
+self.addEventListener('unhandledrejection', (e) => {
+  try {
+    postMessage({
+      event: 'worker:error',
+      phase: 'unhandledrejection',
+      reason: String(e.reason),
+      stack: e.reason && e.reason.stack ? e.reason.stack : null,
+      timestamp: Date.now()
+    });
+  } catch (_) {}
+});
 
 // Define constants first
 const DEFAULT_THUMB_MAX_SIDE = 256;
@@ -25,64 +118,96 @@ const inFlightCalibMap = new Map();
 // -- DYNAMIC IMPORT: ensures the worker's top-level logs run even if storage import fails --
 let storageAPI = null;
 
-try {
-  console.log('preprocessor.worker: (top) module evaluation starting...');
-} catch (e) { /* quiet fallback if console is weird */ }
+console.log('[WORKER] About to start dynamic import IIFE');
 
 (async () => {
   try {
-    console.log('preprocessor.worker: Attempting dynamic import of ./storage.js ...');
-    const mod = await import('/src/js/core/storage.js'); // absolute path from server root
-    storageAPI = mod?.default || mod?.storageAPI || mod;
-    console.log('preprocessor.worker: storage module imported (dynamic)');
-
-    // Delegate to compatibility shim (below) to bind functions and init storage.
-    // initializeStorage() returns the promise from storageAPI.initStorage.
-    // If the shim isn't present for some reason, call storageAPI.initStorage directly.
-    if (typeof initializeStorage === 'function') {
-      try {
-        await initializeStorage(); // shim will call storageAPI.initStorage and bind methods
-      } catch (err) {
-        // initializeStorage will already post worker:error -- do an extra log
-        console.error('preprocessor.worker: initializeStorage (shim) failed:', err);
-        throw err;
-      }
-    } else if (storageAPI && typeof storageAPI.initStorage === 'function') {
-      await storageAPI.initStorage({ quota: undefined, startEvictor: true });
-      // bind commonly referenced functions onto self for backwards compatibility
-      try {
-        self.putInboundArtifact = storageAPI.putInboundArtifact.bind(storageAPI);
-        self.getArtifact = storageAPI.getArtifact.bind(storageAPI);
-        self.pinArtifact = storageAPI.pinArtifact.bind(storageAPI);
-        self.unpinArtifact = storageAPI.unpinArtifact.bind(storageAPI);
-        self.getReadHandle = storageAPI.getReadHandle.bind(storageAPI);
-        self.promoteToWork = storageAPI.promoteToWork.bind(storageAPI);
-        self.reserveArtifact = storageAPI.reserveArtifact.bind(storageAPI);
-        self.releaseReservation = storageAPI.releaseReservation.bind(storageAPI);
-        self.checkQuotaAndEvict = storageAPI.checkQuotaAndEvict.bind(storageAPI);
-        self.getStorageStats = storageAPI.getStorageStats.bind(storageAPI);
-      } catch (bindErr) {
-        console.warn('preprocessor.worker: failed to bind storageAPI methods to self', bindErr);
-      }
-      storageReady = true;
-      console.log('preprocessor.worker: Storage initialized successfully (direct dynamic import path)');
-      postMessage({ event: 'worker:ready' });
-    } else {
-      throw new Error('storageAPI missing initStorage after import');
-    }
-  } catch (err) {
-    console.error('preprocessor.worker: Dynamic import or init failed:', err);
+    console.log('[WORKER] === Storage Import Starting ===');
+    console.log('[WORKER] Attempting dynamic import of storage.js');
+    console.log('[WORKER] Will try absolute path: /src/js/core/storage.js');
+    
+    let mod;
     try {
-      postMessage({
-        event: 'worker:error',
-        error: 'dynamic-import-or-init-failed',
-        details: { message: err?.message, stack: err?.stack }
+      console.log('[WORKER] Trying absolute path import...');
+      mod = await import('/src/js/core/storage.js');
+      console.log('[WORKER] ✓ Absolute path import succeeded');
+    } catch (absErr) {
+      console.error('[WORKER] ✗ Absolute path import failed:', {
+        name: absErr.name,
+        message: absErr.message,
+        stack: absErr.stack
       });
-    } catch (e) {
-      console.error('preprocessor.worker: failed to post worker:error after dynamic import failure', e);
+      
+      console.log('[WORKER] Trying relative path: ./storage.js');
+      try {
+        mod = await import('./storage.js');
+        console.log('[WORKER] ✓ Relative path import succeeded');
+      } catch (relErr) {
+        console.error('[WORKER] ✗ Relative path import also failed:', {
+          name: relErr.name,
+          message: relErr.message,
+          stack: relErr.stack
+        });
+        
+        throw new Error(`Both import attempts failed. Abs: ${absErr.message}, Rel: ${relErr.message}`);
+      }
     }
+    
+    console.log('[WORKER] Storage module object received, type:', typeof mod);
+    console.log('[WORKER] Module keys:', Object.keys(mod || {}));
+    
+    storageAPI = mod?.default || mod?.storageAPI || mod;
+    
+    if (!storageAPI) {
+      throw new Error('storage module imported but storageAPI is null/undefined');
+    }
+    
+    console.log('[WORKER] storageAPI extracted, type:', typeof storageAPI);
+    console.log('[WORKER] Has initStorage?', typeof storageAPI.initStorage);
+    
+    // NOW initialize - storageAPI is available
+    if (typeof storageAPI.initStorage === 'function') {
+      console.log('[WORKER] calling storageAPI.initStorage...');
+      await storageAPI.initStorage({ quota: undefined, startEvictor: true });
+      console.log('[WORKER] ✓ storageAPI.initStorage completed');
+      
+      // Bind methods to self
+      console.log('[WORKER] binding storageAPI methods to self...');
+      self.putInboundArtifact = storageAPI.putInboundArtifact.bind(storageAPI);
+      self.getArtifact = storageAPI.getArtifact.bind(storageAPI);
+      self.pinArtifact = storageAPI.pinArtifact.bind(storageAPI);
+      self.unpinArtifact = storageAPI.unpinArtifact.bind(storageAPI);
+      self.getReadHandle = storageAPI.getReadHandle.bind(storageAPI);
+      self.promoteToWork = storageAPI.promoteToWork.bind(storageAPI);
+      self.reserveArtifact = storageAPI.reserveArtifact.bind(storageAPI);
+      self.releaseReservation = storageAPI.releaseReservation.bind(storageAPI);
+      self.checkQuotaAndEvict = storageAPI.checkQuotaAndEvict.bind(storageAPI);
+      self.getStorageStats = storageAPI.getStorageStats.bind(storageAPI);
+      
+      storageReady = true;
+      console.log('[WORKER] ✓ Storage initialized successfully, sending worker:ready');
+      postMessage({ event: 'worker:ready' });
+      
+    } else {
+      throw new Error('storageAPI.initStorage is not a function');
+    }
+    
+  } catch (err) {
+    console.error('[WORKER] FATAL - Dynamic import or init failed:', {
+      name: err?.name,
+      message: err?.message,
+      stack: err?.stack,
+      toString: String(err)
+    });
+    postMessage({
+      event: 'worker:error',
+      error: 'dynamic-import-or-init-failed',
+      details: { message: err?.message, stack: err?.stack, name: err?.name }
+    });
   }
 })();
+
+console.log('[WORKER] Dynamic import IIFE scheduled (execution is async)')
 
 // Enhanced broadcast channel creation with error handling
 try {
@@ -105,6 +230,71 @@ const initTimeout = setTimeout(() => {
   }
 }, INIT_TIMEOUT_MS);
 
+// ==================== UTILITY: Retry wrapper for storage operations ====================
+// CHANGE 1: NEW FUNCTION
+// PURPOSE: Handle transient IndexedDB errors with exponential backoff
+/**
+ * Retry wrapper for storage operations (handles transient IndexedDB errors)
+ * @param {Function} putFn - Async function that performs the storage operation
+ * @param {number} maxAttempts - Maximum retry attempts (default: 4)
+ * @param {number} baseDelayMs - Base delay in ms for exponential backoff (default: 150)
+ * @returns {Promise} Result of the storage operation
+ */
+async function _retryStoragePut(putFn, maxAttempts = 4, baseDelayMs = 150) {
+  let lastErr = null;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      return await putFn();
+    } catch (err) {
+      lastErr = err;
+      const errMsg = String(err?.message || err).toLowerCase();
+      // Retry on transient errors only
+      const isTransient = /invalidstateerror|database connection is closing|locked|quotaexceeded|timeout/i.test(errMsg);
+      
+      if (!isTransient || attempt === maxAttempts - 1) {
+        throw err; // Non-transient or final attempt - rethrow
+      }
+      
+      const delay = baseDelayMs * (attempt + 1);
+      console.warn(`_retryStoragePut: attempt ${attempt + 1}/${maxAttempts} failed, retrying in ${delay}ms...`, err.message);
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
+  }
+  throw lastErr;
+}
+
+// ==================== UTILITY: Safe bitmap cloning ====================
+// CHANGE 2: NEW FUNCTION
+// PURPOSE: Safely clone ImageBitmaps that might be closed/transferred
+/**
+ * Safely create ImageBitmap from existing bitmap (clones via canvas if needed)
+ * Returns null if source is closed/invalid
+ * @param {ImageBitmap} sourceBitmap - Source bitmap to clone
+ * @returns {Promise<ImageBitmap|null>} Cloned bitmap or null
+ */
+async function _safeBitmapClone(sourceBitmap) {
+  if (!sourceBitmap || sourceBitmap.width === 0 || sourceBitmap.height === 0) {
+    return null;
+  }
+  
+  try {
+    // Test if bitmap is still valid by accessing dimensions
+    const w = sourceBitmap.width;
+    const h = sourceBitmap.height;
+    
+    // Create canvas and draw (this works even if source is already transferred/closed in some browsers)
+    const canvas = new OffscreenCanvas(w, h);
+    const ctx = canvas.getContext('2d', { alpha: false });
+    ctx.drawImage(sourceBitmap, 0, 0);
+    
+    // Create new bitmap from canvas
+    return await createImageBitmap(canvas);
+  } catch (err) {
+    console.warn('_safeBitmapClone failed (source likely closed):', err.message);
+    return null;
+  }
+}
+
 // ==================== CALIBRATION SUBSYSTEM (CALIB) ====================
 
 const CALIB = {
@@ -120,15 +310,12 @@ const CALIB = {
   meta: false,
 
   // Worker-side refcount for frames that reference persisted calibration metaKey
-  // Incremented when a frame referencing calibration is processed, decremented when finished.
   metaRefCount: 0,
-  // If an invalidate/unpin was requested while refcount > 0, we will hold this key here and attempt unpin later
   pendingUnpinKey: null,
   
   // Utility: Compute luminance statistics for frame classification
   async _computeFrameLuminance(imageBitmap) {
     try {
-      // Use smaller sample for speed - downsample to 64x64 for statistics
       const sampleSize = 64;
       const canvas = new OffscreenCanvas(sampleSize, sampleSize);
       const ctx = canvas.getContext('2d', { alpha: false });
@@ -140,7 +327,6 @@ const CALIB = {
       let count = 0;
       const values = [];
       
-      // Compute luminance for each pixel
       for (let i = 0; i < data.length; i += 4) {
         const r = data[i];
         const g = data[i + 1];
@@ -152,8 +338,6 @@ const CALIB = {
       }
       
       const mean = sum / count;
-      
-      // Compute median for more robust statistics
       values.sort((a, b) => a - b);
       const median = values[Math.floor(values.length / 2)];
       
@@ -161,7 +345,7 @@ const CALIB = {
       
     } catch (err) {
       console.error('CALIB: _computeFrameLuminance failed:', err);
-      return { mean: 128, median: 128, min: 0, max: 255 }; // Fallback
+      return { mean: 128, median: 128, min: 0, max: 255 };
     }
   },
   
@@ -171,28 +355,24 @@ const CALIB = {
     
     const frameStats = [];
     
-    // Compute luminance for all frames
     for (let i = 0; i < frames.length; i++) {
       const stats = await this._computeFrameLuminance(frames[i]);
       frameStats.push({ index: i, ...stats });
     }
     
-    // Sort by median luminance
     frameStats.sort((a, b) => a.median - b.median);
     
-    // Split: bottom 40% as dark, top 60% as flat (more flexible than 50/50)
     const darkCount = Math.max(1, Math.floor(frames.length * 0.4));
     const flatCount = Math.max(1, frames.length - darkCount);
     
-    // CRITICAL: Ensure no index overlap by using strict separation
     const darkIndices = frameStats.slice(0, darkCount).map(s => s.index);
-    const flatIndices = frameStats.slice(darkCount).map(s => s.index); // Start from darkCount, not -flatCount
+    const flatIndices = frameStats.slice(darkCount).map(s => s.index);
     
     console.log(`CALIB: Classified ${darkCount} dark frames, ${flatCount} flat frames`);
     console.log('CALIB: Dark frame luminance range:', 
-    frameStats.slice(0, darkCount).map(s => s.median.toFixed(1)).join(', '));
+      frameStats.slice(0, darkCount).map(s => s.median.toFixed(1)).join(', '));
     console.log('CALIB: Flat frame luminance range:', 
-    frameStats.slice(darkCount).map(s => s.median.toFixed(1)).join(', '));
+      frameStats.slice(darkCount).map(s => s.median.toFixed(1)).join(', '));
     
     return { darkIndices, flatIndices };
   },
@@ -201,7 +381,6 @@ const CALIB = {
   async _processFrameGroup(frames, indices, { width, height }) {
     console.log(`CALIB: Processing ${indices.length} frames at ${width}x${height}`);
     
-  // Use downsampling for faster calibration computation
     const maxCalibrationSize = 512;
     const scale = Math.min(1, maxCalibrationSize / Math.max(width, height));
     const calibW = Math.max(1, Math.floor(width * scale));
@@ -211,34 +390,29 @@ const CALIB = {
       console.log(`CALIB: Downsampling calibration frames from ${width}x${height} to ${calibW}x${calibH}`);
     }
     
-    // Use Float32Arrays for accumulation to avoid precision loss
     const channelSize = calibW * calibH;
     const rSum = new Float32Array(channelSize);
     const gSum = new Float32Array(channelSize);
     const bSum = new Float32Array(channelSize);
     
-    // Temporary canvas for reading frame data
     const tempCanvas = new OffscreenCanvas(calibW, calibH);
     const tempCtx = tempCanvas.getContext('2d', { alpha: false });
     
     try {
-      // Accumulate pixel values across frames
       for (let frameIdx = 0; frameIdx < indices.length; frameIdx++) {
         const frame = frames[indices[frameIdx]];
         
         tempCtx.drawImage(frame, 0, 0, calibW, calibH);
-        const imageData = tempCtx.getImageData(0, 0, calibW, calibH); // FIXED: Use downsampled dimensions
+        const imageData = tempCtx.getImageData(0, 0, calibW, calibH);
         const data = imageData.data;
         
         for (let pixelIdx = 0; pixelIdx < channelSize; pixelIdx++) {
           const dataIdx = pixelIdx * 4;
-          rSum[pixelIdx] += data[dataIdx];     // R
-          gSum[pixelIdx] += data[dataIdx + 1]; // G
-          bSum[pixelIdx] += data[dataIdx + 2]; // B
-          // Skip alpha channel
+          rSum[pixelIdx] += data[dataIdx];
+          gSum[pixelIdx] += data[dataIdx + 1];
+          bSum[pixelIdx] += data[dataIdx + 2];
         }
         
-        // Close the frame immediately after processing
         try {
           frame.close();
           console.log(`CALIB: Closed frame ${indices[frameIdx]} after processing`);
@@ -247,21 +421,19 @@ const CALIB = {
         }
       }
       
-      // Compute averages and create final ImageData
       const avgData = new Uint8ClampedArray(calibW * calibH * 4);
       const frameCount = indices.length;
       
       for (let pixelIdx = 0; pixelIdx < channelSize; pixelIdx++) {
         const dataIdx = pixelIdx * 4;
-        avgData[dataIdx]     = Math.round(rSum[pixelIdx] / frameCount); // R
-        avgData[dataIdx + 1] = Math.round(gSum[pixelIdx] / frameCount); // G
-        avgData[dataIdx + 2] = Math.round(bSum[pixelIdx] / frameCount); // B
-        avgData[dataIdx + 3] = 255; // Alpha
+        avgData[dataIdx]     = Math.round(rSum[pixelIdx] / frameCount);
+        avgData[dataIdx + 1] = Math.round(gSum[pixelIdx] / frameCount);
+        avgData[dataIdx + 2] = Math.round(bSum[pixelIdx] / frameCount);
+        avgData[dataIdx + 3] = 255;
       }
       
       const avgImageData = new ImageData(avgData, calibW, calibH);
       
-      // Create final canvas and convert to ImageBitmap
       const resultCanvas = new OffscreenCanvas(calibW, calibH);
       const resultCtx = resultCanvas.getContext('2d', { alpha: false });
       resultCtx.putImageData(avgImageData, 0, 0);
@@ -281,7 +453,6 @@ const CALIB = {
     console.log('CALIB: Computing normalized flat bias correction map');
     
     try {
-      // Create temporary canvases to read pixel data
       const darkCanvas = new OffscreenCanvas(width, height);
       const darkCtx = darkCanvas.getContext('2d', { alpha: false });
       darkCtx.drawImage(darkFrame, 0, 0, width, height);
@@ -292,32 +463,28 @@ const CALIB = {
       flatCtx.drawImage(flatFrame, 0, 0, width, height);
       const flatData = flatCtx.getImageData(0, 0, width, height);
       
-      const biasData = new Float32Array(width * height * 3); // RGB only, no alpha
-      const channelSums = [0, 0, 0]; // For computing per-channel means
+      const biasData = new Float32Array(width * height * 3);
+      const channelSums = [0, 0, 0];
       const pixelCount = width * height;
-      // Use numerically-safe epsilon
       const epsilon = 1e-6;
       
-      // Compute flat - dark for each pixel and channel
       for (let i = 0; i < width * height; i++) {
         const dataIdx = i * 4;
         const biasIdx = i * 3;
         
-        for (let c = 0; c < 3; c++) { // RGB channels only
+        for (let c = 0; c < 3; c++) {
           const flatVal = flatData.data[dataIdx + c];
           const darkVal = darkData.data[dataIdx + c];
-          const bias = Math.max(epsilon, flatVal - darkVal); // Avoid division by zero
+          const bias = Math.max(epsilon, flatVal - darkVal);
           
           biasData[biasIdx + c] = bias;
           channelSums[c] += bias;
         }
       }
       
-      // Compute per-channel means for normalization
-      const channelMeans = channelSums.map(sum => Math.max(epsilon, sum / pixelCount)); // Clamp means
+      const channelMeans = channelSums.map(sum => Math.max(epsilon, sum / pixelCount));
       console.log('CALIB: Flat bias channel means:', channelMeans.map(m => m.toFixed(6)));
       
-      // Check for extremely small means and warn
       const minValidMean = 0.1;
       channelMeans.forEach((mean, c) => {
         if (mean < minValidMean) {
@@ -325,13 +492,11 @@ const CALIB = {
         }
       });
       
-      // Normalize bias map so each channel has mean = 1.0, with float-centered normalization
       for (let i = 0; i < pixelCount; i++) {
         const biasIdx = i * 3;
         
         for (let c = 0; c < 3; c++) {
           const normalized = biasData[biasIdx + c] / channelMeans[c];
-          // Clamp to reasonable range to prevent extreme values
           biasData[biasIdx + c] = Math.max(0.01, Math.min(100.0, normalized));
         }
       }
@@ -346,7 +511,6 @@ const CALIB = {
 
   // Compute calibration from multiple frames
   async computeCalibration({ frames, framesNeeded = 10, resolution }) {
-    // Guard against concurrent calibration jobs
     if (this.busy) {
       throw new Error('Calibration computation already in progress');
     }
@@ -362,30 +526,25 @@ const CALIB = {
       
       const { width, height } = resolution;
       
-      // Classify frames by luminance
       const { darkIndices, flatIndices } = await this._classifyFrames(frames);
       
-      // Process dark frames
       console.log('CALIB: Processing dark frames...');
       const darkFrame = await this._processFrameGroup(frames, darkIndices, { width, height });
       
-      // Process flat frames  
       console.log('CALIB: Processing flat frames...');
       const flatFrame = await this._processFrameGroup(frames, flatIndices, { width, height });
       
-      // Compute normalized flat bias correction map
       const flatBiasNorm = this._computeFlatBiasNorm(darkFrame, flatFrame, { 
         width: darkFrame.width, 
         height: darkFrame.height 
       });
       
-      // Store calibration data
       this.darkFrame = darkFrame;
       this.flatFrame = flatFrame;
       this.flatBiasNorm = flatBiasNorm;
       this.isCalibrated = true;
       this.frameCount = frames.length;
-      this.resolution = { width: darkFrame.width, height: darkFrame.height }; // Use actual calibration frame size
+      this.resolution = { width: darkFrame.width, height: darkFrame.height };
       this.createdAt = Date.now();
       
       console.log(`CALIB: Calibration computed successfully (${this.frameCount} frames, ${this.resolution.width}x${this.resolution.height})`);
@@ -400,7 +559,6 @@ const CALIB = {
       console.error('CALIB: computeCalibration failed:', err);
       this.invalidateCalibration();
       
-      // Clean up any remaining frames on error
       frames.forEach((frame, index) => {
         try {
           frame.close();
@@ -410,7 +568,7 @@ const CALIB = {
         }
       });
       
-    throw err;
+      throw err;
     } finally {
       this.busy = false;
     }
@@ -419,34 +577,30 @@ const CALIB = {
   // Apply calibration correction to an ImageBitmap
   async applyCalibrationToBitmap(imageBitmap, { outW, outH }) {
     if (!this.isCalibrated || !this.darkFrame || !this.flatFrame || !this.flatBiasNorm) {
-      return imageBitmap; // Return unchanged if not calibrated
+      return imageBitmap;
     }
     
     try {
       const canvas = new OffscreenCanvas(outW, outH);
       const ctx = canvas.getContext('2d', { alpha: false });
       
-      // Draw source image
       ctx.drawImage(imageBitmap, 0, 0, outW, outH);
       const sourceData = ctx.getImageData(0, 0, outW, outH);
       
-      // Create temporary canvases for dark frame
       const darkCanvas = new OffscreenCanvas(outW, outH);
       const darkCtx = darkCanvas.getContext('2d', { alpha: false });
       darkCtx.drawImage(this.darkFrame, 0, 0, outW, outH);
       const darkData = darkCtx.getImageData(0, 0, outW, outH);
       
-      // Scale flat bias normalization map to output resolution
       const scaledBiasData = this._scaleFlatBiasNorm(this.flatBiasNorm, this.resolution, { width: outW, height: outH });
       
-      // Apply calibration: corrected = (source - dark) / flatBiasNorm
       const correctedData = new Uint8ClampedArray(sourceData.data.length);
       
       for (let i = 0; i < sourceData.data.length; i += 4) {
         const pixelIdx = Math.floor(i / 4);
         const biasIdx = pixelIdx * 3;
         
-        for (let c = 0; c < 3; c++) { // R,G,B channels only
+        for (let c = 0; c < 3; c++) {
           const source = sourceData.data[i + c];
           const dark = darkData.data[i + c];
           const sourceDark = source - dark;
@@ -455,10 +609,9 @@ const CALIB = {
           const corrected = sourceDark / flatBias;
           correctedData[i + c] = Math.max(0, Math.min(255, Math.round(corrected)));
         }
-        correctedData[i + 3] = sourceData.data[i + 3]; // Copy alpha unchanged
+        correctedData[i + 3] = sourceData.data[i + 3];
       }
       
-      // Create corrected ImageData and convert to ImageBitmap
       const correctedImageData = new ImageData(correctedData, outW, outH);
       ctx.putImageData(correctedImageData, 0, 0);
       
@@ -466,7 +619,7 @@ const CALIB = {
       
     } catch (err) {
       console.error('CALIB: applyCalibrationToBitmap failed:', err);
-      return imageBitmap; // Return original on error
+      return imageBitmap;
     }
   },
   
@@ -474,12 +627,10 @@ const CALIB = {
     const { width: srcW, height: srcH } = sourceRes;
     const { width: targetW, height: targetH } = targetRes;
     
-    // If resolutions match, return as-is
     if (srcW === targetW && srcH === targetH) {
       return flatBiasNorm;
     }
     
-    // Simple nearest-neighbor scaling for the bias map
     const scaledBias = new Float32Array(targetW * targetH * 3);
     const scaleX = srcW / targetW;
     const scaleY = srcH / targetH;
@@ -492,9 +643,9 @@ const CALIB = {
         const srcIdx = (srcY * srcW + srcX) * 3;
         const dstIdx = (y * targetW + x) * 3;
         
-        scaledBias[dstIdx] = flatBiasNorm[srcIdx];         // R
-        scaledBias[dstIdx + 1] = flatBiasNorm[srcIdx + 1]; // G  
-        scaledBias[dstIdx + 2] = flatBiasNorm[srcIdx + 2]; // B
+        scaledBias[dstIdx] = flatBiasNorm[srcIdx];
+        scaledBias[dstIdx + 1] = flatBiasNorm[srcIdx + 1];
+        scaledBias[dstIdx + 2] = flatBiasNorm[srcIdx + 2];
       }
     }
     
@@ -523,9 +674,8 @@ const CALIB = {
     this.frameCount = 0;
     this.resolution = null;
     this.createdAt = null;
-    this.busy = false; // Reset busy flag on invalidation
+    this.busy = false;
     
-    // Reset refcount/pending unpin as well
     this.metaRefCount = 0;
     this.pendingUnpinKey = null;
     
@@ -544,9 +694,7 @@ const CALIB = {
   }
 };
 
-// Helper attached to CALIB: fetch persisted calibration artifacts by metaKey.
-// Returns: { darkBitmap, flatBitmap, biasArray (Float32Array), meta, metaKey }
-// Uses worker-global storage API (self.getArtifact) which storage.js exposes.
+// Helper attached to CALIB: fetch persisted calibration artifacts by metaKey
 CALIB.fetchPersisted = async function(metaKey = null) {
   try {
     const key = metaKey || this.metaKey;
@@ -556,7 +704,6 @@ CALIB.fetchPersisted = async function(metaKey = null) {
       throw new Error('Storage API (getArtifact) not available in worker');
     }
 
-    // fetch meta manifest
     const metaArtifact = await self.getArtifact(key);
     if (!metaArtifact || !metaArtifact.data) {
       throw new Error(`Calibration meta not found for key ${key}`);
@@ -564,31 +711,29 @@ CALIB.fetchPersisted = async function(metaKey = null) {
 
     const { darkKey, flatKey, biasKey } = metaArtifact.data;
 
-    // fetch artifacts (may be null if absent)
     const darkArt = darkKey ? await self.getArtifact(darkKey) : null;
     const flatArt = flatKey ? await self.getArtifact(flatKey) : null;
     const biasArt = biasKey ? await self.getArtifact(biasKey) : null;
 
-    // create ImageBitmaps for dark/flat if blobs present
     const darkBitmap = (darkArt && darkArt.blob) ? await createImageBitmap(darkArt.blob) : null;
     const flatBitmap = (flatArt && flatArt.blob) ? await createImageBitmap(flatArt.blob) : null;
 
-    // bias blob -> Float32Array
     let biasArray = null;
     if (biasArt && biasArt.blob) {
       const ab = await biasArt.blob.arrayBuffer();
       biasArray = new Float32Array(ab);
     }
 
-    // *** PATCH: increment worker-side refcount because we're handing out bitmaps to a remote consumer ***
-    // Bump worker-side refcount since we're handing out bitmaps to requester
+    if (!this._releaseTokens) this._releaseTokens = new Map();
+    const token = `calrel-${Date.now()}-${Math.random().toString(36).slice(2,9)}`;
+    this._releaseTokens.set(token, key);
+
     this.metaRefCount = (this.metaRefCount || 0) + 1;
-    console.log(`CALIB.fetchPersisted: incremented metaRefCount for ${key} => ${this.metaRefCount}`);
-    // Keep a local pointer to the canonical metaKey (useful for deferred unpin)
+    console.log(`CALIB.fetchPersisted: created token=${token} metaKey=${key} metaRefCount=${this.metaRefCount}`);
+
     this.metaKey = key;
-    return { darkBitmap, flatBitmap, biasArray, meta: metaArtifact.data, metaKey: key };
 
-
+    return { darkBitmap, flatBitmap, biasArray, meta: metaArtifact.data, metaKey: key, releaseToken: token };
   } catch (err) {
     console.error('CALIB.fetchPersisted failed', err);
     throw err;
@@ -596,9 +741,6 @@ CALIB.fetchPersisted = async function(metaKey = null) {
 };
 
 // initializeStorage() compatibility shim
-// Historically we relied on storage.js setting self.onstorage via importScripts.
-// In the module-worker world we import storageAPI as an ES module and call initStorage directly.
-// Keep a shim for backwards compatibility that delegates to storageAPI.initStorage.
 function initializeStorage() {
   console.warn('preprocessor.worker: initializeStorage() shim called — delegating to storageAPI.initStorage (module mode)');
   initializationStarted = true;
@@ -609,7 +751,6 @@ function initializeStorage() {
       storageReady = true;
       console.log('preprocessor.worker: Storage initialized successfully (via shim)');
 
-      // Proxy commonly used functions onto self (backwards compatibility)
       try {
         self.putInboundArtifact = storageAPI.putInboundArtifact.bind(storageAPI);
         self.getArtifact = storageAPI.getArtifact.bind(storageAPI);
@@ -625,7 +766,6 @@ function initializeStorage() {
         console.warn('preprocessor.worker: failed to bind storageAPI methods to self', bindErr);
       }
 
-      // Process any queued frames
       const queued = [...pendingFrames];
       pendingFrames.length = 0;
       queued.forEach(frame => {
@@ -633,7 +773,6 @@ function initializeStorage() {
         processFrame(frame);
       });
 
-      // Signal main thread that worker is ready
       console.log('preprocessor.worker: Sending worker:ready message');
       postMessage({ event: 'worker:ready' });
     })
@@ -645,22 +784,13 @@ function initializeStorage() {
         error: String(err),
         details: { phase: 'storage_init', name: err && err.name, stack: err && err.stack }
       });
-      // rethrow for callers if any expect a rejection
       throw err;
     });
 }
 
-
-// NOTE: initialization is now driven by the dynamic import above.
-// initializeStorage() is kept as a shim function for compatibility but should not be invoked here
-// because the dynamic import logic handles calling it (and reporting errors).
-// initializeStorage();
-
-
 // Utility: average hash (aHash) quick implementation
 async function computeAHashFromBitmap(imageBitmap, hashSize = 8) {
   try {
-    // We'll downscale to hashSize x hashSize, grayscale, compare to mean
     const w = hashSize;
     const h = hashSize;
     const off = new OffscreenCanvas(w, h);
@@ -671,19 +801,16 @@ async function computeAHashFromBitmap(imageBitmap, hashSize = 8) {
     let sum = 0;
     const vals = new Uint8Array(w * h);
     for (let i = 0, j = 0; i < data.length; i += 4, j++) {
-      // convert to luminance
       const r = data[i], g = data[i + 1], b = data[i + 2];
       const lum = Math.round(0.299 * r + 0.587 * g + 0.114 * b);
       vals[j] = lum;
       sum += lum;
     }
     const mean = sum / vals.length;
-    // produce bitstring as hex
     let bits = 0n;
     for (let i = 0; i < vals.length; i++) {
       if (vals[i] >= mean) bits |= (1n << BigInt(i));
     }
-    // represent as hex string
     const hex = bits.toString(16);
     return hex;
   } catch (err) {
@@ -702,9 +829,7 @@ async function createThumbnailBlob(imageBitmap, maxSide = DEFAULT_THUMB_MAX_SIDE
     const h = Math.max(1, Math.floor(srcH * scale));
     const off = new OffscreenCanvas(w, h);
     const ctx = off.getContext('2d');
-    // Optionally handle flipY / orientation here if meta requires
     ctx.drawImage(imageBitmap, 0, 0, w, h);
-    // convert to blob (png)
     const blob = await off.convertToBlob({ type: 'image/png' });
     return { blob, w, h };
   } catch (err) {
@@ -716,7 +841,6 @@ async function createThumbnailBlob(imageBitmap, maxSide = DEFAULT_THUMB_MAX_SIDE
 // Main task: process incoming frame
 async function processFrame({ jobId, meta = {}, imageBitmap, options = {} }) {
   const startTime = Date.now();
-  // track whether this job incremented the calibration refcount
   let usedCalibKey = null;
   
   try {
@@ -724,8 +848,6 @@ async function processFrame({ jobId, meta = {}, imageBitmap, options = {} }) {
       throw new Error('No imageBitmap provided');
     }
 
-    // If this job intends to apply calibration and a persisted calibration metaKey exists,
-    // increment the worker-side refcount so we don't unpin while frames that rely on it are processing.
     if (options.applyCalibration && CALIB.metaKey) {
       usedCalibKey = CALIB.metaKey;
       CALIB.metaRefCount = (CALIB.metaRefCount || 0) + 1;
@@ -733,10 +855,8 @@ async function processFrame({ jobId, meta = {}, imageBitmap, options = {} }) {
       console.log(`CALIB: Incremented metaRefCount for key ${usedCalibKey} -> ${CALIB.metaRefCount}`);
     }
 
-    // Emit progress
     postMessage({ event: 'progress', jobId, stage: 'processing_start', timestamp: startTime });
 
-    // Apply calibration correction if enabled and available
     let processedBitmap = imageBitmap;
     if (options.applyCalibration && CALIB.isCalibrated) {
       postMessage({ event: 'progress', jobId, stage: 'applying_calibration' });
@@ -744,33 +864,25 @@ async function processFrame({ jobId, meta = {}, imageBitmap, options = {} }) {
         outW: imageBitmap.width,
         outH: imageBitmap.height
       });
-      // Close original if we created a new one
       if (processedBitmap !== imageBitmap) {
         try { imageBitmap.close(); } catch (e) {}
       }
     }
 
-    // Decide mode: preview vs final
-    const mode = options.mode || meta.mode || 'preview'; // 'preview' or 'final'
+    const mode = options.mode || meta.mode || 'preview';
     const thumbMax = mode === 'final' ? 512 : DEFAULT_THUMB_MAX_SIDE;
 
-    // Apply downsample scale if provided in options
     const downsampleScale = options.downsampleScale || 1.0;
     const effectiveThumbMax = Math.floor(thumbMax * downsampleScale);
 
-    // Create thumbnail
     postMessage({ event: 'progress', jobId, stage: 'creating_thumbnail' });
     const { blob: thumbBlob, w, h } = await createThumbnailBlob(processedBitmap, effectiveThumbMax);
 
-    // compute phash (aHash here)
-    // For phash we can compute from the thumbnail (fast)
-    // create a small bitmap from the blob
     postMessage({ event: 'progress', jobId, stage: 'computing_phash' });
     const thumbBitmap = await createImageBitmap(thumbBlob);
     const phash = await computeAHashFromBitmap(thumbBitmap, 8);
     try { thumbBitmap.close(); } catch (e) {}
 
-    // small manifest data
     const srcHash = meta.srcHash || `src-${Date.now()}-${Math.random().toString(36).slice(2,8)}`;
     const frameNumber = meta.frameNumber || null;
     const timestamp = meta.timestamp || Date.now();
@@ -781,24 +893,24 @@ async function processFrame({ jobId, meta = {}, imageBitmap, options = {} }) {
     const phashKey = `phash:${srcHash}`;
     const manifestKey = `manifest:${srcHash}`;
 
-      const thumbArtifact = {
-        key: thumbKey,
-        type: 'thumbnail',
-        blob: thumbBlob,
-        meta: { 
-          srcHash, 
-          frameNumber, 
-          timestamp, 
-          sizeBytes: thumbBlob.size, 
-          origin: 'preprocessor', 
-          producerVersion,
-          dimensions: { width: w, height: h },
-          downsampleScale: downsampleScale !== 1.0 ? downsampleScale : undefined,
-          calibrationApplied: options.applyCalibration && CALIB.isCalibrated,
-          calibrationKey: CALIB.metaKey || undefined   // <-- ADDED
-        },
-        createdAt: new Date().toISOString()
-      };
+    const thumbArtifact = {
+      key: thumbKey,
+      type: 'thumbnail',
+      blob: thumbBlob,
+      meta: { 
+        srcHash, 
+        frameNumber, 
+        timestamp, 
+        sizeBytes: thumbBlob.size, 
+        origin: 'preprocessor', 
+        producerVersion,
+        dimensions: { width: w, height: h },
+        downsampleScale: downsampleScale !== 1.0 ? downsampleScale : undefined,
+        calibrationApplied: options.applyCalibration && CALIB.isCalibrated,
+        calibrationKey: CALIB.metaKey || undefined
+      },
+      createdAt: new Date().toISOString()
+    };
 
     const phashArtifact = {
       key: phashKey,
@@ -811,7 +923,7 @@ async function processFrame({ jobId, meta = {}, imageBitmap, options = {} }) {
         producerVersion,
         hashVersion,
         sizeBytes: JSON.stringify({ phash, hashVersion, algorithm: 'aHash' }).length,
-        calibrationKey: CALIB.metaKey || undefined   // <- ADDED here too (useful)
+        calibrationKey: CALIB.metaKey || undefined
       },
       createdAt: new Date().toISOString()
     };
@@ -833,7 +945,7 @@ async function processFrame({ jobId, meta = {}, imageBitmap, options = {} }) {
         processingMode: mode,
         downsampleScale: downsampleScale !== 1.0 ? downsampleScale : undefined,
         calibrationApplied: options.applyCalibration && CALIB.isCalibrated,
-        calibrationKey: CALIB.metaKey || undefined   // <-- ADDED
+        calibrationKey: CALIB.metaKey || undefined
       },
       meta: { 
         srcHash, 
@@ -850,11 +962,8 @@ async function processFrame({ jobId, meta = {}, imageBitmap, options = {} }) {
       createdAt: new Date().toISOString()
     };
 
-
-    // Write artifacts to storage
     postMessage({ event: 'progress', jobId, stage: 'writing_storage' });
     
-    // Check if storage functions are available
     if (typeof self.putInboundArtifact !== 'function') {
       throw new Error('putInboundArtifact function not available');
     }
@@ -865,7 +974,6 @@ async function processFrame({ jobId, meta = {}, imageBitmap, options = {} }) {
 
     const durationMs = Date.now() - startTime;
 
-    // Notify main thread and broadcast channel
     const readyData = { 
       event: 'artifact:ready', 
       jobId, 
@@ -879,10 +987,13 @@ async function processFrame({ jobId, meta = {}, imageBitmap, options = {} }) {
     
     postMessage(readyData);
     if (bc) {
-      bc.postMessage(readyData);
+      try {
+        bc.postMessage(readyData);
+      } catch (bcErr) {
+        console.warn('preprocessor.worker: broadcast artifact:ready failed', bcErr);
+      }
     }
 
-    // Close the processed ImageBitmap to free GPU resources
     try { processedBitmap.close(); } catch (e) {}
     
   } catch (err) {
@@ -896,11 +1007,14 @@ async function processFrame({ jobId, meta = {}, imageBitmap, options = {} }) {
     };
     postMessage(errorData);
     if (bc) {
-      bc.postMessage(errorData);
+      try {
+        bc.postMessage(errorData);
+      } catch (bcErr) {
+        console.warn('preprocessor.worker: broadcast artifact:error failed', bcErr);
+      }
     }
     try { imageBitmap.close(); } catch (e) {}
   } finally {
-    // If this job used calibration, decrement the worker-side refcount and attempt unpin if pending
     try {
       if (usedCalibKey) {
         inFlightCalibMap.delete(jobId);
@@ -913,6 +1027,13 @@ async function processFrame({ jobId, meta = {}, imageBitmap, options = {} }) {
             if (typeof self.unpinArtifact === 'function') {
               await self.unpinArtifact(toUnpin);
               console.log(`CALIB: Unpinned pending key ${toUnpin} after refcount reached zero`);
+              if (bc) {
+                try {
+                  bc.postMessage({ event: 'calibration:unpin', metaKey: toUnpin, producer: 'preprocessor', timestamp: Date.now() });
+                } catch (bcErr) {
+                  console.warn('preprocessor.worker: broadcast calibration:unpin failed', bcErr);
+                }
+              }
             } else {
               console.warn('CALIB: unpinArtifact not available when trying deferred unpin');
             }
@@ -932,12 +1053,10 @@ async function handleReprocess({ jobId, key, actions = [], priority = 0 }) {
   try {
     postMessage({ event: 'progress', jobId, stage: 'reprocess_start', key, actions });
 
-    // Check if storage functions are available
     if (typeof self.getArtifact !== 'function') {
       throw new Error('getArtifact function not available');
     }
 
-    // Get the original artifact
     const artifact = await self.getArtifact(key);
     if (!artifact) {
       throw new Error(`Artifact not found: ${key}`);
@@ -947,7 +1066,6 @@ async function handleReprocess({ jobId, key, actions = [], priority = 0 }) {
     
     for (const action of actions) {
       if (action === 'sdf') {
-        // Placeholder for SDF generation
         const sdfKey = `sdf:${artifact.meta.srcHash}`;
         const sdfArtifact = {
           key: sdfKey,
@@ -965,7 +1083,6 @@ async function handleReprocess({ jobId, key, actions = [], priority = 0 }) {
         results.push(sdfKey);
         
       } else if (action === 'pose') {
-        // Placeholder for pose estimation
         const poseKey = `pose:${artifact.meta.srcHash}`;
         const poseArtifact = {
           key: poseKey,
@@ -1003,149 +1120,262 @@ async function handleReprocess({ jobId, key, actions = [], priority = 0 }) {
   }
 }
 
-// Handle calibration computation requests
+// ==================== MAJOR CHANGE: handleComputeCalibration ====================
+// CHANGE 3: COMPLETE REWRITE
+// PURPOSE: Create and persist calibrated frame artifact with robust error handling
+/**
+ * Handle calibration computation requests
+ * CHANGES:
+ * 1. Uses _safeBitmapClone to avoid closed bitmap errors
+ * 2. Creates calibratedFrameKey artifact (required by motion.worker)
+ * 3. Uses _retryStoragePut for transient IndexedDB error handling
+ * 4. Persists artifacts in atomic order (children first, manifest last)
+ * 5. Does NOT transfer bitmaps to main (sends metadata only)
+ * 6. Proper cleanup in finally block
+ */
 async function handleComputeCalibration({ jobId, frames, framesNeeded, resolution }) {
+  // Track bitmaps we create so we can clean them up properly
+  let darkBitmapClone = null;
+  let flatBitmapClone = null;
+  let calibratedBitmap = null;
+  
   try {
     postMessage({ event: 'progress', jobId, stage: 'calibration_start', frameCount: frames.length });
     
-        const result = await CALIB.computeCalibration({ frames, framesNeeded, resolution });
+    const result = await CALIB.computeCalibration({ frames, framesNeeded, resolution });
 
-    // Persist calibration artifacts: dark.png, flat.png, bias.bin, and a meta manifest
-    try {
-      // create PNG blobs from the ImageBitmaps
-      const darkCanvas = new OffscreenCanvas(result.darkFrame.width, result.darkFrame.height);
-      const darkCtx = darkCanvas.getContext('2d', { alpha: false });
-      darkCtx.drawImage(result.darkFrame, 0, 0);
-      const darkBlob = await darkCanvas.convertToBlob({ type: 'image/png' });
+    // CRITICAL: Clone result bitmaps IMMEDIATELY before they might be closed/transferred
+    postMessage({ event: 'progress', jobId, stage: 'cloning_calibration_bitmaps' });
+    
+    darkBitmapClone = await _safeBitmapClone(result.darkFrame);
+    flatBitmapClone = await _safeBitmapClone(result.flatFrame);
+    
+    if (!darkBitmapClone || !flatBitmapClone) {
+      throw new Error('Failed to clone calibration bitmaps - source frames may be closed');
+    }
 
-      const flatCanvas = new OffscreenCanvas(result.flatFrame.width, result.flatFrame.height);
-      const flatCtx = flatCanvas.getContext('2d', { alpha: false });
-      flatCtx.drawImage(result.flatFrame, 0, 0);
-      const flatBlob = await flatCanvas.convertToBlob({ type: 'image/png' });
+    postMessage({ event: 'progress', jobId, stage: 'creating_calibrated_reference' });
 
-      // bias (Float32Array) is stored in CALIB.flatBiasNorm
-      // serialize the Float32Array to a blob
-      let biasBlob = null;
-      if (CALIB.flatBiasNorm) {
-        // ensure we have an ArrayBuffer
-        const biasBuffer = CALIB.flatBiasNorm.buffer || new Float32Array(CALIB.flatBiasNorm).buffer;
-        biasBlob = new Blob([biasBuffer], { type: 'application/octet-stream' });
+    // Create calibrated reference frame by applying calibration to flat frame
+    calibratedBitmap = await CALIB.applyCalibrationToBitmap(
+      flatBitmapClone,
+      { outW: flatBitmapClone.width, outH: flatBitmapClone.height }
+    );
+    
+    if (!calibratedBitmap) {
+      throw new Error('Failed to create calibrated reference bitmap');
+    }
+
+    postMessage({ event: 'progress', jobId, stage: 'serializing_artifacts' });
+
+    // Generate artifact keys with timestamp
+    const ts = Date.now();
+    const darkKey = `calib:dark:${ts}`;
+    const flatKey = `calib:flat:${ts}`;
+    const biasKey = `calib:bias:${ts}`;
+    const calibratedKey = `calib:calibrated:${ts}`; // NEW: Required by motion.worker
+    const metaKey = `calib:meta:${ts}`;
+
+    // Convert bitmaps to PNG blobs
+    const darkCanvas = new OffscreenCanvas(darkBitmapClone.width, darkBitmapClone.height);
+    const darkCtx = darkCanvas.getContext('2d', { alpha: false });
+    darkCtx.drawImage(darkBitmapClone, 0, 0);
+    const darkBlob = await darkCanvas.convertToBlob({ type: 'image/png' });
+
+    const flatCanvas = new OffscreenCanvas(flatBitmapClone.width, flatBitmapClone.height);
+    const flatCtx = flatCanvas.getContext('2d', { alpha: false });
+    flatCtx.drawImage(flatBitmapClone, 0, 0);
+    const flatBlob = await flatCanvas.convertToBlob({ type: 'image/png' });
+
+    // NEW: Calibrated frame -> PNG
+    const calibCanvas = new OffscreenCanvas(calibratedBitmap.width, calibratedBitmap.height);
+    const calibCtx = calibCanvas.getContext('2d', { alpha: false });
+    calibCtx.drawImage(calibratedBitmap, 0, 0);
+    const calibratedBlob = await calibCanvas.convertToBlob({ type: 'image/png' });
+
+    // Bias map -> binary blob
+    let biasBlob = null;
+    if (CALIB.flatBiasNorm) {
+      const biasBuffer = CALIB.flatBiasNorm.buffer || new Float32Array(CALIB.flatBiasNorm).buffer;
+      biasBlob = new Blob([biasBuffer], { type: 'application/octet-stream' });
+    }
+
+    postMessage({ event: 'progress', jobId, stage: 'persisting_artifacts' });
+
+    // Build manifest with calibratedFrameKey (CRITICAL FIELD)
+    const manifestData = {
+      darkKey,
+      flatKey,
+      biasKey,
+      calibratedFrameKey: calibratedKey, // Required by motion.worker
+      resolution: { 
+        width: darkBitmapClone.width, 
+        height: darkBitmapClone.height 
+      },
+      frameCount: result.meta?.frameCount || null,
+      createdAt: new Date().toISOString(),
+      version: 'calib-v1',
+      producer: 'preprocessor.worker',
+      producerVersion: '1.0'
+    };
+
+    // Persist artifacts with retry logic (atomic order: children first, manifest last)
+    const artifactsToPersist = [
+      { key: darkKey, type: 'calib-dark', blob: darkBlob, 
+        meta: { sizeBytes: darkBlob.size, resolution: manifestData.resolution } },
+      { key: flatKey, type: 'calib-flat', blob: flatBlob,
+        meta: { sizeBytes: flatBlob.size, resolution: manifestData.resolution } },
+      { key: biasKey, type: 'calib-bias', blob: biasBlob,
+        meta: { sizeBytes: biasBlob.size, dtype: 'float32', 
+                description: 'Flat bias normalization map (Float32Array)' } },
+      { key: calibratedKey, type: 'calib-calibrated', blob: calibratedBlob,
+        meta: { 
+          sizeBytes: calibratedBlob.size, 
+          resolution: { width: calibCanvas.width, height: calibCanvas.height },
+          description: 'Calibrated reference frame (flat with dark/bias corrections)',
+          appliedCorrections: { darkSubtraction: true, flatFieldCorrection: true }
+        } 
       }
+    ];
 
-      // produce keys
-      const ts = Date.now();
-      const darkKey = `calib:dark:${ts}`;
-      const flatKey = `calib:flat:${ts}`;
-      const biasKey = `calib:bias:${ts}`;
-      const metaKey = `calib:meta:${ts}`;
+    // Persist child artifacts sequentially with retry
+    for (const artifact of artifactsToPersist) {
+      if (!artifact.blob) continue;
+      
+      await _retryStoragePut(async () => {
+        const putFn = self.putInboundArtifact || 
+                      (typeof storageAPI !== 'undefined' && storageAPI.putInboundArtifact);
+        
+        if (typeof putFn !== 'function') {
+          throw new Error('putInboundArtifact not available in worker context');
+        }
+        
+        await putFn({
+          key: artifact.key,
+          type: artifact.type,
+          blob: artifact.blob,
+          meta: artifact.meta,
+          createdAt: new Date().toISOString()
+        });
+      });
+    }
 
-      // Build meta manifest (references keys)
-      const manifest = {
+    // Persist meta manifest LAST (atomic commit point)
+    await _retryStoragePut(async () => {
+      const putFn = self.putInboundArtifact || 
+                    (typeof storageAPI !== 'undefined' && storageAPI.putInboundArtifact);
+      
+      if (typeof putFn !== 'function') {
+        throw new Error('putInboundArtifact not available for manifest');
+      }
+      
+      await putFn({
         key: metaKey,
         type: 'calibration.meta',
-        data: {
-          darkKey,
-          flatKey,
-          biasKey,
-          resolution: { width: result.darkFrame.width, height: result.darkFrame.height },
-          frameCount: result.meta?.frameCount || null,
-          createdAt: new Date().toISOString(),
-          version: 'calib-v1'
-        },
+        data: manifestData,
         meta: {
           producer: 'preprocessor',
+          calibVersion: 'calib-v1',
+          artifactKeys: [darkKey, flatKey, biasKey, calibratedKey],
           createdAt: new Date().toISOString()
         },
         createdAt: new Date().toISOString()
-      };
-
-      // Put artifacts into storage (idempotent - putInboundArtifact handles existing)
-      if (darkBlob) {
-        await self.putInboundArtifact({
-          key: darkKey,
-          type: 'calib-dark',
-          blob: darkBlob,
-          meta: { sizeBytes: darkBlob.size, resolution: { width: result.darkFrame.width, height: result.darkFrame.height } },
-          createdAt: new Date().toISOString()
-        });
-      }
-      if (flatBlob) {
-        await self.putInboundArtifact({
-          key: flatKey,
-          type: 'calib-flat',
-          blob: flatBlob,
-          meta: { sizeBytes: flatBlob.size, resolution: { width: result.flatFrame.width, height: result.flatFrame.height } },
-          createdAt: new Date().toISOString()
-        });
-      }
-
-      if (biasBlob) {
-        await self.putInboundArtifact({
-          key: biasKey,
-          type: 'calib-bias',
-          blob: biasBlob,
-          meta: { sizeBytes: biasBlob.size, dtype: 'float32', description: 'flat bias normalization map' },
-          createdAt: new Date().toISOString()
-        });
-      }
-
-      // persist meta manifest last (references the other keys)
-      await self.putInboundArtifact({
-        key: metaKey,
-        type: 'calibration.meta',
-        data: manifest.data,
-        meta: manifest.meta,
-        createdAt: manifest.createdAt
       });
+    });
 
-      // store canonical meta key in CALIB for immediate use
-      CALIB.metaKey = metaKey;
-      CALIB.meta = manifest.data;
+    postMessage({ event: 'progress', jobId, stage: 'finalization' });
 
-      // *** PATCH: initialize worker-side refcount so unpin logic is correct (meta owner = worker) ***
-      // Set worker-side refcount to reflect that worker/pinner is an owner.
-      // Prevent immediate unpinning if invalidateCalibration is requested, while consumers rely on persisted data
-      CALIB.metaRefCount = 1;
-      console.log(`CALIB: metaKey set to ${metaKey}, metaRefCount=${CALIB.metaRefCount}`);
-      
+    // Update CALIB state
+    CALIB.metaKey = metaKey;
+    CALIB.meta = manifestData;
+    CALIB.metaRefCount = 1;
+    
+    console.log(`CALIB: Calibration persisted successfully. metaKey=${metaKey}, calibratedFrameKey=${calibratedKey}`);
 
-      // Pin the calibration meta so it isn't evicted immediately (soft pin)
-      try {
-        await self.pinArtifact(metaKey, { owner: 'preprocessor', type: 'soft' });
-      } catch (pinErr) {
-        console.warn('handleComputeCalibration: pinArtifact failed', pinErr);
+    // Pin meta artifact (prevents premature eviction)
+    try {
+      const pinFn = self.pinArtifact || 
+                    (typeof storageAPI !== 'undefined' && storageAPI.pinArtifact);
+      if (typeof pinFn === 'function') {
+        await pinFn(metaKey, { owner: 'preprocessor', type: 'soft' });
       }
-
-      // Now post calibration ready to main (transfer the ImageBitmaps as before)
-      postMessage({
-        event: 'calibration:ready',
-        jobId,
-        darkFrame: result.darkFrame,
-        flatFrame: result.flatFrame,
-        meta: manifest.data,
-        metaKey
-      }, [result.darkFrame, result.flatFrame]);
-
-    } catch (persistErr) {
-      console.error('handleComputeCalibration: failed to persist calibration artifacts', persistErr);
-      // fallback to sending calibration bitmaps without persistence
-      postMessage({
-        event: 'calibration:ready',
-        jobId,
-        darkFrame: result.darkFrame,
-        flatFrame: result.flatFrame,
-        meta: result.meta
-      }, [result.darkFrame, result.flatFrame]);
+    } catch (pinErr) {
+      console.warn('handleComputeCalibration: pinArtifact failed (non-fatal)', pinErr);
     }
-  
+
+    // Generate release token
+    let releaseToken = null;
+    try {
+      releaseToken = `calrel-${ts}-${Math.random().toString(36).slice(2,9)}`;
+      if (!CALIB._releaseTokens) CALIB._releaseTokens = new Map();
+      CALIB._releaseTokens.set(releaseToken, metaKey);
+      CALIB.metaRefCount = (CALIB.metaRefCount || 0) + 1;
+      console.log(`CALIB: releaseToken created: ${releaseToken} (metaRefCount=${CALIB.metaRefCount})`);
+    } catch (tokErr) {
+      console.warn('handleComputeCalibration: releaseToken generation failed', tokErr);
+    }
+
+    // CHANGE: Do NOT transfer bitmaps (avoid ownership issues)
+    // Send metadata only - main thread can fetch from storage if needed
+    postMessage({
+      event: 'calibration:ready',
+      jobId,
+      metaKey,
+      meta: manifestData,
+      releaseToken,
+      darkFrameInfo: { width: darkBitmapClone.width, height: darkBitmapClone.height },
+      flatFrameInfo: { width: flatBitmapClone.width, height: flatBitmapClone.height }
+    }); // No transferables
+
+    // Broadcast to other workers (metadata only)
+    try {
+      if (bc) {
+        bc.postMessage({
+          event: 'calibration:ready',
+          metaKey,
+          meta: manifestData,
+          releaseToken,
+          producer: 'preprocessor',
+          timestamp: Date.now()
+        });
+        console.log('preprocessor.worker: Broadcasted calibration:ready with calibratedFrameKey');
+      }
+    } catch (bcErr) {
+      console.warn('preprocessor.worker: BroadcastChannel failed (non-fatal)', bcErr);
+    }
+
   } catch (err) {
-    console.error('preprocessor.worker: calibration computation failed', err);
+    console.error('preprocessor.worker: calibration computation/persistence failed', err);
+    
     postMessage({ 
       event: 'calibration:error', 
       jobId, 
       error: String(err),
-      stack: err.stack 
+      stack: err.stack,
+      phase: 'computation_or_persistence'
     });
+    
+    if (bc) {
+      try {
+        bc.postMessage({ 
+          event: 'calibration:error', 
+          jobId, 
+          error: String(err), 
+          producer: 'preprocessor', 
+          timestamp: Date.now() 
+        });
+      } catch (bcErr) {}
+    }
+    
+  } finally {
+    // Cleanup: Close all bitmap clones we created
+    try {
+      if (darkBitmapClone) darkBitmapClone.close();
+      if (flatBitmapClone) flatBitmapClone.close();
+      if (calibratedBitmap) calibratedBitmap.close();
+    } catch (cleanupErr) {
+      console.warn('Bitmap cleanup error (non-fatal):', cleanupErr);
+    }
   }
 }
 
@@ -1154,10 +1384,35 @@ self.onmessage = async (ev) => {
   const msg = ev.data || {};
   
   try {
+
+    if (msg.op === '__request_diagnostics') {
+      try {
+        postMessage({
+          event: 'worker:diag',
+          ts: msg.ts || Date.now(),
+          storageReady: !!storageReady,
+          initializationStarted: !!initializationStarted,
+          pendingFrames: pendingFrames ? pendingFrames.length : 0,
+          queuedFrameSamples: pendingFrames.slice(0,3).map(p => ({ jobId: p.jobId, meta: p.meta })),
+          CALIB: {
+            isCalibrated: !!CALIB.isCalibrated,
+            metaKey: CALIB.metaKey || null,
+            metaRefCount: CALIB.metaRefCount || 0,
+            busy: !!CALIB.busy
+          },
+          env: {
+            hasOffscreenCanvas: typeof OffscreenCanvas !== 'undefined',
+            hasCreateImageBitmap: typeof createImageBitmap !== 'undefined'
+          }
+        });
+      } catch (e) {
+        postMessage({ event: 'worker:diag', error: String(e), ts: Date.now() });
+      }
+      return;
+    }
+
     if (msg.op === 'preprocess') {
-      // message should contain { jobId, meta, imageBitmap, options? }
       const { jobId, meta = {}, options = {} } = msg;
-      // imageBitmap is a transferred ImageBitmap
       const imageBitmap = msg.imageBitmap || ev.data.imageBitmap || null;
       
       if (!imageBitmap) {
@@ -1166,13 +1421,11 @@ self.onmessage = async (ev) => {
       }
 
       if (!storageReady) {
-        // Queue the frame for processing once storage is ready
         pendingFrames.push({ jobId, meta, imageBitmap, options });
         console.debug('preprocessor.worker: storage not ready, queuing frame', jobId);
         return;
       }
       
-      // Process immediately if storage is ready
       await processFrame({ jobId, meta, imageBitmap, options });
       
     } else if (msg.op === 'reprocess') {
@@ -1188,25 +1441,39 @@ self.onmessage = async (ev) => {
       await handleComputeCalibration({ jobId, frames, framesNeeded, resolution });
       
     } else if (msg.op === 'fetchCalibration') {
-      // New: handle fetch request from main wrapper to retrieve persisted calibration artifacts
-      // msg: { jobId, metaKey? }
       try {
         const metaKey = msg.metaKey || CALIB.metaKey;
         if (!metaKey) {
           throw new Error('No metaKey specified and no CALIB.metaKey available');
         }
-        // Use CALIB.fetchPersisted to load bitmaps (and bias if present) from storage
         const fetched = await CALIB.fetchPersisted(metaKey);
-        // Do NOT send biasArray back to main (per preference B)
-        const { darkBitmap, flatBitmap, meta, metaKey: canonicalKey } = fetched;
+        const { darkBitmap, flatBitmap, meta, metaKey: canonicalKey, releaseToken } = fetched;
         postMessage({
           event: 'calibration:fetched',
           jobId: msg.jobId || null,
           metaKey: canonicalKey,
           meta,
           darkFrame: darkBitmap,
-          flatFrame: flatBitmap
+          flatFrame: flatBitmap,
+          releaseToken
         }, [darkBitmap, flatBitmap]);
+
+        try {
+          if (bc) {
+            bc.postMessage({
+              event: 'calibration:fetched',
+              metaKey: canonicalKey,
+              meta,
+              releaseToken,
+              producer: 'preprocessor',
+              timestamp: Date.now()
+            });
+            console.log('preprocessor.worker: broadcasted calibration:fetched', canonicalKey);
+          }
+        } catch (bcErr) {
+          console.warn('preprocessor.worker: failed to broadcast calibration:fetched', bcErr);
+        }
+
       } catch (fErr) {
         console.error('preprocessor.worker: fetchCalibration failed', fErr);
         postMessage({
@@ -1215,31 +1482,109 @@ self.onmessage = async (ev) => {
           metaKey: msg.metaKey || null,
           error: String(fErr)
         });
+        if (bc) {
+          try {
+            bc.postMessage({
+              event: 'calibration:fetch_error',
+              metaKey: msg.metaKey || null,
+              error: String(fErr),
+              producer: 'preprocessor',
+              timestamp: Date.now()
+            });
+          } catch (bcErr) {
+            console.warn('preprocessor.worker: failed to broadcast calibration:fetch_error', bcErr);
+          }
+        }
+      }
+      
+    } else if (msg.op === 'releaseCalibration') {
+      try {
+        const token = msg.token;
+        if (!token) {
+          postMessage({ event: 'calibration:release_error', token: null, error: 'missing_token' });
+          return;
+        }
+        if (!CALIB._releaseTokens || !CALIB._releaseTokens.has(token)) {
+          console.warn('preprocessor.worker: releaseCalibration received unknown token', token);
+          postMessage({ event: 'calibration:release_error', token, error: 'invalid_token' });
+          return;
+        }
+
+        const key = CALIB._releaseTokens.get(token);
+        CALIB._releaseTokens.delete(token);
+        CALIB.metaRefCount = Math.max(0, (CALIB.metaRefCount || 0) - 1);
+        console.log(`CALIB: release token ${token} for ${key}, metaRefCount -> ${CALIB.metaRefCount}`);
+
+        if (CALIB.metaRefCount === 0 && CALIB.pendingUnpinKey) {
+          const toUnpin = CALIB.pendingUnpinKey;
+          CALIB.pendingUnpinKey = null;
+          try {
+            if (typeof self.unpinArtifact === 'function') {
+              await self.unpinArtifact(toUnpin);
+              console.log(`CALIB: Unpinned pending key ${toUnpin} after release`);
+              if (bc) {
+                try {
+                  bc.postMessage({ event: 'calibration:unpin', metaKey: toUnpin, producer: 'preprocessor', timestamp: Date.now() });
+                } catch (bcErr) {
+                  console.warn('preprocessor.worker: broadcast calibration:unpin failed', bcErr);
+                }
+              }
+            } else {
+              console.warn('CALIB: unpinArtifact not available when attempting deferred unpin');
+            }
+          } catch (uErr) {
+            console.warn('CALIB: deferred unpin failed', uErr);
+          }
+        }
+
+        postMessage({ event: 'calibration:released', token, metaKey: key });
+
+        try {
+          if (bc) {
+            bc.postMessage({ event: 'calibration:released', token, metaKey: key, producer: 'preprocessor', timestamp: Date.now() });
+            console.log('preprocessor.worker: broadcasted calibration:released', key);
+          }
+        } catch (bcErr) {
+          console.warn('preprocessor.worker: failed to broadcast calibration:released', bcErr);
+        }
+
+      } catch (err) {
+        console.error('preprocessor.worker: releaseCalibration handler failed', err);
+        postMessage({ event: 'calibration:release_error', token: msg.token, error: String(err) });
+        if (bc) {
+          try {
+            bc.postMessage({ event: 'calibration:release_error', token: msg.token, error: String(err), producer: 'preprocessor', timestamp: Date.now() });
+          } catch (bcErr) {
+            console.warn('preprocessor.worker: failed to broadcast calibration:release_error', bcErr);
+          }
+        }
       }
 
     } else if (msg.op === 'invalidateCalibration') {
-      // If a persisted calibration metaKey exists, attempt to unpin it first, but only when safe
       const oldMetaKey = CALIB.metaKey;
       if (oldMetaKey) {
         if (CALIB.metaRefCount && CALIB.metaRefCount > 0) {
-          // There are in-flight frames that reference the persisted meta.
-          // Defer unpinning until refcount reaches zero.
           CALIB.pendingUnpinKey = oldMetaKey;
           console.log(`invalidateCalibration: deferring unpin of ${oldMetaKey} until metaRefCount reaches 0 (currently ${CALIB.metaRefCount})`);
         } else {
           try {
             await self.unpinArtifact(oldMetaKey);
             console.log(`invalidateCalibration: unpinned ${oldMetaKey}`);
+            if (bc) {
+              try {
+                bc.postMessage({ event: 'calibration:unpin', metaKey: oldMetaKey, producer: 'preprocessor', timestamp: Date.now() });
+              } catch (bcErr) {
+                console.warn('preprocessor.worker: broadcast calibration:unpin failed', bcErr);
+              }
+            }
           } catch (unpErr) {
             console.warn('invalidateCalibration: unpinArtifact failed', unpErr);
           }
         }
       }
 
-      // Now invalidate in-memory calibration
       CALIB.invalidateCalibration();
 
-      // Also clear any stored references
       CALIB.metaKey = null;
       CALIB.meta = null;
 
@@ -1247,6 +1592,15 @@ self.onmessage = async (ev) => {
         event: 'calibration:invalidated',
         timestamp: Date.now()
       });
+
+      try {
+        if (bc) {
+          bc.postMessage({ event: 'calibration:invalidated', metaKey: oldMetaKey || null, producer: 'preprocessor', timestamp: Date.now() });
+          console.log('preprocessor.worker: broadcasted calibration:invalidated', oldMetaKey);
+        }
+      } catch (bcErr) {
+        console.warn('preprocessor.worker: failed to broadcast calibration:invalidated', bcErr);
+      }
 
       
     } else if (msg.op === 'getCalibrationMeta') {
@@ -1256,23 +1610,19 @@ self.onmessage = async (ev) => {
       });
       
     } else if (msg.op === 'shutdown') {
-      // Clean up any pending frames
       pendingFrames.forEach(({ imageBitmap }) => {
         try { imageBitmap.close(); } catch (e) {}
       });
       pendingFrames.length = 0;
       
-      // Clean up calibration
       CALIB.invalidateCalibration();
       
-      // Close broadcast channel
       try { if (bc) bc.close(); } catch (e) {}
       
       postMessage({ event: 'worker:shutdown' });
       close();
       
     } else {
-      // other ops
       console.debug('preprocessor.worker: unknown op', msg.op);
     }
   } catch (err) {
@@ -1283,5 +1633,12 @@ self.onmessage = async (ev) => {
       stack: err.stack,
       phase: 'message_handling'
     });
+    if (bc) {
+      try {
+        bc.postMessage({ event: 'worker:error', error: String(err), stack: err.stack, producer: 'preprocessor', timestamp: Date.now() });
+      } catch (bcErr) {
+        console.warn('preprocessor.worker: broadcast worker:error failed', bcErr);
+      }
+    }
   }
 };

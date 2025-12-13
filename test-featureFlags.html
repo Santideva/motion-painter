@@ -1,0 +1,39 @@
+<!doctype html>
+<html>
+<body>
+  <pre id="out"></pre>
+  <script type="module">
+    import featureFlags from './src/config/featureFlags.js';
+    const out = document.getElementById('out');
+    function log(...a){ out.textContent += a.map(x=>typeof x==='object'?JSON.stringify(x,null,2):String(x)).join(' ') + '\\n'; }
+
+    // Basic bootstrap
+    log('initial flags snapshot:', featureFlags.getFlags());
+
+    // waitForFlag demo
+    featureFlags.setFlag('demoFlag', false);
+    featureFlags.waitForFlag('demoFlag', true, 5000)
+      .then(snap => log('waitForFlag resolved:', snap))
+      .catch(err => log('waitForFlag rejected:', err.message));
+
+    setTimeout(()=> {
+      log('setting demoFlag true now');
+      featureFlags.setFlag('demoFlag', true);
+    }, 500);
+
+    // subscribeKey demo
+    const unsub = featureFlags.subscribeKey('demoFlag', (p)=> log('subscribeKey callback', p));
+    // BC demo (only works if BroadcastChannel available)
+    if (featureFlags._replaceBroadcastChannel) {
+      const fake = {
+        addEventListener: (e,f)=>{ window._fakeHandler = f; },
+        removeEventListener: () => {},
+        postMessage: (m) => log('fakeBC.postMessage called:', m),
+        close: ()=>{}
+      };
+      featureFlags._replaceBroadcastChannel(fake);
+      log('replaced BC with fake');
+    }
+  </script>
+</body>
+</html>
