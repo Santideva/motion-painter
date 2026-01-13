@@ -2,7 +2,7 @@
 // IndexedDB-backed, flux & calibration support, optimistic-versioning, robust eviction.
 
 const DB_NAME = 'motionPainterDB';
-const DB_VERSION = 2;
+const DB_VERSION = 3; // Incremented to add reconStatus store
 const ARTIFACTS_STORE = 'artifacts';
 const STREAMS_STORE = 'streams';
 const COUNTERS_STORE = 'counters';
@@ -682,12 +682,35 @@ const openDB = () => {
         if (!s.indexNames.contains('version')) s.createIndex('version', 'meta.version', { unique: false });
       }
 
+      // When creating STREAMS_STORE (inside openDB onupgradeneeded)
       if (!db.objectStoreNames.contains(STREAMS_STORE)) {
-        db.createObjectStore(STREAMS_STORE, { keyPath: 'seq', autoIncrement: true });
+        const s = db.createObjectStore(STREAMS_STORE, { keyPath: 'seq', autoIncrement: true });
+        // Add indexes to allow efficient lookup
+        try {
+          s.createIndex('stream', 'stream', { unique: false });
+          s.createIndex('createdAt', 'createdAt', { unique: false });
+        } catch (e) {
+          console.warn('storage.js: failed to create streams indexes', e);
+        }
+      } else if (oldVersion < 3) {
+        // If streams existed but indexes not present, create them via existing transaction's objectStore
+        const tx = ev.target.transaction;
+        const s = tx.objectStore(STREAMS_STORE);
+        if (!s.indexNames.contains('stream')) s.createIndex('stream', 'stream', { unique: false });
+        if (!s.indexNames.contains('createdAt')) s.createIndex('createdAt', 'createdAt', { unique: false });
       }
 
       if (!db.objectStoreNames.contains(COUNTERS_STORE)) {
         db.createObjectStore(COUNTERS_STORE, { keyPath: 'id' });
+      }
+      // Version 3: Add reconStatus store
+      if (oldVersion < 3) {
+        if (!db.objectStoreNames.contains('reconStatus')) {
+          const reconStore = db.createObjectStore('reconStatus', { keyPath: 'metaKey' });
+          reconStore.createIndex('state', 'state', { unique: false });
+          reconStore.createIndex('startedAt', 'startedAt', { unique: false });
+          console.log('storage.js: created reconStatus store (v3)');
+        }
       }
     };
 
@@ -946,13 +969,28 @@ const updateCalibrationAsync = async (key, calibResult) => {
 
 // Core artifact APIs
 
+// Core artifact APIs
+
 const putInboundArtifact = async (artifact) => {
   const db = await openDB();
   const nowMs = Date.now();
   const nowISO = new Date(nowMs).toISOString();
 
+  // ===== NEW: Generate canonical metaKey if not provided =====
+  let metaKey = artifact.key;
+  
+  if (!metaKey) {
+    const timestamp = Date.now();
+    const sourceHash = artifact.meta?.sourceMetaKey 
+      ? artifact.meta.sourceMetaKey.split(':').pop() 
+      : timestamp.toString(36);
+    
+    metaKey = `artifact:${artifact.type}:${sourceHash}:${timestamp}`;
+  }
+  // ===== END NEW =====
+
   let art = {
-    key: artifact.key,
+    key: metaKey, // CHANGED: Use generated/provided metaKey
     type: artifact.type,
     blob: artifact.blob || null,
     data: artifact.data || null,
@@ -1081,7 +1119,8 @@ const putInboundArtifact = async (artifact) => {
               .catch(err => console.warn('Flux calib verification failed (async):', err));
           }
 
-          resolve({ ok: true, seq: null, reused: true });
+          // CHANGED: Return metaKey instead of seq
+          resolve({ ok: true, metaKey: art.key, reused: true });
         };
 
         tx.onerror = () => {
@@ -1122,7 +1161,8 @@ const putInboundArtifact = async (artifact) => {
             .catch(err => console.warn('Flux calib verification failed (async):', err));
         }
 
-        resolve({ ok: true, seq: createdStreamSeq });
+        // CHANGED: Return metaKey instead of seq
+        resolve({ ok: true, metaKey: art.key, seq: createdStreamSeq });
       };
 
       tx.onerror = () => {
@@ -1289,38 +1329,104 @@ const pinArtifact = async (key, { owner = 'user', type = 'soft' } = {}) => {
       pbReq.onsuccess = () => {
         const pinnedBytes = pbReq.result?.value || 0;
         const softBudget = Math.floor(quotaBytes * 0.3);
+        const pinRefId = `pinref:${key}`;
 
+        // If artifact already marked pinned, we still increment the per-key refcount,
+        // but DO NOT double-count pinnedBytes.
         if (art.meta?.pinned) {
-          incrementVersion(art);
-          Object.assign(art.meta, { pinType: type, pinOwner: owner });
-          const putReq = artifacts.put(art);
-          putReq.onerror = () => { tx.abort(); reject(new Error('Failed to update pinned artifact metadata: ' + putReq.error)); };
-          tx.oncomplete = () => {
-            ensureBroadcast()?.postMessage({ event: 'artifact:pinned', key, owner, type, reused: true });
-            resolve({ ok: true, reused: true });
+          // Read current pinref (may be absent -> default 0) and increment it
+          const getPinReq = counters.get(pinRefId);
+          getPinReq.onsuccess = () => {
+            const cur = getPinReq.result?.value || 0;
+            const next = cur + 1;
+            counters.put({ id: pinRefId, value: next });
+
+            // Update metadata (keep pinned true) and store artifact
+            try {
+              incrementVersion(art);
+              Object.assign(art.meta, { pinType: type, pinOwner: owner });
+              const putReq = artifacts.put(art);
+              putReq.onerror = () => { tx.abort(); reject(new Error('Failed to update pinned artifact metadata: ' + putReq.error)); };
+              tx.oncomplete = () => {
+                ensureBroadcast()?.postMessage({ event: 'artifact:pinned', key, owner, type, reused: true });
+                resolve({ ok: true, reused: true });
+              };
+              tx.onerror = () => reject(tx.error);
+            } catch (err) {
+              tx.abort();
+              reject(err);
+            }
           };
-          tx.onerror = () => reject(tx.error);
+          getPinReq.onerror = () => {
+            // Best-effort: still update artifact metadata if we couldn't read counters
+            try {
+              incrementVersion(art);
+              Object.assign(art.meta, { pinType: type, pinOwner: owner });
+              const putReq = artifacts.put(art);
+              putReq.onerror = () => { tx.abort(); reject(new Error('Failed to update pinned artifact metadata: ' + putReq.error)); };
+              tx.oncomplete = () => {
+                ensureBroadcast()?.postMessage({ event: 'artifact:pinned', key, owner, type, reused: true });
+                resolve({ ok: true, reused: true });
+              };
+              tx.onerror = () => reject(tx.error);
+            } catch (err) {
+              tx.abort();
+              reject(err);
+            }
+          };
           return;
         }
 
+        // If this would exceed soft budget for 'soft' pin, reject early
         if (pinnedBytes + size > softBudget && type === 'soft') {
           tx.abort();
           return resolve({ ok: false, reason: 'PIN_BUDGET_EXCEEDED' });
         }
 
-        incrementVersion(art);
-        art.meta = art.meta || {};
-        Object.assign(art.meta, { pinned: true, pinType: type, pinOwner: owner });
+        // Normal "first pin" path: increment pinref (from 0->1), set art.meta.pinned, and bump pinnedBytes
+        try {
+          const getPinReq2 = counters.get(pinRefId);
+          getPinReq2.onsuccess = () => {
+            const cur = getPinReq2.result?.value || 0;
+            const next = cur + 1;
+            counters.put({ id: pinRefId, value: next });
 
-        const putReq = artifacts.put(art);
-        putReq.onsuccess = () => counters.put({ id: 'pinnedBytes', value: pinnedBytes + size });
-        putReq.onerror = () => { tx.abort(); reject(new Error('Failed to pin artifact: ' + putReq.error)); };
+            // mark artifact pinned and update pinnedBytes in same tx
+            incrementVersion(art);
+            art.meta = art.meta || {};
+            Object.assign(art.meta, { pinned: true, pinType: type, pinOwner: owner });
 
-        tx.oncomplete = () => {
-          ensureBroadcast()?.postMessage({ event: 'artifact:pinned', key, owner, type });
-          resolve({ ok: true });
-        };
-        tx.onerror = () => reject(tx.error);
+            const putReq = artifacts.put(art);
+            putReq.onsuccess = () => counters.put({ id: 'pinnedBytes', value: pinnedBytes + size });
+            putReq.onerror = () => { tx.abort(); reject(new Error('Failed to pin artifact: ' + putReq.error)); };
+
+            tx.oncomplete = () => {
+              ensureBroadcast()?.postMessage({ event: 'artifact:pinned', key, owner, type });
+              resolve({ ok: true });
+            };
+            tx.onerror = () => reject(tx.error);
+          };
+
+          getPinReq2.onerror = () => {
+            // Fallback: if counters.get fails, still attempt to mark artifact pinned and update pinnedBytes
+            incrementVersion(art);
+            art.meta = art.meta || {};
+            Object.assign(art.meta, { pinned: true, pinType: type, pinOwner: owner });
+
+            const putReq = artifacts.put(art);
+            putReq.onsuccess = () => counters.put({ id: 'pinnedBytes', value: pinnedBytes + size });
+            putReq.onerror = () => { tx.abort(); reject(new Error('Failed to pin artifact (fallback): ' + putReq.error)); };
+
+            tx.oncomplete = () => {
+              ensureBroadcast()?.postMessage({ event: 'artifact:pinned', key, owner, type });
+              resolve({ ok: true });
+            };
+            tx.onerror = () => reject(tx.error);
+          };
+        } catch (err) {
+          tx.abort();
+          reject(err);
+        }
       };
 
       pbReq.onerror = () => { tx.abort(); reject(new Error('Failed to get pinnedBytes counter: ' + pbReq.error)); };
@@ -1329,6 +1435,7 @@ const pinArtifact = async (key, { owner = 'user', type = 'soft' } = {}) => {
     req.onerror = () => { tx.abort(); reject(new Error('Failed to get artifact for pinning: ' + req.error)); };
   });
 };
+
 
 const unpinArtifact = async (key) => {
   const db = await openDB();
@@ -1345,42 +1452,130 @@ const unpinArtifact = async (key) => {
 
       const size = art.meta?.sizeBytes || 0;
       const pbReq = counters.get('pinnedBytes');
+      const pinRefId = `pinref:${key}`;
 
       pbReq.onsuccess = () => {
         let pinnedBytes = pbReq.result?.value || 0;
         art.meta = art.meta || {};
 
-        if (!art.meta.pinned) {
-          incrementVersion(art);
-          delete art.meta.pinType;
-          delete art.meta.pinOwner;
-          const putReq = artifacts.put(art);
-          putReq.onerror = () => { tx.abort(); reject(new Error('Failed to update unpinned artifact: ' + putReq.error)); };
-          tx.oncomplete = () => {
-            ensureBroadcast()?.postMessage({ event: 'artifact:unpinned', key, reused: true });
-            resolve({ ok: true, reused: true });
+        // Read current pinref and decrement it (we will decide whether to remove 'pinned' based on resulting refcount)
+        try {
+          const getPinReq = counters.get(pinRefId);
+          getPinReq.onsuccess = () => {
+            const cur = getPinReq.result?.value || 0;
+            const next = Math.max(0, cur - 1);
+            counters.put({ id: pinRefId, value: next });
+
+            // Case A: artifact is not marked pinned — just clear pin metadata (if any) and keep pinnedBytes unchanged.
+            if (!art.meta.pinned) {
+              try {
+                incrementVersion(art);
+                delete art.meta.pinType;
+                delete art.meta.pinOwner;
+                const putReq = artifacts.put(art);
+                putReq.onerror = () => { tx.abort(); reject(new Error('Failed to update unpinned artifact: ' + putReq.error)); };
+                tx.oncomplete = () => {
+                  ensureBroadcast()?.postMessage({ event: 'artifact:unpinned', key, reused: true });
+                  resolve({ ok: true, reused: true });
+                };
+                tx.onerror = () => reject(tx.error);
+              } catch (err) {
+                tx.abort();
+                reject(err);
+              }
+              return;
+            }
+
+            // Case B: artifact was pinned. We should only decrement pinnedBytes when refcount reached zero.
+            if (art.meta.pinned) {
+              if (next === 0) {
+                // last unpin -> remove pinned flag and subtract pinnedBytes
+                try {
+                  incrementVersion(art);
+                  delete art.meta.pinned;
+                  delete art.meta.pinType;
+                  delete art.meta.pinOwner;
+
+                  const putReq = artifacts.put(art);
+                  putReq.onsuccess = () => {
+                    pinnedBytes = Math.max(0, pinnedBytes - size);
+                    counters.put({ id: 'pinnedBytes', value: pinnedBytes });
+                  };
+                  putReq.onerror = () => { tx.abort(); reject(new Error('Failed to unpin artifact: ' + putReq.error)); };
+
+                  tx.oncomplete = () => {
+                    ensureBroadcast()?.postMessage({ event: 'artifact:unpinned', key });
+                    resolve({ ok: true });
+                  };
+                  tx.onerror = () => reject(tx.error);
+                } catch (err) {
+                  tx.abort();
+                  reject(err);
+                }
+              } else {
+                // still other refs -> keep pinned flag, only update per-key refcount
+                try {
+                  incrementVersion(art);
+                  // keep art.meta.pinned true; optionally update pinOwner/pinType metadata if you want to reflect latest caller
+                  delete art.meta.pinOwner; // optional: clear single-owner field to avoid confusion
+                  delete art.meta.pinType;
+                  const putReq = artifacts.put(art);
+                  putReq.onerror = () => { tx.abort(); reject(new Error('Failed to update artifact after unpin (refcount>0): ' + putReq.error)); };
+                  tx.oncomplete = () => {
+                    ensureBroadcast()?.postMessage({ event: 'artifact:partial-unpin', key, remainingRefCount: next });
+                    resolve({ ok: true, remainingRefCount: next });
+                  };
+                  tx.onerror = () => reject(tx.error);
+                } catch (err) {
+                  tx.abort();
+                  reject(err);
+                }
+              }
+            }
           };
-          tx.onerror = () => reject(tx.error);
-          return;
+
+          getPinReq.onerror = () => {
+            // If we couldn't read pinref, fall back to previous behavior:
+            try {
+              if (!art.meta.pinned) {
+                incrementVersion(art);
+                delete art.meta.pinType;
+                delete art.meta.pinOwner;
+                const putReq = artifacts.put(art);
+                putReq.onerror = () => { tx.abort(); reject(new Error('Failed to update unpinned artifact (fallback): ' + putReq.error)); };
+                tx.oncomplete = () => {
+                  ensureBroadcast()?.postMessage({ event: 'artifact:unpinned', key, reused: true });
+                  resolve({ ok: true, reused: true });
+                };
+                tx.onerror = () => reject(tx.error);
+                return;
+              }
+
+              // If pinned and we can't read counters, attempt to unpin and decrement pinnedBytes conservatively
+              incrementVersion(art);
+              delete art.meta.pinned;
+              delete art.meta.pinType;
+              delete art.meta.pinOwner;
+              const putReq2 = artifacts.put(art);
+              putReq2.onsuccess = () => {
+                pinnedBytes = Math.max(0, pinnedBytes - size);
+                counters.put({ id: 'pinnedBytes', value: pinnedBytes });
+              };
+              putReq2.onerror = () => { tx.abort(); reject(new Error('Failed to unpin artifact (fallback): ' + putReq2.error)); };
+              tx.oncomplete = () => {
+                ensureBroadcast()?.postMessage({ event: 'artifact:unpinned', key, fallback: true });
+                resolve({ ok: true, fallback: true });
+              };
+              tx.onerror = () => reject(tx.error);
+            } catch (err) {
+              tx.abort();
+              reject(err);
+            }
+          };
+        } catch (err) {
+          tx.abort();
+          reject(err);
         }
-
-        incrementVersion(art);
-        delete art.meta.pinned;
-        delete art.meta.pinType;
-        delete art.meta.pinOwner;
-
-        const putReq = artifacts.put(art);
-        putReq.onsuccess = () => {
-          pinnedBytes = Math.max(0, pinnedBytes - size);
-          counters.put({ id: 'pinnedBytes', value: pinnedBytes });
-        };
-        putReq.onerror = () => { tx.abort(); reject(new Error('Failed to unpin artifact: ' + putReq.error)); };
-
-        tx.oncomplete = () => {
-          ensureBroadcast()?.postMessage({ event: 'artifact:unpinned', key });
-          resolve({ ok: true });
-        };
-        tx.onerror = () => reject(tx.error);
       };
 
       pbReq.onerror = () => { tx.abort(); reject(new Error('Failed to get pinnedBytes counter: ' + pbReq.error)); };
@@ -1412,8 +1607,328 @@ const getArtifact = async (key, { denormalize = false } = {}) => {
     }
   });
 };
+ 
+/**
+ * Get reconstruction status for metaKey
+ * @param {string} metaKey - Artifact key
+ * @returns {Promise<Object|null>} Status object or null if not found
+ */
+const getReconStatus = async (metaKey) => {
+  const db = await openDB();
+  return new Promise((resolve) => {
+    try {
+      const tx = db.transaction(['reconStatus'], 'readonly');
+      const store = tx.objectStore('reconStatus');
+      const req = store.get(metaKey);
+      
+      req.onsuccess = () => {
+        resolve(req.result || null);
+      };
+      
+      req.onerror = () => {
+        console.warn('getReconStatus: failed to get status', req.error);
+        resolve(null);
+      };
+    } catch (err) {
+      console.warn('getReconStatus error', err);
+      resolve(null);
+    }
+  });
+};
 
-  //  Read handles & clones
+/**
+ * Atomically mark reconstruction as running
+ * Handles race conditions and stale-job takeover
+ * @param {string} metaKey - Artifact key
+ * @param {string} reqId - Request ID (worker owner)
+ * @param {number} maxRuntimeMs - Max runtime before considering stale (default 10 min)
+ * @returns {Promise<{ok: boolean, rec?: Object, reason?: string, existing?: Object, runtime?: number}>}
+ */
+const markReconRunning = async (metaKey, reqId, maxRuntimeMs = 600000) => {
+  const db = await openDB();
+  
+  return new Promise((resolve, reject) => {
+    try {
+      const tx = db.transaction(['reconStatus'], 'readwrite');
+      const store = tx.objectStore('reconStatus');
+      const getReq = store.get(metaKey);
+      
+      getReq.onsuccess = () => {
+        const existing = getReq.result;
+        const now = Date.now();
+        
+        // Check if already running
+        if (existing && existing.state === 'running') {
+          const runtime = now - existing.startedAt;
+          
+          // Stale-job takeover: if running too long, allow takeover
+          if (runtime < maxRuntimeMs) {
+            // Still fresh, reject
+            resolve({ 
+              ok: false, 
+              reason: 'running', 
+              existing,
+              runtime 
+            });
+            return;
+          } else {
+            // Stale job, allow takeover
+            console.warn(`storage: taking over stale job ${metaKey} (runtime: ${runtime}ms)`);
+          }
+        }
+        
+        // Create or update record
+        const rec = {
+          metaKey,
+          state: 'running',
+          reqId,
+          attempts: (existing?.attempts || 0) + 1,
+          startedAt: now,
+          finishedAt: null,
+          lastError: null,
+          nextRetryAt: null,
+          derivedKeys: existing?.derivedKeys || []
+        };
+        
+        const putReq = store.put(rec);
+        
+        putReq.onsuccess = () => {
+          resolve({ ok: true, rec });
+        };
+        
+        putReq.onerror = () => {
+          reject(putReq.error || new Error('markReconRunning: put failed'));
+        };
+      };
+      
+      getReq.onerror = () => {
+        reject(getReq.error || new Error('markReconRunning: get failed'));
+      };
+    } catch (err) {
+      console.warn('markReconRunning error', err);
+      reject(err);
+    }
+  });
+};
+
+/**
+ * Atomically mark reconstruction as done
+ * @param {string} metaKey
+ * @param {string[]} derivedKeys - Array of derived artifact keys
+ * @returns {Promise<Object>} Updated status
+ */
+const markReconDone = async (metaKey, derivedKeys) => {
+  const db = await openDB();
+  
+  return new Promise((resolve, reject) => {
+    try {
+      const tx = db.transaction(['reconStatus'], 'readwrite');
+      const store = tx.objectStore('reconStatus');
+      
+      const getReq = store.get(metaKey);
+      
+      getReq.onsuccess = () => {
+        const existing = getReq.result;
+        
+        const status = {
+          ...(existing || {}),
+          metaKey,
+          state: 'done',
+          derivedKeys: derivedKeys || [],
+          finishedAt: Date.now(),
+          lastError: null,
+          nextRetryAt: null
+        };
+        
+        const putReq = store.put(status);
+        
+        putReq.onsuccess = () => {
+          resolve(status);
+        };
+        
+        putReq.onerror = () => {
+          reject(putReq.error || new Error('markReconDone: put failed'));
+        };
+      };
+      
+      getReq.onerror = () => {
+        reject(getReq.error || new Error('markReconDone: get failed'));
+      };
+    } catch (err) {
+      console.warn('markReconDone error', err);
+      reject(err);
+    }
+  });
+};
+
+/**
+ * Atomically mark reconstruction as failed with exponential backoff
+ * @param {string} metaKey
+ * @param {string} error - Error message
+ * @param {number} backoffMs - Backoff delay (default 5 min)
+ * @returns {Promise<Object>} Updated status
+ */
+const markReconFailed = async (metaKey, error, backoffMs = 300000) => {
+  const db = await openDB();
+  
+  return new Promise((resolve, reject) => {
+    try {
+      const tx = db.transaction(['reconStatus'], 'readwrite');
+      const store = tx.objectStore('reconStatus');
+      
+      const getReq = store.get(metaKey);
+      
+      getReq.onsuccess = () => {
+        const existing = getReq.result;
+        const now = Date.now();
+        
+        // Exponential backoff based on attempts
+        const attempts = (existing?.attempts || 0);
+        const adjustedBackoff = backoffMs * Math.pow(2, Math.min(attempts, 5));
+        
+        const status = {
+          ...(existing || {}),
+          metaKey,
+          state: 'failed',
+          lastError: String(error),
+          nextRetryAt: now + adjustedBackoff,
+          finishedAt: now
+        };
+        
+        const putReq = store.put(status);
+        
+        putReq.onsuccess = () => {
+          resolve(status);
+        };
+        
+        putReq.onerror = () => {
+          reject(putReq.error || new Error('markReconFailed: put failed'));
+        };
+      };
+      
+      getReq.onerror = () => {
+        reject(getReq.error || new Error('markReconFailed: get failed'));
+      };
+    } catch (err) {
+      console.warn('markReconFailed error', err);
+      reject(err);
+    }
+  });
+};
+
+/**
+ * Maintenance: Purge old reconstruction statuses
+ * @param {number} ageMs - Age threshold (default 7 days)
+ * @returns {Promise<number>} Number of deleted records
+ */
+const clearOldReconStatus = async (ageMs = 604800000) => {
+  const db = await openDB();
+  
+  return new Promise((resolve, reject) => {
+    try {
+      const tx = db.transaction(['reconStatus'], 'readwrite');
+      const store = tx.objectStore('reconStatus');
+      const index = store.index('startedAt');
+      
+      const cutoff = Date.now() - ageMs;
+      const range = IDBKeyRange.upperBound(cutoff);
+      
+      const cursorReq = index.openCursor(range);
+      let deleted = 0;
+      
+      cursorReq.onsuccess = (event) => {
+        const cursor = event.target.result;
+        
+        if (cursor) {
+          // Only delete if state is 'done' or 'failed'
+          if (cursor.value.state === 'done' || cursor.value.state === 'failed') {
+            cursor.delete();
+            deleted++;
+          }
+          cursor.continue();
+        } else {
+          // Cursor exhausted
+          console.log(`storage: cleared ${deleted} old reconStatus records`);
+          resolve(deleted);
+        }
+      };
+      
+      cursorReq.onerror = () => {
+        console.warn('clearOldReconStatus: cursor error', cursorReq.error);
+        resolve(0);
+      };
+    } catch (err) {
+      console.warn('clearOldReconStatus error', err);
+      resolve(0);
+    }
+  });
+};
+
+/**
+ * Reaper: Find stale 'running' entries and mark as failed
+ * Handles worker death without manual intervention
+ * @param {number} maxRuntimeMs - Max runtime before considering stale (default 10 min)
+ * @returns {Promise<number>} Number of reaped records
+ */
+const reapStaleRunning = async (maxRuntimeMs = 600000) => {
+  const db = await openDB();
+  
+  return new Promise((resolve, reject) => {
+    try {
+      const tx = db.transaction(['reconStatus'], 'readwrite');
+      const store = tx.objectStore('reconStatus');
+      const index = store.index('state');
+      
+      const range = IDBKeyRange.only('running');
+      const cursorReq = index.openCursor(range);
+      
+      let reaped = 0;
+      const now = Date.now();
+      
+      cursorReq.onsuccess = (event) => {
+        const cursor = event.target.result;
+        
+        if (cursor) {
+          const record = cursor.value;
+          const runtime = now - record.startedAt;
+          
+          if (runtime > maxRuntimeMs) {
+            // Mark as failed with stale indicator
+            const updated = {
+              ...record,
+              state: 'failed',
+              lastError: `Stale job (runtime: ${runtime}ms)`,
+              finishedAt: now,
+              nextRetryAt: now + 300000 // 5 min backoff
+            };
+            
+            cursor.update(updated);
+            reaped++;
+            console.warn(`storage: reaped stale job ${record.metaKey}`);
+          }
+          
+          cursor.continue();
+        } else {
+          // Cursor exhausted
+          if (reaped > 0) {
+            console.log(`storage: reaped ${reaped} stale running jobs`);
+          }
+          resolve(reaped);
+        }
+      };
+      
+      cursorReq.onerror = () => {
+        console.warn('reapStaleRunning: cursor error', cursorReq.error);
+        resolve(0);
+      };
+    } catch (err) {
+      console.warn('reapStaleRunning error', err);
+      resolve(0);
+    }
+  });
+};
+
+//  Read handles & clones
 
 const getReadHandle = async (key, { mode = 'ref', owner = 'unknown' } = {}) => {
   const art = await getArtifact(key);
@@ -1660,47 +2175,97 @@ const checkQuotaAndEvict = async () => {
     };
 
     function performEviction() {
-      if (!toEvict.length) return resolve({ ok: true, freed: 0 });
+    if (!toEvict.length) return resolve({ ok: true, freed: 0 });
 
-      const evictTx = db.transaction([STREAMS_STORE, ARTIFACTS_STORE, COUNTERS_STORE], 'readwrite');
-      const evictStreams = evictTx.objectStore(STREAMS_STORE);
-      const evictArtifacts = evictTx.objectStore(ARTIFACTS_STORE);
-      const evictCounters = evictTx.objectStore(COUNTERS_STORE);
+    const evictTx = db.transaction([STREAMS_STORE, ARTIFACTS_STORE, COUNTERS_STORE], 'readwrite');
+    const evictStreams = evictTx.objectStore(STREAMS_STORE);
+    const evictArtifacts = evictTx.objectStore(ARTIFACTS_STORE);
+    const evictCounters = evictTx.objectStore(COUNTERS_STORE);
 
-      let totalFreed = 0;
+    let totalFreedWrite = 0;
+    let processed = 0;
+    const nowLocal = Date.now();
 
-      for (const item of toEvict) {
-        if (item.artifactExists) {
-          try { evictArtifacts.delete(item.key); } catch (e) { console.warn('evict delete artifact failed', e); }
-          revokeArtifactURLs(item.key);
-        }
-        try { evictStreams.delete(item.seq); } catch (e) { console.warn('evict delete stream failed', e); }
-        totalFreed += item.size;
-        evictedCount++;
-      }
-
-      const totalReq = evictCounters.get('totalBytes');
-      totalReq.onsuccess = () => {
-        const cur = totalReq.result?.value || 0;
-        evictCounters.put({ id: 'totalBytes', value: Math.max(0, cur - totalFreed) });
-      };
-      totalReq.onerror = () => console.warn('Failed to update totalBytes during eviction');
-
-      evictTx.oncomplete = () => {
-        freed = totalFreed;
-        const bc = ensureBroadcast();
-        if (bc) {
-          for (const item of toEvict) {
-            if (item.artifactExists) bc.postMessage({ event: 'artifact:evicted', key: item.key, freedBytes: item.size });
+    // iterate items and do final checks inside write tx
+    for (const item of toEvict) {
+      const seq = item.seq;
+      if (item.artifactExists) {
+        // re-get artifact in this write transaction
+        const getA = evictArtifacts.get(item.key);
+        getA.onsuccess = () => {
+          const art = getA.result;
+          // If artifact missing, just remove stream entry
+          if (!art) {
+            try { evictStreams.delete(seq); } catch (e) { console.warn('evict: delete stream failed', e); }
+            processed++;
+            checkComplete();
+            return;
           }
-        }
-        resolve({ ok: true, freed, evictedCount });
-      };
 
-      evictTx.onerror = () => {
-        console.warn('Eviction transaction error:', evictTx.error);
-        resolve({ ok: false, freed: 0 });
-      };
+          const pinned = art.meta?.pinned;
+          const reservedUntil = art.meta?.reservedUntil || 0;
+          // small safety margin for reservations - 1000ms
+          if (pinned || reservedUntil > (nowLocal + 1000)) {
+            // skip eviction, but remove the stream entry if you want? We'll keep stream entry for now
+            processed++;
+            checkComplete();
+            return;
+          }
+
+          // perform deletion
+          try {
+            evictArtifacts.delete(item.key);
+            revokeArtifactURLs(item.key);
+          } catch (e) { console.warn('evict: delete artifact failed', e); }
+
+          try { evictStreams.delete(seq); } catch (e) { console.warn('evict: delete stream failed', e); }
+
+          // compute accurate freed bytes from art.meta.sizeBytes if available
+          const freedBytes = art.meta?.sizeBytes || item.size || 0;
+          totalFreedWrite += freedBytes;
+          processed++;
+          checkComplete();
+        };
+        getA.onerror = () => {
+          // on error, skip deletion for safety: remove stream entry to avoid loop?
+          try { evictStreams.delete(seq); } catch(e) { /* ignore */ }
+          processed++;
+          checkComplete();
+        };
+      } else {
+        // artifact didn't exist at scan; remove stream entry
+        try { evictStreams.delete(seq); } catch (e) { console.warn('evict: delete stream failed', e); }
+        processed++;
+        checkComplete();
+      }
+    }
+
+    function checkComplete() {
+      if (processed === toEvict.length) {
+        // update totalBytes counter
+        const totalReq = evictCounters.get('totalBytes');
+        totalReq.onsuccess = () => {
+          const cur = totalReq.result?.value || 0;
+          evictCounters.put({ id: 'totalBytes', value: Math.max(0, cur - totalFreedWrite) });
+        };
+        totalReq.onerror = () => console.warn('Failed to update totalBytes during eviction');
+
+        evictTx.oncomplete = () => {
+          const bc = ensureBroadcast();
+          if (bc) {
+            for (const item of toEvict) {
+              if (item.artifactExists) bc.postMessage({ event: 'artifact:evicted', key: item.key, freedBytes: item.size });
+            }
+          }
+          resolve({ ok: true, freed: totalFreedWrite, evictedCount: toEvict.length });
+        };
+
+        evictTx.onerror = () => {
+          console.warn('Eviction transaction error:', evictTx.error);
+          resolve({ ok: false, freed: 0 });
+        };
+      }
+    }
     }
   });
 };
@@ -1909,6 +2474,9 @@ const storageAPI = {
   startEvictorLoop,
   stopEvictorLoop,
   getCounter,
+  getPinRef,
+  pinRef,
+  unpinRef,
   quotaBytes: () => quotaBytes,
 
   // maintenance
@@ -1947,7 +2515,15 @@ const storageAPI = {
 
   // data normalization
   normalizeArtifactData,
-  denormalizeArtifactData
+  denormalizeArtifactData,
+
+  // reconStatus APIs (Phase 1)
+  getReconStatus,
+  markReconRunning,
+  markReconDone,
+  markReconFailed,
+  clearOldReconStatus,
+  reapStaleRunning
 };
 
 // CommonJS export (Node-like bundlers)

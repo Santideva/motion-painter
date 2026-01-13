@@ -24,6 +24,20 @@ const DEFAULTS = {
   enableSamplerPlugins: true,
   enableDevPanels: false,
 
+  // Pipeline phase control (NEW)
+  // enablePreprocessAnnotate: allow preprocessors to annotate manifests / metadata
+  // enablePreprocessQuantize: allow preprocessors to emit quantized/solver-ready artifacts (SOC/A,b)
+  // enableReconstructionSolve: allow heavy backend/solver runs (future worker)
+  enablePreprocessAnnotate: true,
+  enablePreprocessQuantize: true,
+  enableReconstructionSolve: false,
+
+  // Overhang behavior control (NEW: policy vs compute)
+  // 'off' -> skip overhang entirely
+  // 'annotate' -> detect + annotate only (lightweight)
+  // 'constraints' -> emit solver-ready constraints (A, b, SOCs)
+  overhangPolicyMode: 'annotate',
+
   // Flux / Poynting-proxy related
   enableFlux: false,
   fluxMode: 'coarse',
@@ -43,11 +57,47 @@ const DEFAULTS = {
   fluxPersistFullResOnDemand: true,
   fluxWorkerCount: 1,
 
+  // Triangle / depth / overhang related (new)
+  enableOverhang: true,
+  overhangCosineThresh: 0.7,
+  overhangWindingThresh: 0.25,
+  overhangMinGroupSize: 3,
+  depthKL: 1.0,
+  depthKD: 0.5,
+  depthBase: 0.1,
+  depthScale: 2.0,
+
+  // Selector / BSS tuning (new)
+  bssPersistSelector: false,
+  bssPullEta: 0.1,
+  bssPushEta: 0.05,
+  bssGamma: 1.02,
+  bssIters: 8,
+
+  // Heartbeat / recon / safety (new)
+  reconTakeoverMs: 600000,           // 10 minutes
+  reconBackoffOnFailMs: 300000,      // 5 minutes
+  heartbeatIntervalMs: 20000,        // 20s
+  maxWorkerMemoryBytes: 1 << 28,     // ~268MB safety cap
+  enableDepthFallbackOnWebGLFail: true,
+  reconTelemetryEnabled: true,
+
   // Topology tuning
   topologyPersistenceThreshold: 0.05,
   topologyLcsThresholdPct: 0.05,
   topologyUseFluxAsFiltration: false,
   topologyComputeOnDemand: true,
+
+  // HFH (Hybrid Fresnel Harvester) controls (NEW)
+  enableHFH: true,
+  // When an annular-derived score exceeds this (0..1) HFH can route heavy paths
+  hfhHeavyPathThreshold: 0.85,
+  // Per-camera HFH cooldown (ms)
+  hfhCooldownMs: 30000,
+  // If true, HFH will only annotate during eviction; otherwise eviction may escalate
+  hfhAnnotateOnlyDuringEviction: true,
+  // Who decides escalation: 'worker' (motion.worker) or 'eviction' (frame-eviction hook)
+  hfhDecisionAuthority: 'worker',
 
   // Safety / scaffolding
   featureFlagsVersion: FEATURE_FLAGS_VERSION
@@ -89,6 +139,15 @@ function _hasLocalStorage() {
   } catch (e) {
     return false;
   }
+}
+
+/**
+ * clamp(x, a, b)
+ * Small helper used for coercion/range-clamping in _coerceOrWarn.
+ */
+function clamp(x, a, b) {
+  if (typeof x !== 'number' || Number.isNaN(x)) return a;
+  return Math.max(a, Math.min(b, x));
 }
 
 /* ------------------------ Sequence management ------------------------ */
@@ -329,6 +388,94 @@ function _coerceOrWarn(key, value) {
       console.warn(`[featureFlags] type mismatch for ${key}: expected ${expectedType} got ${typeof value}`);
     }
   }
+
+  // Lightweight domain/range clamping and extra numeric coercions for newly introduced flags.
+  try {
+    // Timeouts / ms values: ensure minimum 1s
+    if (key === 'reconTakeoverMs' || key === 'reconBackoffOnFailMs' || key === 'heartbeatIntervalMs' || key === 'hfhCooldownMs') {
+      const n = Number(value);
+      if (Number.isFinite(n)) {
+        return Math.max(1000, Math.floor(n));
+      }
+      return DEFAULTS[key];
+    }
+
+    if (key === 'maxWorkerMemoryBytes') {
+      const n = Number(value);
+      if (Number.isFinite(n)) {
+        // minimum 1MB
+        return Math.max(1 << 20, Math.floor(n));
+      }
+      return DEFAULTS.maxWorkerMemoryBytes;
+    }
+
+    if (key === 'overhangCosineThresh') {
+      const n = Number(value);
+      if (Number.isFinite(n)) return clamp(n, 0.0, 1.0);
+      return DEFAULTS.overhangCosineThresh;
+    }
+
+    if (['depthKL', 'depthKD', 'depthBase', 'depthScale'].includes(key)) {
+      const n = Number(value);
+      if (Number.isFinite(n)) return n;
+      return DEFAULTS[key];
+    }
+
+    if (['bssPullEta','bssPushEta','bssGamma'].includes(key)) {
+      const n = Number(value);
+      if (Number.isFinite(n)) return n;
+      return DEFAULTS[key];
+    }
+
+    // boolean-ish values that might arrive as strings
+    if (typeof DEFAULTS[key] === 'boolean') {
+      if (value === 'true' || value === true) return true;
+      if (value === 'false' || value === false) return false;
+    }
+
+    // ----- New keys coercion/validation -----
+
+    // HFH heavy threshold (0..1)
+    if (key === 'hfhHeavyPathThreshold') {
+      const n = Number(value);
+      if (Number.isFinite(n)) return clamp(n, 0.0, 1.0);
+      return DEFAULTS.hfhHeavyPathThreshold;
+    }
+
+    // overhangPolicyMode: allowed values 'off' | 'annotate' | 'constraints'
+    if (key === 'overhangPolicyMode') {
+      if (typeof value === 'string') {
+        const v = value.toLowerCase();
+        if (v === 'off' || v === 'annotate' || v === 'constraints') return v;
+      }
+      // warn and fallback
+      console.warn(`[featureFlags] invalid overhangPolicyMode "${value}", falling back to "${DEFAULTS.overhangPolicyMode}"`);
+      return DEFAULTS.overhangPolicyMode;
+    }
+
+    // hfhDecisionAuthority: 'worker' | 'eviction'
+    if (key === 'hfhDecisionAuthority') {
+      if (typeof value === 'string') {
+        const v = value.toLowerCase();
+        if (v === 'worker' || v === 'eviction') return v;
+      }
+      console.warn(`[featureFlags] invalid hfhDecisionAuthority "${value}", falling back to "${DEFAULTS.hfhDecisionAuthority}"`);
+      return DEFAULTS.hfhDecisionAuthority;
+    }
+
+    // phase toggles - boolean coercion already above will handle strings; ensure default fallback
+    if (key === 'enablePreprocessAnnotate' || key === 'enablePreprocessQuantize' || key === 'enableReconstructionSolve' || key === 'enableHFH' || key === 'hfhAnnotateOnlyDuringEviction') {
+      if (value === 'true' || value === true) return true;
+      if (value === 'false' || value === false) return false;
+      // fallback to default if unknown
+      return DEFAULTS[key];
+    }
+
+  } catch (e) {
+    // fall back to original behavior
+    console.warn('[featureFlags] coercion helper threw', e);
+  }
+
   return value;
 }
 

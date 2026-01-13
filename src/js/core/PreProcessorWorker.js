@@ -1,5 +1,6 @@
 // src/js/core/PreprocessorWorker.js
-// Enhanced version with backpressure, improved queue management, and calibration support
+// Enhanced version with backpressure, improved queue management, calibration support,
+// and HFH / camera-container integration tracking.
 
 export class PreprocessorWorker {
   constructor(workerPath = null) {
@@ -36,6 +37,16 @@ export class PreprocessorWorker {
     this.calibRefCounts = new Map(); // metaKey -> outstanding in-flight frames count
     this.pendingFetches = new Map(); // jobId/metaKey -> {resolve,reject,timeout} for fetchPersistedCalibration
 
+    // HFH and Camera tracking
+    this._metaKeyToJobId = new Map(); // metaKey → jobId
+    this._jobIdToMetaKey = new Map(); // jobId → metaKey
+
+    // Track per-camera statistics
+    this._cameraStats = new Map(); // cameraId → { framesProcessed, lastProcessedAt, avgProcessingTime }
+
+    // Track HFH-triggered frames
+    this._hfhTriggeredFrames = new Set(); // jobIds that had shouldRun=true
+
     // --- Worker creation (robust, supports override via workerPath) ---
     try {
       // If caller supplied a workerPath, accept string or URL; otherwise fall back to default build path.
@@ -68,7 +79,8 @@ export class PreprocessorWorker {
 
       // Better logging: show the exact URL fetched
       console.log('PreprocessorWorker: Worker created successfully (module worker) -', workerUrl.href || workerUrl);
-      console.log (this.worker);
+      console.log(this.worker);
+
       // === Robust worker error handlers  ===
       this.worker.onerror = (ev) => {
         try {
@@ -211,39 +223,127 @@ export class PreprocessorWorker {
         clearTimeout(this.readyTimeout);
 
       } else if (data.event === 'artifact:ready') {
-        // Silenced recurring info: console.info('PreprocessorWorker: artifact ready', data.jobId, data.keys || data.key);
-        this._updateProcessingMetrics(data);
+        // Centralized handling for artifact readiness:
+        // - update processing metrics
+        // - establish bidirectional metaKey <-> jobId mapping
+        // - update per-camera stats
+        // - clear pending and calibration refcounts
+        try {
+          this._updateProcessingMetrics(data);
 
-        // If this pending job used a calibration metaKey, decrement reference count
-        const pendingEntry = this.pending.get(data.jobId);
-        if (pendingEntry) {
-          const usedMeta = pendingEntry.calibMetaKeyUsed;
-          if (usedMeta) {
-            const cur = this.calibRefCounts.get(usedMeta) || 0;
-            const next = Math.max(0, cur - 1);
-            if (next === 0) this.calibRefCounts.delete(usedMeta);
-            else this.calibRefCounts.set(usedMeta, next);
+          const pendingEntry = this.pending.get(data.jobId);
+          if (pendingEntry) {
+            // Capture metaKey (storage may return metaKey or key)
+            const metaKey = data.metaKey || data.key || (data.keys && data.keys[0]) || null;
+
+            if (metaKey) {
+              // create bidirectional mapping
+              try {
+                this._metaKeyToJobId.set(metaKey, data.jobId);
+                this._jobIdToMetaKey.set(data.jobId, metaKey);
+              } catch (e) {
+                // defensive: ignore mapping errors
+                console.warn('PreprocessorWorker: failed to set metaKey↔jobId mapping', e);
+              }
+            }
+
+            // If this pending job used a calibration metaKey, decrement reference count
+            const usedMeta = pendingEntry.calibMetaKeyUsed;
+            if (usedMeta) {
+              const cur = this.calibRefCounts.get(usedMeta) || 0;
+              const next = Math.max(0, cur - 1);
+              if (next === 0) this.calibRefCounts.delete(usedMeta);
+              else this.calibRefCounts.set(usedMeta, next);
+            }
+
+            // Update per-camera statistics if cameraId present
+            try {
+              const cameraId = pendingEntry.cameraId || (pendingEntry.meta && pendingEntry.meta.cameraId) || 'unknown';
+              const processingTime = Date.now() - pendingEntry.startTime;
+              this._updateCameraStats(cameraId, processingTime);
+            } catch (e) {
+              console.warn('PreprocessorWorker: failed updating camera stats on artifact:ready', e);
+            }
+
+            // If HFH was triggered for this job, log and remove it from pending-trigger set
+            if (pendingEntry.hfhTriggered) {
+              try {
+                console.log(`PreprocessorWorker: HFH-triggered job completed: jobId=${data.jobId}, metaKey=${data.metaKey || data.key}`);
+                this._hfhTriggeredFrames.delete(data.jobId);
+              } catch (e) {
+                console.warn('PreprocessorWorker: HFH cleanup failed on artifact:ready', e);
+              }
+            }
+
+            // Delete pending entry
+            this.pending.delete(data.jobId);
+          } else {
+            // No pending entry found — still attempt to map metaKey -> jobId for observability if metaKey present
+            const metaKey = data.metaKey || data.key || (data.keys && data.keys[0]) || null;
+            if (metaKey && data.jobId) {
+              try {
+                this._metaKeyToJobId.set(metaKey, data.jobId);
+                this._jobIdToMetaKey.set(data.jobId, metaKey);
+              } catch (e) {
+                // ignore
+              }
+            }
           }
-        }
 
-        this.pending.delete(data.jobId);
+        } catch (e) {
+          console.warn('PreprocessorWorker: error in artifact:ready handler', e);
+        }
 
       } else if (data.event === 'artifact:error') {
-        console.warn('PreprocessorWorker: artifact error', data.jobId, data.error);
+        // Artifact pipeline error for a job - log, decrement calib refcounts and clean HFH tracking
+        try {
+          console.warn('PreprocessorWorker: artifact error', data.jobId, data.error);
 
-        // If the failed job used calibration metaKey, decrement refcount to avoid leak
-        const pendingEntry = this.pending.get(data.jobId);
-        if (pendingEntry) {
-          const usedMeta = pendingEntry.calibMetaKeyUsed;
-          if (usedMeta) {
-            const cur = this.calibRefCounts.get(usedMeta) || 0;
-            const next = Math.max(0, cur - 1);
-            if (next === 0) this.calibRefCounts.delete(usedMeta);
-            else this.calibRefCounts.set(usedMeta, next);
+          const pendingEntry = this.pending.get(data.jobId);
+          if (pendingEntry) {
+            const usedMeta = pendingEntry.calibMetaKeyUsed;
+            if (usedMeta) {
+              const cur = this.calibRefCounts.get(usedMeta) || 0;
+              const next = Math.max(0, cur - 1);
+              if (next === 0) this.calibRefCounts.delete(usedMeta);
+              else this.calibRefCounts.set(usedMeta, next);
+            }
+
+            // HFH cleanup for failed job
+            if (pendingEntry.hfhTriggered) {
+              try {
+                this._hfhTriggeredFrames.delete(data.jobId);
+              } catch (e) { /* ignore */ }
+            }
+
+            // Remove jobId <-> metaKey mapping if present
+            try {
+              const existingMetaKey = this._jobIdToMetaKey.get(data.jobId);
+              if (existingMetaKey) {
+                this._jobIdToMetaKey.delete(data.jobId);
+                this._metaKeyToJobId.delete(existingMetaKey);
+              }
+            } catch (e) {
+              // ignore mapping cleanup errors
+            }
+
+            this.pending.delete(data.jobId);
+          } else {
+            // No pending: attempt to cleanup mapping if jobId known
+            try {
+              const existingMetaKey = this._jobIdToMetaKey.get(data.jobId);
+              if (existingMetaKey) {
+                this._jobIdToMetaKey.delete(data.jobId);
+                this._metaKeyToJobId.delete(existingMetaKey);
+              }
+            } catch (e) {
+              // ignore
+            }
           }
-        }
 
-        this.pending.delete(data.jobId);
+        } catch (e) {
+          console.warn('PreprocessorWorker: error handling artifact:error', e);
+        }
 
       // Calibration lifecycle messages from worker
       } else if (data.event === 'calibration:ready') {
@@ -504,12 +604,26 @@ export class PreprocessorWorker {
       this.calibRefCounts.set(calibMetaKey, cur + 1);
     }
 
+    // Extract camera identification
+    const cameraId = meta.cameraId || meta.cameraContainer?.cameraId || 'unknown';
+
+    // Check if this frame has HFH decision that triggers reconstruction
+    const hfhTriggered = !!(meta.hfhDecision && meta.hfhDecision.shouldRun);
+
+    if (hfhTriggered) {
+      this._hfhTriggeredFrames.add(jobId);
+      console.log(`PreprocessorWorker: Frame ${jobId} has HFH trigger (${meta.hfhDecision.reason})`);
+    }
+
     this.pending.set(jobId, {
       meta,
       ts: Date.now(),
       options,
       startTime: Date.now(),
-      calibMetaKeyUsed: calibMetaKey // attach for later decrement
+      calibMetaKeyUsed: calibMetaKey, // attach for later decrement
+      cameraId: cameraId, // Track camera
+      hfhTriggered: hfhTriggered, // Track HFH trigger
+      hfhDecision: meta.hfhDecision || null // Store decision for later use
     });
 
     try {
@@ -536,6 +650,8 @@ export class PreprocessorWorker {
         else this.calibRefCounts.set(calibMetaKey, next);
       }
       this.pending.delete(jobId);
+      // Clean up HFH tracking
+      this._hfhTriggeredFrames.delete(jobId);
       return { ok: false, reason: 'POST_FAILED', error: String(err) };
     }
   }
@@ -598,6 +714,9 @@ export class PreprocessorWorker {
         droppedCount: this.droppedCount || 0,
         backpressureActive: this.backpressureActive || false,
         calibrationSupported: true,
+        hfhSupported: !!this._metaKeyToJobId, // presence implies support
+        trackedCameras: this._cameraStats ? this._cameraStats.size : 0,
+        hfhTriggeredPending: this._hfhTriggeredFrames ? this._hfhTriggeredFrames.size : 0,
         ...this.metrics
       };
     }
@@ -611,6 +730,9 @@ export class PreprocessorWorker {
       droppedCount: this.droppedCount,
       backpressureActive: this.backpressureActive,
       calibrationSupported: true,
+      hfhSupported: !!this._metaKeyToJobId,
+      trackedCameras: this._cameraStats.size,
+      hfhTriggeredPending: this._hfhTriggeredFrames.size,
       ...this.metrics
     };
   }
@@ -1005,10 +1127,21 @@ export class PreprocessorWorker {
       } catch (e) {
         // ignore
       }
+      // Clear worker resources & maps
       this.worker = null;
       this.pending.clear();
       this.workerReady = false;
       this.backpressureActive = false;
+
+      // Clean up HFH/camera tracking structures
+      try {
+        if (this._metaKeyToJobId) this._metaKeyToJobId.clear();
+        if (this._jobIdToMetaKey) this._jobIdToMetaKey.clear();
+        if (this._cameraStats) this._cameraStats.clear();
+        if (this._hfhTriggeredFrames) this._hfhTriggeredFrames.clear();
+      } catch (e) {
+        // ignore cleanup errors
+      }
     }
   }
 
@@ -1022,4 +1155,72 @@ export class PreprocessorWorker {
       console.warn('PreprocessorWorker.releaseCalibrationToken failed', err);
     }
   }
+
+  // -------------------------
+  // HFH & Camera helper APIs
+  // -------------------------
+
+  /**
+   * _updateCameraStats(cameraId, processingTime)
+   * updates per-camera rolling average processing time and count
+   */
+  _updateCameraStats(cameraId, processingTime) {
+    if (!cameraId) cameraId = 'unknown';
+    const cur = this._cameraStats.get(cameraId) || { framesProcessed: 0, lastProcessedAt: null, avgProcessingTime: 0 };
+    const newCount = (cur.framesProcessed || 0) + 1;
+    const newAvg = ((cur.avgProcessingTime || 0) * (cur.framesProcessed || 0) + processingTime) / newCount;
+    this._cameraStats.set(cameraId, {
+      framesProcessed: newCount,
+      lastProcessedAt: Date.now(),
+      avgProcessingTime: newAvg
+    });
+  }
+
+  /**
+   * getCameraStats(cameraId)
+   */
+  getCameraStats(cameraId) {
+    return this._cameraStats.get(cameraId) || { framesProcessed: 0, lastProcessedAt: null, avgProcessingTime: 0 };
+  }
+
+  /**
+   * getAllCameraStats()
+   */
+  getAllCameraStats() {
+    const out = {};
+    for (const [k, v] of this._cameraStats.entries()) {
+      out[k] = { ...v };
+    }
+    return out;
+  }
+
+  /**
+   * getJobIdByMetaKey(metaKey)
+   */
+  getJobIdByMetaKey(metaKey) {
+    return this._metaKeyToJobId.get(metaKey) || null;
+  }
+
+  /**
+   * getMetaKeyByJobId(jobId)
+   */
+  getMetaKeyByJobId(jobId) {
+    return this._jobIdToMetaKey.get(jobId) || null;
+  }
+
+  /**
+   * isHFHTriggered(jobId)
+   */
+  isHFHTriggered(jobId) {
+    return this._hfhTriggeredFrames.has(jobId);
+  }
+
+  /**
+   * getHFHTriggeredCount()
+   */
+  getHFHTriggeredCount() {
+    return this._hfhTriggeredFrames.size;
+  }
 }
+
+export default PreprocessorWorker;

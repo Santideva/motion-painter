@@ -6,6 +6,7 @@ import '../styles/layout.css';
 // Import core modules
 import featureFlags from '../config/featureFlags.js';
 import { addFrameBufferDiagnostics, addWebGLRendererDiagnostics } from './core/diagnostics.js';
+import HybridFresnelHarvester from './core/HybridFresnelHarvester.js';
 import { WebGLRenderer } from './core/webGLRenderer.js';
 import { FrameBuffer } from './core/FrameBuffer.js';
 import { MotionDetector } from './core/MotionDetector.js';
@@ -43,7 +44,8 @@ class MotionPainter {
     
     // MotionWorker (wrapper instance) - created on demand when calibration is requested
     this.motionWorker = null;
-
+    this._heavyPathRequested = false;
+    this.cameraContainer = null;
     // BroadcastChannel used for cross-worker signaling (listen for release_request etc.)
     this._bc = null;
 
@@ -118,8 +120,22 @@ class MotionPainter {
           try { featureFlags.broadcastCurrentFlags(); } catch (err) { console.warn('featureFlags.broadcastCurrentFlags failed (fallback2)', err); }
         }
         
+
+        const hfh = new HybridFresnelHarvester({
+          mode: 'annular primary',
+          normalized: true
+        });
+
         // create and attach the eviction hook (FrameEvictionHook is defensive if frameBuffer is null)
-        this.evictionHook = new FrameEvictionHook(this.preprocessor);
+        this.evictionHook = new FrameEvictionHook(this.preprocessor, {
+          hfh,
+          enableHFH: true
+        });
+
+        // If camera container already known, bind immediately
+        if (this.cameraContainer && typeof this.evictionHook.setCameraContainer === 'function') {
+          this.evictionHook.setCameraContainer(this.cameraContainer);
+        }
         this.evictionHook.attach(this.frameBuffer);
         console.log('Eviction hook attached to FrameBuffer');
       } catch (err) {
@@ -201,8 +217,62 @@ class MotionPainter {
         this._flagUnsubs.push(unsubFluxConfig);
       } catch (e) { console.warn('subscribe flux config failed', e); }
       
-      const statusElement = document.getElementById('status');
+const statusElement = document.getElementById('status');
       this.mediaInput = new MediaInput(this.video, statusElement);
+
+      // Receive canonical camera container from MediaInput
+      this.mediaInput.onCameraContainer = (container) => {
+        // More lenient validation - accept CameraContainer instances or plain objects
+        if (!container) {
+          console.warn('[cameraContainer] main.js: null/undefined container received');
+          return;
+        }
+
+        // Extract cameraId from instance or plain object
+        const cameraId = container.cameraId || container.id || null;
+        
+        if (!cameraId) {
+          console.warn('[cameraContainer] main.js: container missing cameraId', {
+            container,
+            keys: Object.keys(container),
+            prototype: Object.getPrototypeOf(container)
+          });
+          return;
+        }
+
+        // Extract relevant fields from CameraContainer instance or plain object
+        const canonicalContainer = {
+          cameraId: cameraId,
+          kind: container.kind || 'unknown',
+          deviceId: container.deviceId || null,
+          status: container.status || 'unknown',
+          meta: container.meta || {},
+          hasStream: !!container.stream,
+          hasVideoElement: !!container.videoElement,
+          createdAt: container.createdAt || Date.now()
+        };
+
+        // Freeze to prevent mutations
+        this.cameraContainer = Object.freeze(canonicalContainer);
+        
+        console.log('[cameraContainer] main.js: canonical camera container set', {
+          cameraId: this.cameraContainer.cameraId,
+          kind: this.cameraContainer.kind,
+          status: this.cameraContainer.status
+        });
+
+        // Propagate to eviction hook immediately if available
+        if (this.evictionHook) {
+          if (typeof this.evictionHook.setCameraContainer === 'function') {
+            console.log('[cameraContainer] main.js: propagating to evictionHook');
+            this.evictionHook.setCameraContainer(this.cameraContainer);
+          } else {
+            console.warn('[cameraContainer] main.js: evictionHook exists but has no setCameraContainer method');
+          }
+        } else {
+          console.log('[cameraContainer] main.js: evictionHook not yet initialized (will propagate on init)');
+        }
+      };
       
       // Set up event handlers
       this.setupEventHandlers();
@@ -920,75 +990,295 @@ displayHardwareLimitations() {
     }
   }
 
-  /**
-   * Ensure MotionWorker exists and is minimally initialized so it can listen/ query storage.
-   * We create a MotionWorkerWrapper which manages the worker lifecycle and communications.
-   * This is non-blocking: we create the wrapper and attach basic handlers so it can listen on BC.
-   */
-  _ensureMotionWorker() {
-    if (this.motionWorker) return;
-
-    try {
-      // Instantiate the wrapper which will create the underlying worker.
-      // Use absolute path that maps to project layout so the wrapper can resolve URL reliably.
-      this.motionWorker = new MotionWorkerWrapper('/src/js/core/motion.worker.js', { readyTimeoutMs: 8000 });
-
-      // Minimal ready hook so we can log; wrapper will broadcast flags when it becomes ready.
-      try {
-        this.motionWorker.onReady(() => {
-          try {
-            console.log('MotionPainter: MotionWorkerWrapper is ready');
-            // optionally request metrics to warm the worker
-            try {
-              this.motionWorker.requestMetrics().then(m => {
-                if (m) console.debug('MotionWorker metrics:', m);
-              }).catch(() => {});
-            } catch (e) {}
-          } catch (e) {
-            console.warn('MotionPainter: motionWorker onReady handler error', e);
-          }
-        });
-      } catch (e) {
-        // ignore if onReady isn't present (defensive)
-      }
-
-      // Note: we intentionally do not send any calibration/artifacts from main.
-      // MotionWorker will use the BroadcastChannel or storage API to obtain persisted artifacts.
-
-      console.log('MotionPainter: MotionWorkerWrapper created (non-blocking)');
-    } catch (err) {
-      console.error('MotionPainter: Failed to create MotionWorkerWrapper', err);
-      try { if (this.motionWorker && typeof this.motionWorker.terminate === 'function') this.motionWorker.terminate(); } catch (_) {}
-      this.motionWorker = null;
-    }
+/**
+ * IMPORTANT ARCHITECTURAL RULE:
+ * main.js must NEVER decide whether HFH "heavy" or "light" path is taken.
+ *
+ * main.js responsibilities here are LIMITED to:
+ *  - ensuring MotionWorker infrastructure exists
+ *  - relaying context (camera container, flags, storage keys)
+ *
+ * The decision to escalate to heavy reconstruction belongs to:
+ *  - MotionDetector (runtime judgment)
+ *  - motion.worker (post-hoc reconstruction choice)
+ */
+/**
+ * IMPORTANT ARCHITECTURAL RULE:
+ * main.js must NEVER decide whether HFH "heavy" or "light" path is taken.
+ *
+ * main.js responsibilities here are LIMITED to:
+ *  - ensuring MotionWorker infrastructure exists
+ *  - relaying context (camera container, flags, storage keys)
+ *
+ * The decision to escalate to heavy reconstruction belongs to:
+ *  - MotionDetector (runtime judgment)
+ *  - motion.worker (post-hoc reconstruction choice)
+ */
+_ensureMotionWorker() {
+  if (this.motionWorker) {
+    console.log('MotionPainter: MotionWorker already exists, skipping creation');
+    return;
   }
 
-  /**
-   * Teardown MotionWorker if present (called during destroy)
-   */
-  _teardownMotionWorker() {
-    try {
-      if (this.motionWorker) {
-        // prefer wrapper terminate if available
+  try {
+    // Guard: MotionWorker may ONLY be created after explicit escalation
+    if (!this._heavyPathRequested) {
+      console.warn(
+        'MotionPainter: MotionWorker creation attempted without heavy-path escalation; ignoring.'
+      );
+      return;
+    }
+
+    console.log('MotionPainter: Creating MotionWorkerWrapper...');
+
+    // Instantiate the wrapper which will create the underlying worker.
+    // Use absolute path that maps to project layout so the wrapper can resolve URL reliably.
+    this.motionWorker = new MotionWorkerWrapper('/src/js/core/motion.worker.js', { 
+      readyTimeoutMs: 8000,
+      defaultJobTimeoutMs: 120000,
+      debug: true  // Enable debug logging for development
+    });
+
+    // ===================================================================
+    // CRITICAL: Connect MotionWorkerWrapper to MotionDetector
+    // ===================================================================
+    if (this.motionDetector && typeof this.motionDetector.setDispatcher === 'function') {
+      this.motionDetector.setDispatcher(this.motionWorker);
+      console.log('✅ MotionPainter: MotionDetector.setDispatcher() called successfully');
+      console.log('✅ MotionPainter: MotionDetector → MotionWorker pipeline established');
+    } else {
+      console.error('❌ MotionPainter: MotionDetector not available or missing setDispatcher method!');
+      console.error('   This will cause reconstruction requests to fail silently.');
+      // Don't throw - let app continue but log the critical issue
+    }
+
+    // ===================================================================
+    // Worker Death Callback (Recovery)
+    // ===================================================================
+    this.motionWorker.onWorkerDeath = (error) => {
+      console.error('🔴 MotionPainter: MotionWorker died unexpectedly!', error);
+      
+      // Notify MotionDetector to recover in-flight intents
+      if (this.motionDetector && typeof this.motionDetector.recoverFromWorkerDeath === 'function') {
         try {
-          if (typeof this.motionWorker.terminate === 'function') {
-            // terminate may be async — call but do not await in destroy path
-            try { this.motionWorker.terminate(); } catch (e) {}
+          console.warn('MotionPainter: Initiating MotionDetector recovery...');
+          this.motionDetector.recoverFromWorkerDeath();
+          console.log('✅ MotionPainter: MotionDetector recovery completed');
+        } catch (recoveryErr) {
+          console.error('❌ MotionPainter: MotionDetector recovery failed', recoveryErr);
+        }
+      } else {
+        console.warn('⚠️ MotionPainter: MotionDetector.recoverFromWorkerDeath() not available');
+      }
+      
+      // Clear worker reference so it can be recreated on next escalation
+      this.motionWorker = null;
+      
+      // Update UI status
+      if (this.controls) {
+        this.controls.updateStatus('Motion worker crashed - will restart on next reconstruction');
+      }
+      
+      // Optionally: attempt automatic restart after a delay
+      setTimeout(() => {
+        if (this._heavyPathRequested && !this.motionWorker) {
+          console.log('MotionPainter: Attempting automatic MotionWorker restart...');
+          try {
+            this._ensureMotionWorker();
+          } catch (restartErr) {
+            console.error('MotionPainter: Automatic restart failed', restartErr);
+          }
+        }
+      }, 5000); // Wait 5 seconds before restart attempt
+    };
+
+    // ===================================================================
+    // Ready Callback (Non-blocking)
+    // ===================================================================
+    try {
+      this.motionWorker.onReady(() => {
+        try {
+          console.log('✅ MotionPainter: MotionWorkerWrapper is ready');
+          
+          // Verify dispatcher connection is still intact
+          if (this.motionDetector && this.motionDetector._dispatcher === this.motionWorker) {
+            console.log('✅ MotionPainter: Dispatcher connection verified');
           } else {
-            // fallback for older raw worker usage (unlikely)
-            try { if (this.motionWorker.postMessage) this.motionWorker.postMessage({ op: 'shutdown' }); } catch (e) {}
-            try { if (this.motionWorker.terminate) this.motionWorker.terminate(); } catch (e) {}
+            console.warn('⚠️ MotionPainter: Dispatcher connection verification failed!');
+          }
+          
+          // Request initial metrics to warm the worker
+          try {
+            this.motionWorker.requestMetrics().then(metrics => {
+              if (metrics) {
+                console.debug('MotionWorker initial metrics:', metrics);
+                console.log(`   - Worker ready: ${metrics.workerReady}`);
+                console.log(`   - Pending jobs: ${metrics.pendingJobs || 0}`);
+              }
+            }).catch(metricsErr => {
+              console.warn('MotionPainter: Failed to fetch initial metrics', metricsErr);
+            });
+          } catch (e) {
+            // Metrics request is optional, ignore errors
+          }
+          
+          // Update UI status
+          if (this.controls) {
+            this.controls.updateStatus('Motion worker ready');
           }
         } catch (e) {
-          console.warn('MotionPainter: error terminating motionWorker', e);
+          console.warn('MotionPainter: motionWorker onReady handler error', e);
         }
-        this.motionWorker = null;
-      }
-    } catch (err) {
-      console.warn('MotionPainter: error tearing down MotionWorker', err);
-      this.motionWorker = null;
+      });
+    } catch (e) {
+      // onReady might not be present in all wrapper versions - defensive coding
+      console.warn('MotionPainter: motionWorker.onReady() not available', e);
     }
+
+    console.log('✅ MotionPainter: MotionWorkerWrapper created (non-blocking initialization)');
+    
+    // ===================================================================
+    // Verification Log Summary
+    // ===================================================================
+    console.group('🔍 MotionWorker Setup Verification');
+    console.log('Wrapper instance:', this.motionWorker ? '✅ Created' : '❌ Failed');
+    console.log('Dispatcher connected:', this.motionDetector?._dispatcher === this.motionWorker ? '✅ Yes' : '❌ No');
+    console.log('Death callback:', this.motionWorker?.onWorkerDeath ? '✅ Registered' : '❌ Missing');
+    console.log('Ready callback:', 'Registered (will execute asynchronously)');
+    console.log('Heavy path requested:', this._heavyPathRequested ? '✅ Yes' : '❌ No');
+    console.groupEnd();
+    
+  } catch (err) {
+    console.error('❌ MotionPainter: Failed to create MotionWorkerWrapper', err);
+    console.error('Stack trace:', err.stack);
+    
+    // Cleanup on failure
+    try { 
+      if (this.motionWorker && typeof this.motionWorker.terminate === 'function') {
+        this.motionWorker.terminate();
+      }
+    } catch (terminateErr) {
+      console.warn('MotionPainter: Failed to terminate worker during cleanup', terminateErr);
+    }
+    
+    this.motionWorker = null;
+    
+    // Update UI status
+    if (this.controls) {
+      this.controls.updateStatus('Failed to initialize motion worker: ' + err.message);
+    }
+    
+    // Re-throw so caller knows creation failed
+    throw err;
   }
+}
+
+/**
+ * Teardown MotionWorker if present (called during destroy)
+ */
+_teardownMotionWorker() {
+  if (!this.motionWorker) {
+    return;
+  }
+
+  console.log('MotionPainter: Tearing down MotionWorker...');
+  
+  try {
+    // Clear dispatcher connection in MotionDetector
+    if (this.motionDetector && typeof this.motionDetector.setDispatcher === 'function') {
+      try {
+        this.motionDetector.setDispatcher(null);
+        console.log('MotionPainter: Cleared MotionDetector dispatcher');
+      } catch (err) {
+        console.warn('MotionPainter: Failed to clear dispatcher', err);
+      }
+    }
+    
+    // Terminate worker (prefer wrapper method if available)
+    if (typeof this.motionWorker.terminate === 'function') {
+      // Wrapper has async terminate - don't await in destroy path
+      try { 
+        this.motionWorker.terminate(); 
+        console.log('MotionPainter: MotionWorker termination initiated');
+      } catch (e) {
+        console.warn('MotionPainter: Worker termination failed', e);
+      }
+    } else {
+      // Fallback for older raw worker usage (unlikely)
+      try { 
+        if (this.motionWorker.postMessage) {
+          this.motionWorker.postMessage({ op: 'shutdown' }); 
+        }
+      } catch (e) {
+        console.warn('MotionPainter: Failed to send shutdown message', e);
+      }
+      try { 
+        if (this.motionWorker.terminate) {
+          this.motionWorker.terminate(); 
+        }
+      } catch (e) {
+        console.warn('MotionPainter: Failed to terminate worker', e);
+      }
+    }
+    
+    this.motionWorker = null;
+    console.log('✅ MotionPainter: MotionWorker teardown complete');
+    
+  } catch (err) {
+    console.error('❌ MotionPainter: Error during MotionWorker teardown', err);
+    // Force null even on error
+    this.motionWorker = null;
+  }
+}
+
+/**
+ * Manual dispatcher verification (for debugging)
+ * Call this from console: window.MotionPainter.verifyDispatcherConnection()
+ */
+verifyDispatcherConnection() {
+  console.group('🔍 Dispatcher Connection Verification');
+  
+  try {
+    const detectorExists = !!this.motionDetector;
+    const workerExists = !!this.motionWorker;
+    const dispatcherSet = this.motionDetector?._dispatcher === this.motionWorker;
+    
+    console.log('MotionDetector exists:', detectorExists ? '✅' : '❌');
+    console.log('MotionWorker exists:', workerExists ? '✅' : '❌');
+    console.log('Dispatcher connected:', dispatcherSet ? '✅' : '❌');
+    
+    if (detectorExists && workerExists && !dispatcherSet) {
+      console.error('🔴 CRITICAL: MotionWorker exists but dispatcher not connected!');
+      console.log('   Fix: Call this.motionDetector.setDispatcher(this.motionWorker)');
+    }
+    
+    if (this.motionDetector) {
+      console.log('MotionDetector stats:', this.motionDetector.getRecentStats());
+    }
+    
+    if (this.motionWorker) {
+      this.motionWorker.getMetrics().then(metrics => {
+        console.log('MotionWorker metrics:', metrics);
+      }).catch(err => {
+        console.warn('Failed to get worker metrics:', err);
+      });
+    }
+    
+    console.log('Heavy path requested:', this._heavyPathRequested ? '✅' : '❌');
+    
+  } catch (err) {
+    console.error('Verification failed:', err);
+  }
+  
+  console.groupEnd();
+  
+  return {
+    detectorExists: !!this.motionDetector,
+    workerExists: !!this.motionWorker,
+    dispatcherConnected: this.motionDetector?._dispatcher === this.motionWorker,
+    heavyPathRequested: this._heavyPathRequested
+  };
+}
 
   /**
    * Register MotionDetector event handlers and calibration orchestration.
@@ -1127,6 +1417,9 @@ displayHardwareLimitations() {
 
     console.log('Calibration requested by MotionDetector:', { count, resolution, reason });
     this.controls && this.controls.updateStatus('Calibration requested...');
+
+    // Escalation intent: MotionDetector has requested deeper analysis
+    this._heavyPathRequested = true;
 
     // Ensure MotionWorker exists so it will receive BC messages or can query storage
     try {

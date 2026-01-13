@@ -86,25 +86,36 @@ export class FrameBuffer {
     return texture;
   }
 
-  setBufferSize(newSize) {
-    const clampedSize = Math.max(CONFIG.MIN_BUFFER_SIZE, Math.min(CONFIG.MAX_BUFFER_SIZE, newSize));
+    setBufferSize(newSize) {
+      const clampedSize = Math.max(CONFIG.MIN_BUFFER_SIZE, Math.min(CONFIG.MAX_BUFFER_SIZE, newSize));
 
-    if (clampedSize === this.bufferSize) return;
+      if (clampedSize === this.bufferSize) return;
 
-    if (clampedSize !== newSize) {
-      console.warn(`Requested buffer size ${newSize} clamped to ${clampedSize} due to application limits.`);
+      if (clampedSize !== newSize) {
+        console.warn(`Requested buffer size ${newSize} clamped to ${clampedSize} due to application limits.`);
+      }
+
+      const wasInitialized = this.width > 0 && this.height > 0;
+      const oldSize = this.bufferSize;
+      
+      this.bufferSize = clampedSize;
+      this.spiralIndices = null;
+      this.readTextures = null;
+
+      // ✅ FIX: Reset writeIndex if it would be out of bounds
+      if (this.writeIndex >= this.bufferSize) {
+        console.warn(`[FB] setBufferSize: writeIndex (${this.writeIndex}) >= new bufferSize (${this.bufferSize}), resetting to 0`);
+        this.writeIndex = 0;
+        // Also reset frameCount since we're disrupting the buffer state
+        this.frameCount = 0;
+      }
+
+      console.log(`[FB] setBufferSize: ${oldSize} → ${clampedSize}, writeIndex=${this.writeIndex}, frameCount=${this.frameCount}`);
+
+      if (wasInitialized) {
+        this.resize(this.width, this.height);
+      }
     }
-
-    const wasInitialized = this.width > 0 && this.height > 0;
-    this.bufferSize = clampedSize;
-    this.spiralIndices = null;
-    this.readTextures = null;
-
-    if (wasInitialized) {
-      // Recreate array texture with new layer count
-      this.resize(this.width, this.height);
-    }
-  }
 
   setSpiralRetention(enabled) {
     this.useSpiralRetention = enabled;

@@ -838,17 +838,62 @@ async function createThumbnailBlob(imageBitmap, maxSide = DEFAULT_THUMB_MAX_SIDE
   }
 }
 
-// Main task: process incoming frame
+/**
+ * processFrame({ jobId, meta = {}, imageBitmap, options = {} })
+ * - Performs thumbnail + phash creation, preserves HFH metadata and cameraContainer,
+ * - Persists artifacts via self.putInboundArtifact and uses returned canonical metaKey(s),
+ * - Emits worker postMessage artifact:ready with canonical metaKey,
+ * - Keeps calibration refcount semantics (usedCalibKey + inFlightCalibMap).
+ */
 async function processFrame({ jobId, meta = {}, imageBitmap, options = {} }) {
   const startTime = Date.now();
   let usedCalibKey = null;
-  
+
+  // Helpers / constants local to function
+  const MAX_ANNULAR_LEN = 512; // safety cap (tuneable)
+  const ensureTypedFloat32 = (arr, maxLen = MAX_ANNULAR_LEN) => {
+    if (!arr) return null;
+    // Accept already-typed arrays
+    if (ArrayBuffer.isView(arr) && !(arr instanceof DataView)) {
+      if (arr instanceof Float32Array) {
+        return (arr.length > maxLen) ? arr.slice(0, maxLen) : arr;
+      }
+      // Convert other typed arrays to Float32Array
+      const sliced = (arr.length > maxLen) ? arr.slice(0, maxLen) : arr;
+      return new Float32Array(sliced.buffer, sliced.byteOffset, Math.floor(sliced.byteLength / 4));
+    }
+    // If plain Array -> convert and cap
+    if (Array.isArray(arr)) {
+      const a = arr.length > maxLen ? arr.slice(0, maxLen) : arr;
+      return new Float32Array(a);
+    }
+    // Unknown shape -> null
+    return null;
+  };
+
+  const ensureTypedInt32 = (arr, maxLen = MAX_ANNULAR_LEN) => {
+    if (!arr) return null;
+    if (ArrayBuffer.isView(arr) && !(arr instanceof DataView)) {
+      if (arr instanceof Int32Array) {
+        return (arr.length > maxLen) ? arr.slice(0, maxLen) : arr;
+      }
+      const sliced = (arr.length > maxLen) ? arr.slice(0, maxLen) : arr;
+      return new Int32Array(sliced.buffer, sliced.byteOffset, Math.floor(sliced.byteLength / 4));
+    }
+    if (Array.isArray(arr)) {
+      const a = arr.length > maxLen ? arr.slice(0, maxLen) : arr;
+      return new Int32Array(a);
+    }
+    return null;
+  };
+
   try {
     if (!imageBitmap) {
       throw new Error('No imageBitmap provided');
     }
 
-    if (options.applyCalibration && CALIB.metaKey) {
+    // Calibration refcount handling (if applyCalibration requested and CALIB.metaKey present)
+    if (options.applyCalibration && CALIB && CALIB.metaKey) {
       usedCalibKey = CALIB.metaKey;
       CALIB.metaRefCount = (CALIB.metaRefCount || 0) + 1;
       inFlightCalibMap.set(jobId, usedCalibKey);
@@ -857,8 +902,9 @@ async function processFrame({ jobId, meta = {}, imageBitmap, options = {} }) {
 
     postMessage({ event: 'progress', jobId, stage: 'processing_start', timestamp: startTime });
 
+    // Apply calibration inside worker if requested
     let processedBitmap = imageBitmap;
-    if (options.applyCalibration && CALIB.isCalibrated) {
+    if (options.applyCalibration && CALIB && CALIB.isCalibrated) {
       postMessage({ event: 'progress', jobId, stage: 'applying_calibration' });
       processedBitmap = await CALIB.applyCalibrationToBitmap(imageBitmap, {
         outW: imageBitmap.width,
@@ -871,7 +917,6 @@ async function processFrame({ jobId, meta = {}, imageBitmap, options = {} }) {
 
     const mode = options.mode || meta.mode || 'preview';
     const thumbMax = mode === 'final' ? 512 : DEFAULT_THUMB_MAX_SIDE;
-
     const downsampleScale = options.downsampleScale || 1.0;
     const effectiveThumbMax = Math.floor(thumbMax * downsampleScale);
 
@@ -883,59 +928,120 @@ async function processFrame({ jobId, meta = {}, imageBitmap, options = {} }) {
     const phash = await computeAHashFromBitmap(thumbBitmap, 8);
     try { thumbBitmap.close(); } catch (e) {}
 
+    // Compose a stable source id/hash
     const srcHash = meta.srcHash || `src-${Date.now()}-${Math.random().toString(36).slice(2,8)}`;
     const frameNumber = meta.frameNumber || null;
     const timestamp = meta.timestamp || Date.now();
     const producerVersion = 'preproc-v1';
     const hashVersion = 'ahash-v1';
-    
-    const thumbKey = `thumb:${srcHash}:${w}x${h}`;
-    const phashKey = `phash:${srcHash}`;
-    const manifestKey = `manifest:${srcHash}`;
 
+    // Build initial artifact objects (keys left undefined to let storage generate canonical metaKey)
     const thumbArtifact = {
-      key: thumbKey,
+      // key: omitted -> let storage generate canonical key
       type: 'thumbnail',
       blob: thumbBlob,
-      meta: { 
-        srcHash, 
-        frameNumber, 
-        timestamp, 
-        sizeBytes: thumbBlob.size, 
-        origin: 'preprocessor', 
+      meta: {
+        srcHash,
+        frameNumber,
+        timestamp,
+        sizeBytes: thumbBlob.size,
+        origin: 'preprocessor',
         producerVersion,
         dimensions: { width: w, height: h },
         downsampleScale: downsampleScale !== 1.0 ? downsampleScale : undefined,
-        calibrationApplied: options.applyCalibration && CALIB.isCalibrated,
-        calibrationKey: CALIB.metaKey || undefined
+        calibrationApplied: options.applyCalibration && CALIB && CALIB.isCalibrated,
+        calibrationKey: CALIB && CALIB.metaKey ? CALIB.metaKey : undefined,
+        cameraId: (meta.cameraContainer && meta.cameraContainer.cameraId) || meta.cameraId || 'unknown'
       },
       createdAt: new Date().toISOString()
     };
 
     const phashArtifact = {
-      key: phashKey,
       type: 'phash',
       data: { phash, hashVersion, algorithm: 'aHash' },
-      meta: { 
-        srcHash, 
-        frameNumber, 
-        timestamp, 
+      meta: {
+        srcHash,
+        frameNumber,
+        timestamp,
         producerVersion,
         hashVersion,
         sizeBytes: JSON.stringify({ phash, hashVersion, algorithm: 'aHash' }).length,
-        calibrationKey: CALIB.metaKey || undefined
+        calibrationKey: CALIB && CALIB.metaKey ? CALIB.metaKey : undefined,
+        cameraId: (meta.cameraContainer && meta.cameraContainer.cameraId) || meta.cameraId || 'unknown'
       },
       createdAt: new Date().toISOString()
     };
 
+    // Extract HFH info from incoming meta, convert arrays to typed arrays (compact)
+    const hfhData = {};
+    if (meta.annular) {
+      const ann = ensureTypedFloat32(meta.annular, 512);
+      if (ann && ann.length > 0) hfhData.annular = ann;
+    }
+    if (meta.annularCounts) {
+      const ac = ensureTypedInt32(meta.annularCounts, 512);
+      if (ac && ac.length > 0) hfhData.annularCounts = ac;
+    }
+    if (meta.annularStats) {
+      // Copy stats as-is (small object)
+      hfhData.annularStats = {
+        mean: Number(meta.annularStats.mean) || 0,
+        stddev: Number(meta.annularStats.stddev) || 0,
+        min: Number(meta.annularStats.min) || 0,
+        max: Number(meta.annularStats.max) || 0,
+        samples: Number(meta.annularStats.samples) || (hfhData.annular ? hfhData.annular.length : 0)
+      };
+    }
+
+    let hfhDecision = null;
+    if (meta.hfhDecision) {
+      // Normalize fields
+      hfhDecision = {
+        shouldRun: !!meta.hfhDecision.shouldRun,
+        reason: meta.hfhDecision.reason || 'unknown',
+        severity: Number(meta.hfhDecision.severity) || 0,
+        suggestedResolution: Number(meta.hfhDecision.suggestedResolution) || 256,
+        suggestedMode: meta.hfhDecision.suggestedMode || 'light',
+        diagnostics: meta.hfhDecision.diagnostics ? {
+          spike: !!meta.hfhDecision.diagnostics.spike,
+          spikeBin: meta.hfhDecision.diagnostics.spikeBin,
+          spikeThreshold: meta.hfhDecision.diagnostics.spikeThreshold,
+          cv: meta.hfhDecision.diagnostics.cv,
+          vignettingRatio: meta.hfhDecision.diagnostics.vignettingRatio,
+          exposureChange: !!meta.hfhDecision.diagnostics.exposureChange,
+          reasons: Array.isArray(meta.hfhDecision.diagnostics.reasons) ? meta.hfhDecision.diagnostics.reasons : []
+        } : {}
+      };
+    }
+
+    // Camera container (preserve full structure)
+    let cameraContainer = null;
+    if (meta.cameraContainer) {
+      cameraContainer = {
+        cameraId: meta.cameraContainer.cameraId || 'unknown',
+        deviceId: meta.cameraContainer.deviceId,
+        label: meta.cameraContainer.label,
+        facing: meta.cameraContainer.facing,
+        width: meta.cameraContainer.width,
+        height: meta.cameraContainer.height,
+        ...meta.cameraContainer
+      };
+    } else if (meta.cameraId) {
+      cameraContainer = { cameraId: meta.cameraId };
+    }
+
+    // Build manifest (initial, keys will be updated with canonical keys returned by storage)
     const manifestArtifact = {
-      key: manifestKey,
       type: 'manifest',
-      data: { 
-        keys: [thumbKey, phashKey], 
-        frameNumber, 
-        timestamp, 
-        meta,
+      data: {
+        keys: [], // will be filled with canonical keys returned by storage
+        frameNumber,
+        timestamp,
+        cameraContainer: cameraContainer || undefined,
+        cameraId: cameraContainer?.cameraId || meta.cameraId || 'unknown',
+        hfh: Object.keys(hfhData).length > 0 ? hfhData : null,
+        hfhDecision: hfhDecision,
+        meta: meta, // preserve original meta for compatibility
         versions: {
           thumbnail: producerVersion,
           phash: hashVersion,
@@ -944,69 +1050,101 @@ async function processFrame({ jobId, meta = {}, imageBitmap, options = {} }) {
         },
         processingMode: mode,
         downsampleScale: downsampleScale !== 1.0 ? downsampleScale : undefined,
-        calibrationApplied: options.applyCalibration && CALIB.isCalibrated,
-        calibrationKey: CALIB.metaKey || undefined
+        calibrationApplied: options.applyCalibration && CALIB && CALIB.isCalibrated,
+        calibrationKey: CALIB && CALIB.metaKey ? CALIB.metaKey : undefined
       },
-      meta: { 
-        srcHash, 
-        frameNumber, 
-        timestamp, 
+      meta: {
+        srcHash,
+        frameNumber,
+        timestamp,
         producerVersion,
-        sizeBytes: JSON.stringify({
-          keys: [thumbKey, phashKey],
-          frameNumber,
-          timestamp,
-          meta
-        }).length
+        cameraId: cameraContainer?.cameraId || meta.cameraId || 'unknown',
+        sizeBytes: 0
       },
       createdAt: new Date().toISOString()
     };
 
-    postMessage({ event: 'progress', jobId, stage: 'writing_storage' });
-    
+    // Persist thumbnail -> capture canonical key
+    postMessage({ event: 'progress', jobId, stage: 'writing_thumb' });
     if (typeof self.putInboundArtifact !== 'function') {
-      throw new Error('putInboundArtifact function not available');
+      throw new Error('putInboundArtifact not available in worker context');
     }
-    
-    await self.putInboundArtifact(thumbArtifact);
-    await self.putInboundArtifact(phashArtifact);
-    await self.putInboundArtifact(manifestArtifact);
+
+    const thumbRes = await self.putInboundArtifact(thumbArtifact).catch(e => { throw new Error('thumb persist failed: ' + (e && e.message ? e.message : String(e))); });
+    const thumbKeyStored = thumbRes?.metaKey || thumbArtifact.key || null;
+
+    // Persist phash -> capture canonical key
+    postMessage({ event: 'progress', jobId, stage: 'writing_phash' });
+    const phashRes = await self.putInboundArtifact(phashArtifact).catch(e => { throw new Error('phash persist failed: ' + (e && e.message ? e.message : String(e))); });
+    const phashKeyStored = phashRes?.metaKey || phashArtifact.key || null;
+
+    // Update manifest keys with canonical keys reported by storage
+    manifestArtifact.data.keys = [thumbKeyStored, phashKeyStored].filter(Boolean);
+
+    // Update manifest meta size estimate before writing (best-effort)
+    try {
+      manifestArtifact.meta.sizeBytes = JSON.stringify(manifestArtifact.data).length;
+    } catch (e) {
+      manifestArtifact.meta.sizeBytes = 0;
+    }
+
+    // Persist manifest and capture canonical metaKey (this is the authoritative metaKey consumers should use)
+    postMessage({ event: 'progress', jobId, stage: 'writing_manifest' });
+    const manifestRes = await self.putInboundArtifact(manifestArtifact).catch(e => { throw new Error('manifest persist failed: ' + (e && e.message ? e.message : String(e))); });
+    const canonicalMetaKey = manifestRes?.metaKey || manifestArtifact.key || null;
 
     const durationMs = Date.now() - startTime;
 
-    const readyData = { 
-      event: 'artifact:ready', 
-      jobId, 
-      keys: [thumbKey, phashKey, manifestKey], 
-      meta: { srcHash, frameNumber, timestamp, producerVersion, hashVersion },
+    // Broadcast artifact:ready using canonicalMetaKey
+    const readyData = {
+      event: 'artifact:ready',
+      jobId,
+      keys: manifestArtifact.data.keys.slice(0),
+      metaKey: canonicalMetaKey,
+      meta: {
+        srcHash,
+        frameNumber,
+        timestamp,
+        producerVersion,
+        hashVersion,
+        cameraId: cameraContainer?.cameraId || meta.cameraId || 'unknown',
+        // crucial: forward HFH decision to listeners (motion.worker, MotionDetector)
+        hfhDecision: hfhDecision,
+        type: 'frame-manifest'
+      },
       durationMs,
       processingMode: mode,
       downsampleScale: downsampleScale !== 1.0 ? downsampleScale : undefined,
-      calibrationApplied: options.applyCalibration && CALIB.isCalibrated
+      calibrationApplied: options.applyCalibration && CALIB && CALIB.isCalibrated
     };
-    
+
+    // Post to main thread
     postMessage(readyData);
-    if (bc) {
+
+    // Broadcast on BroadcastChannel for cross-worker listeners (MotionDetector / motion.worker)
+    if (typeof bc !== 'undefined' && bc) {
       try {
+        // Use the canonicalMetaKey from storage as the single source of truth
         bc.postMessage(readyData);
       } catch (bcErr) {
         console.warn('preprocessor.worker: broadcast artifact:ready failed', bcErr);
       }
     }
 
+    // Clean up processed bitmap
     try { processedBitmap.close(); } catch (e) {}
-    
+
   } catch (err) {
     console.error('preprocessor.worker: processing failed', err);
-    const errorData = { 
-      event: 'artifact:error', 
-      jobId, 
-      error: String(err), 
-      stack: err.stack,
+    const errorData = {
+      event: 'artifact:error',
+      jobId,
+      error: String(err),
+      stack: err && err.stack ? err.stack : null,
       phase: 'processing'
     };
     postMessage(errorData);
-    if (bc) {
+    if (typeof bc !== 'undefined' && bc) {
       try {
         bc.postMessage(errorData);
       } catch (bcErr) {
@@ -1015,11 +1153,13 @@ async function processFrame({ jobId, meta = {}, imageBitmap, options = {} }) {
     }
     try { imageBitmap.close(); } catch (e) {}
   } finally {
+    // Calibration refcount decrement (if we incremented at the top)
     try {
       if (usedCalibKey) {
         inFlightCalibMap.delete(jobId);
         CALIB.metaRefCount = Math.max(0, (CALIB.metaRefCount || 0) - 1);
         console.log(`CALIB: Decremented metaRefCount for key ${usedCalibKey} -> ${CALIB.metaRefCount}`);
+
         if (CALIB.metaRefCount === 0 && CALIB.pendingUnpinKey) {
           const toUnpin = CALIB.pendingUnpinKey;
           CALIB.pendingUnpinKey = null;
@@ -1027,9 +1167,14 @@ async function processFrame({ jobId, meta = {}, imageBitmap, options = {} }) {
             if (typeof self.unpinArtifact === 'function') {
               await self.unpinArtifact(toUnpin);
               console.log(`CALIB: Unpinned pending key ${toUnpin} after refcount reached zero`);
-              if (bc) {
+              if (typeof bc !== 'undefined' && bc) {
                 try {
-                  bc.postMessage({ event: 'calibration:unpin', metaKey: toUnpin, producer: 'preprocessor', timestamp: Date.now() });
+                  bc.postMessage({
+                    event: 'calibration:unpin',
+                    metaKey: toUnpin,
+                    producer: 'preprocessor',
+                    timestamp: Date.now()
+                  });
                 } catch (bcErr) {
                   console.warn('preprocessor.worker: broadcast calibration:unpin failed', bcErr);
                 }
@@ -1046,7 +1191,7 @@ async function processFrame({ jobId, meta = {}, imageBitmap, options = {} }) {
       console.warn('CALIB: error in finalization refcount handling', finalErr);
     }
   }
-}
+} 
 
 // Handle reprocess requests (for future SDF/pose generation)
 async function handleReprocess({ jobId, key, actions = [], priority = 0 }) {
