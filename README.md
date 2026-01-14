@@ -1,3 +1,5 @@
+(subject to change during development)
+
 motion-painter/
 ├── src/
 │ ├── js/
