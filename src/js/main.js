@@ -144,8 +144,68 @@ class MotionPainter {
         this.preprocessor = null;
         this.evictionHook = null;
       }
+
+      // ========================================================================
+      // STORAGE INITIALIZATION & REAPER
+      // ========================================================================
+      try {
+        await storageAPI.initStorage({ 
+          quota: 500 * 1024 * 1024,  // 500MB
+          startEvictor: true 
+        });
+        
+        // Start periodic reaper for stale reconstruction jobs
+        this._reaperInterval = setInterval(async () => {
+          try {
+            const reaped = await storageAPI.reapStaleRunning(10 * 60 * 1000); // 10 min timeout
+            
+            if (reaped > 0) {
+              console.log(`Reaper: cleaned up ${reaped} stale reconstruction job(s)`);
+              
+              if (this.controls) {
+                this.controls.updateStatus(`Cleaned up ${reaped} stale job(s)`);
+              }
+            }
+          } catch (reaperErr) {
+            console.warn('Reaper execution failed:', reaperErr);
+          }
+        }, 60000); // Every 60 seconds
+        
+        console.log('Storage initialized with periodic reaper (60s interval)');
+      } catch (storageErr) {
+        console.error('Storage initialization failed:', storageErr);
+        // Non-fatal - continue without reaper
+      }
       
       this.motionDetector = new MotionDetector();
+      
+      // ============================================================================
+      // ✅ NEW: Bind storage API to MotionDetector
+      // ============================================================================
+      /**
+       * CRITICAL: MotionDetector requires storage API for artifact persistence
+       * 
+       * Artifacts persisted by MotionDetector:
+       * - annular_analysis (ALWAYS - 30fps)
+       * - calibration_decision (ALWAYS - every calibration trigger)
+       * - reconstruction_intent (ALWAYS - every reconstruction intent)
+       * - motion_analysis (DEBUG - controlled by persistDebugArtifacts flag)
+       * - motion_detector_metrics (DEBUG - every 10s)
+       * 
+       * Without storage binding, MotionDetector will silently skip persistence.
+       */
+      try {
+        if (typeof storageAPI !== 'undefined' && storageAPI) {
+          this.motionDetector.setStorageAPI(storageAPI);
+          console.log('✅ main.js: Storage API bound to MotionDetector');
+        } else {
+          console.warn('⚠️ main.js: storageAPI not available for MotionDetector - artifact persistence disabled');
+        }
+      } catch (storageBindErr) {
+        console.error('❌ main.js: Failed to bind storage to MotionDetector', storageBindErr);
+        // Non-fatal - MotionDetector can operate without persistence
+      }
+      
       this.compositeRenderer = new CompositeRenderer(
         this.webglRenderer, 
         this.frameBuffer, 
@@ -216,8 +276,124 @@ class MotionPainter {
         });
         this._flagUnsubs.push(unsubFluxConfig);
       } catch (e) { console.warn('subscribe flux config failed', e); }
+
+      // ============================================================================
+      // ✅ NEW: Subscribe to persistDebugArtifacts feature flag
+      // ============================================================================
+      /**
+       * CRITICAL: This flag controls high-frequency debug artifact persistence
+       * 
+       * Impact when enabled:
+       * - motion_analysis: ~240KB/s at 30fps (HIGH FREQUENCY)
+       * - motion_detector_metrics: ~15KB per 10s (LOW FREQUENCY)
+       * 
+       * Subscribers:
+       * - MotionDetector._persistDebugArtifacts (updated synchronously)
+       * - Metrics timer (started/stopped based on flag state)
+       * 
+       * Performance recommendation:
+       * - Enable ONLY for short debugging sessions (<5 minutes)
+       * - Always disable in production environments
+       */
+      try {
+        // Apply initial flag value
+        const initialDebugFlag = featureFlags.getFlag('persistDebugArtifacts');
+        if (this.motionDetector) {
+          this.motionDetector._persistDebugArtifacts = !!initialDebugFlag;
+          console.log(`main.js: Initial MotionDetector.persistDebugArtifacts = ${this.motionDetector._persistDebugArtifacts}`);
+        }
+        
+        // Subscribe to flag changes
+          const unsubDebugArtifacts = featureFlags.subscribeKey('persistDebugArtifacts', ({ key, value }) => {
+          const newValue = !!value;
+          
+          if (this.motionDetector) {
+            const oldValue = this.motionDetector._persistDebugArtifacts;
+            
+            // Only update if value actually changed
+            if (oldValue !== newValue) {
+              this.motionDetector._persistDebugArtifacts = newValue;
+              console.log(`main.js: MotionDetector.persistDebugArtifacts changed: ${oldValue} → ${newValue}`);
+              
+              // ============================================================================
+              // ✅ NEW: Control metrics timer based on flag state
+              // ============================================================================
+              if (newValue) {
+                // Flag enabled - start metrics timer
+                if (this._startMetricsTimer) {
+                  try {
+                    this._startMetricsTimer();
+                  } catch (err) {
+                    console.warn('main.js: Failed to start metrics timer', err);
+                  }
+                }
+              } else {
+                // Flag disabled - stop metrics timer
+                if (this._stopMetricsTimer) {
+                  try {
+                    this._stopMetricsTimer();
+                  } catch (err) {
+                    console.warn('main.js: Failed to stop metrics timer', err);
+                  }
+                }
+              }
+              
+              // Update UI status
+              if (this.controls) {
+                const status = newValue 
+                  ? '⚠️ Debug artifact persistence ENABLED (high storage usage - metrics every 10s)'
+                  : '✅ Debug artifact persistence disabled (metrics timer stopped)';
+                this.controls.updateStatus(status);
+              }
+              
+              // If disabling, optionally trigger cleanup
+              if (!newValue && oldValue) {
+                console.log('main.js: Debug artifacts disabled - consider clearing old debug artifacts from storage');
+                
+                // Optional: Provide storage cleanup helper
+                if (typeof storageAPI !== 'undefined' && storageAPI) {
+                  console.log('main.js: To clean up debug artifacts, run in console:');
+                  console.log('  await storageAPI.deleteArtifactsByType("motion_analysis")');
+                  console.log('  await storageAPI.deleteArtifactsByType("motion_detector_metrics")');
+                }
+              }
+            }
+          }
+        });
+        
+        this._flagUnsubs.push(unsubDebugArtifacts);
+        
+      } catch (e) {
+        console.warn('main.js: persistDebugArtifacts subscription failed', e);
+      }
+
+      // ============================================================================
+      // ✅ NEW: Subscribe to persistIntermediates flag (informational only)
+      // ============================================================================
+      /**
+       * NOTE: This flag is handled by motion.worker directly via BC
+       * Main.js subscription is for UI/logging purposes only
+       */
+      try {
+        const unsubIntermediates = featureFlags.subscribeKey('persistIntermediates', ({ key, value }) => {
+          const enabled = !!value;
+          console.log(`main.js: persistIntermediates flag changed: ${enabled}`);
+          
+          if (this.controls) {
+            const status = enabled
+              ? 'Motion worker: intermediate artifacts enabled (~5MB per reconstruction)'
+              : 'Motion worker: intermediate artifacts disabled';
+            this.controls.updateStatus(status);
+          }
+        });
+        
+        this._flagUnsubs.push(unsubIntermediates);
+        
+      } catch (e) {
+        console.warn('main.js: persistIntermediates subscription failed', e);
+      }
       
-const statusElement = document.getElementById('status');
+      const statusElement = document.getElementById('status');
       this.mediaInput = new MediaInput(this.video, statusElement);
 
       // Receive canonical camera container from MediaInput
@@ -310,6 +486,66 @@ const statusElement = document.getElementById('status');
 
       // Set up MotionDetector -> Main calibration orchestration (main only orchestrates; it won't store artifacts)
       this.setupCalibrationOrchestration();
+
+      // ============================================================================
+      // ✅ NEW: Periodic MotionDetector metrics persistence (debug mode only)
+      // ============================================================================
+      /**
+       * Timer that persists MotionDetector metrics every 10 seconds when debug flag enabled
+       * 
+       * Lifecycle:
+       * - Started if persistDebugArtifacts is initially true
+       * - Stopped/started dynamically when flag changes (handled by subscription above)
+       * - Stopped on page unload (see beforeunload handler below)
+       * 
+       * Storage impact: ~15KB every 10s = ~90KB/min = ~5.4MB/hour
+       */
+      this._metricsTimer = null;
+      
+      const startMetricsTimer = () => {
+        if (this._metricsTimer) {
+          return; // Already running
+        }
+        
+        this._metricsTimer = setInterval(() => {
+          // Double-check flag is still enabled (defensive)
+          if (this.motionDetector && this.motionDetector._persistDebugArtifacts) {
+            this.motionDetector.persistMetrics().catch(err => {
+              console.warn('main.js: Metrics persistence failed (non-fatal)', err);
+            });
+          } else {
+            // Flag was disabled - stop timer
+            if (this._metricsTimer) {
+              clearInterval(this._metricsTimer);
+              this._metricsTimer = null;
+              console.log('main.js: Metrics timer stopped (debug flag disabled)');
+            }
+          }
+        }, 10000); // Every 10 seconds
+        
+        console.log('main.js: Metrics timer started (10s interval)');
+      };
+      
+      const stopMetricsTimer = () => {
+        if (this._metricsTimer) {
+          clearInterval(this._metricsTimer);
+          this._metricsTimer = null;
+          console.log('main.js: Metrics timer stopped');
+        }
+      };
+      
+      // Start immediately if debug flag is enabled
+      try {
+        if (featureFlags.getFlag('persistDebugArtifacts')) {
+          startMetricsTimer();
+        }
+      } catch (e) {
+        console.warn('main.js: Failed to check initial persistDebugArtifacts flag', e);
+      }
+      
+      // Store references for later use (cleanup + dynamic start/stop)
+      this._startMetricsTimer = startMetricsTimer;
+      this._stopMetricsTimer = stopMetricsTimer;
 
       // Update UI with initial buffer info and hardware limitations
       this.updateBufferSizeDisplay();
@@ -1512,8 +1748,7 @@ verifyDispatcherConnection() {
   }
 
   // ------------------ end MotionDetector calibration orchestration ------------------
-
-  destroy() {
+   destroy() {
     this.stopRendering();
 
     if (Array.isArray(this._flagUnsubs)) {
@@ -1524,6 +1759,38 @@ verifyDispatcherConnection() {
       } catch (e) { console.warn('Failed to cleanup flag subscriptions', e); }
       this._flagUnsubs = [];
     }
+
+    // ============================================================================
+    // ✅ NEW: Stop metrics timer on destroy
+    // ============================================================================
+    /**
+     * CRITICAL: Must stop metrics timer to prevent memory leaks
+     * 
+     * If not stopped, timer continues to:
+     * - Call persistMetrics() every 10s
+     * - Hold references to MotionDetector
+     * - Prevent garbage collection
+     * 
+     * This is especially important for SPA contexts where app may be
+     * destroyed/recreated without full page reload.
+     */
+    try {
+      if (this._stopMetricsTimer) {
+        this._stopMetricsTimer();
+        console.log('✅ main.js: Metrics timer stopped on destroy');
+      } else if (this._metricsTimer) {
+        // Fallback: direct clear if helper not available
+        clearInterval(this._metricsTimer);
+        this._metricsTimer = null;
+        console.log('✅ main.js: Metrics timer cleared on destroy (fallback)');
+      }
+    } catch (e) {
+      console.warn('⚠️ main.js: Failed to stop metrics timer on destroy', e);
+    }
+    
+    // Clear helper references
+    this._startMetricsTimer = null;
+    this._stopMetricsTimer = null;
 
     // Clean up MotionDetector listeners we registered
     try {
@@ -1536,6 +1803,20 @@ verifyDispatcherConnection() {
     } catch (e) {
       console.warn('Failed to cleanup motionDetector listeners', e);
     }
+
+    // ========================================================================
+    // CLEANUP REAPER INTERVAL
+    // ========================================================================
+    if (this._reaperInterval) {
+      try {
+        clearInterval(this._reaperInterval);
+        this._reaperInterval = null;
+        console.log('Reaper interval stopped');
+      } catch (e) {
+        console.warn('Failed to stop reaper interval:', e);
+      }
+    }
+    // ========================================================================
     
     // Detach eviction hook and terminate preprocessor worker (if present)
     if (this.evictionHook && typeof this.evictionHook.detach === 'function') {
@@ -1596,12 +1877,34 @@ verifyDispatcherConnection() {
     await app.init();
   }
   
-  // Clean up on page unload
+  // ============================================================================
+  // ✅ ENHANCED: Clean up on page unload
+  // ============================================================================
   window.addEventListener('beforeunload', () => {
-    app.destroy();
+    try {
+      // Stop metrics timer first (prevents final persist attempt during teardown)
+      if (app._stopMetricsTimer) {
+        try {
+          app._stopMetricsTimer();
+          console.log('beforeunload: Metrics timer stopped');
+        } catch (e) {
+          console.warn('beforeunload: Failed to stop metrics timer', e);
+        }
+      }
+      
+      // Full app teardown
+      app.destroy();
+      
+      console.log('beforeunload: Application cleanup complete');
+      
+    } catch (err) {
+      console.error('beforeunload: Cleanup error', err);
+      // Force destroy even on error
+      try { app.destroy(); } catch (e) {}
+    }
   });
   
-  // Export for debugging
+// Export for debugging
   window.MotionPainter = app;
   
   // Debug helpers
@@ -1609,4 +1912,117 @@ verifyDispatcherConnection() {
   window.exportFrame = () => app.exportCurrentFrame();
   window.validateConfig = () => app.validateConfiguration();
   window.resetToOptimal = () => app.resetToOptimalSettings();
+  
+  // ============================================================================
+  // ✅ NEW: Storage cleanup helpers for debug artifacts
+  // ============================================================================
+  /**
+   * Clean up debug artifacts from storage (call from browser console)
+   * 
+   * Usage:
+   *   await window.cleanupDebugArtifacts()           // All debug types
+   *   await window.cleanupDebugArtifacts('motion_analysis')  // Specific type
+   */
+  window.cleanupDebugArtifacts = async (artifactType = null) => {
+    try {
+      if (typeof storageAPI === 'undefined') {
+        console.error('storageAPI not available');
+        return { error: 'storageAPI not available' };
+      }
+      
+      const debugTypes = artifactType 
+        ? [artifactType]
+        : ['motion_analysis', 'motion_detector_metrics'];
+      
+      const results = {};
+      let totalDeleted = 0;
+      
+      for (const type of debugTypes) {
+        console.log(`Cleaning up artifacts of type: ${type}...`);
+        
+        // Query all artifacts of this type
+        const artifacts = await storageAPI.queryArtifacts({ type });
+        
+        if (!artifacts || artifacts.length === 0) {
+          console.log(`  No ${type} artifacts found`);
+          results[type] = 0;
+          continue;
+        }
+        
+        console.log(`  Found ${artifacts.length} ${type} artifacts`);
+        
+        // Delete each artifact
+        let deleted = 0;
+        for (const artifact of artifacts) {
+          try {
+            await storageAPI.deleteArtifact(artifact.metaKey);
+            deleted++;
+          } catch (err) {
+            console.warn(`  Failed to delete ${artifact.metaKey}:`, err);
+          }
+        }
+        
+        console.log(`  Deleted ${deleted}/${artifacts.length} ${type} artifacts`);
+        results[type] = deleted;
+        totalDeleted += deleted;
+      }
+      
+      console.log(`Total cleanup: ${totalDeleted} debug artifacts deleted`);
+      
+      return {
+        success: true,
+        totalDeleted,
+        byType: results
+      };
+      
+    } catch (err) {
+      console.error('Cleanup failed:', err);
+      return {
+        error: err.message,
+        stack: err.stack
+      };
+    }
+  };
+  
+  /**
+   * Get storage usage breakdown by artifact type
+   * 
+   * Usage:
+   *   await window.getStorageUsage()
+   */
+  window.getStorageUsage = async () => {
+    try {
+      if (typeof storageAPI === 'undefined') {
+        console.error('storageAPI not available');
+        return { error: 'storageAPI not available' };
+      }
+      
+      const stats = await storageAPI.getStorageStats();
+      
+      console.log('Storage Usage:');
+      console.log('  Total:', (stats.totalBytes / (1024 * 1024)).toFixed(2), 'MB');
+      console.log('  Artifacts:', stats.artifactCount);
+      console.log('  Pinned:', (stats.pinnedBytes / (1024 * 1024)).toFixed(2), 'MB');
+      
+      if (stats.byType) {
+        console.log('  By Type:');
+        Object.entries(stats.byType).forEach(([type, bytes]) => {
+          console.log(`    ${type}: ${(bytes / (1024 * 1024)).toFixed(2)} MB`);
+        });
+      }
+      
+      return stats;
+      
+    } catch (err) {
+      console.error('Failed to get storage usage:', err);
+      return {
+        error: err.message,
+        stack: err.stack
+      };
+    }
+  };
+  
+  console.log('💡 Debug helpers available:');
+  console.log('  - await window.cleanupDebugArtifacts()  // Clean all debug artifacts');
+  console.log('  - await window.getStorageUsage()        // Show storage breakdown');
 })();

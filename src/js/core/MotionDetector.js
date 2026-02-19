@@ -181,6 +181,46 @@ export class MotionDetector {
       this._annularConfig.minSpikeNormalized = Math.max(0, Math.min(1, this._annularConfig.minSpikeNormalized));
     }
 
+    // ============================================================================
+    // ✅ NEW: STORAGE API BINDING & PERSISTENCE FLAGS
+    // ============================================================================
+    /**
+     * Storage API binding (injected by main.js after initialization)
+     * 
+     * REQUIRED METHODS:
+     * - putInboundArtifact(artifact): Promise<{ok, metaKey}>
+     * - pinArtifact(metaKey, {owner, type, ttlMs}): Promise<void>
+     * - unpinArtifact(metaKey, {owner}): Promise<void>
+     * 
+     * LIFECYCLE:
+     * 1. main.js creates MotionDetector
+     * 2. main.js binds storage via setStorageAPI(storageAPI)
+     * 3. MotionDetector persists artifacts via this._storageAPI
+     */
+    this._storageAPI = null;
+    
+    /**
+     * Feature flags for conditional persistence
+     * 
+     * persistDebugArtifacts: Controls debug-only artifacts
+     * - motion_analysis (ImageData fallback)
+     * - camera_policy_snapshot (fairness debugging)
+     * - scheduler_state (queue debugging)
+     * - motion_history_snapshot (trend analysis)
+     * - motion_detector_metrics (performance)
+     * 
+     * Updated via main.js feature flag subscription
+     */
+    this._persistDebugArtifacts = false;
+    
+    /**
+     * Persistence tracking
+     * 
+     * Track what we've persisted to avoid duplicate storage calls
+     * Map structure: artifactType → Set<cameraId or intentId>
+     */
+    this._persistedArtifacts = new Map();
+
     // ===== EVENT LISTENERS (EXISTING) =====
     this._ee = new Map();
     this._domListeners = new Map();
@@ -243,6 +283,11 @@ export class MotionDetector {
     // Periodic decay timer
     this._decayTimer = setInterval(() => this._tickDecay(), 10000); // Every 10 seconds
 
+    // ============================================================================
+    // ✅ NEW: Track initialization time for uptime metrics
+    // ============================================================================
+    this._startTime = Date.now();
+
     console.log('MotionDetector: initialized with calibrationMode=' + this.calibrationMode);
   }
 
@@ -286,6 +331,35 @@ export class MotionDetector {
     if (!s) return;
     s.delete(handler);
     if (s.size === 0) this._domListeners.delete(event);
+  }
+
+  // ============================================================================
+  // ✅ NEW: STORAGE API BINDING
+  // ============================================================================
+  /**
+   * Set storage API (called by main.js after initialization)
+   * 
+   * CRITICAL: Must be called before any handleAnnularEvent or handleFrame calls
+   * 
+   * @param {Object} storageAPI - Storage API instance with persistence methods
+   */
+  setStorageAPI(storageAPI) {
+    if (!storageAPI) {
+      console.warn('MotionDetector.setStorageAPI: null storage API provided');
+      return;
+    }
+    
+    // Validate required methods
+    const requiredMethods = ['putInboundArtifact', 'pinArtifact', 'unpinArtifact'];
+    const missingMethods = requiredMethods.filter(method => typeof storageAPI[method] !== 'function');
+    
+    if (missingMethods.length > 0) {
+      console.error('MotionDetector.setStorageAPI: missing required methods:', missingMethods);
+      return;
+    }
+    
+    this._storageAPI = storageAPI;
+    console.log('MotionDetector: storage API bound successfully');
   }
 
   requestCalibration(handler) {
@@ -346,7 +420,7 @@ export class MotionDetector {
    * PHASE 2: Handle annular event from FrameEvictionHook
    * PRIMARY trigger source for both reconstruction AND calibration
    */
-  handleAnnularEvent({ annular, meta, avgLuma, timestamp }) {
+    handleAnnularEvent({ annular, meta, avgLuma, timestamp }) {
     try {
       const cameraId = meta.cameraId || 'unknown';
 
@@ -359,8 +433,22 @@ export class MotionDetector {
         return;
       }
 
-      // ===== RECONSTRUCTION TRIGGERS =====
+      // ============================================================================
+      // ✅ NEW: Persist annular analysis (ALWAYS - critical analytics)
+      // ============================================================================
+      this._persistAnnularAnalysis({
+        cameraId,
+        annular: norm,
+        annularRaw: Array.from(annular),
+        avgLuma,
+        timestamp: timestamp || Date.now(),
+        meta
+      }).catch(err => {
+        // Non-fatal: log but continue processing
+        console.warn('MotionDetector: annular persistence failed (non-fatal)', err);
+      });
 
+      // ===== RECONSTRUCTION TRIGGERS =====
       // Trigger 1: Motion spike based on normalized annular
       const stats = this._annularStatsPerCamera.get(cameraId);
       const spike = this._detectAnnularSpikeAdaptive(norm, cameraId);
@@ -393,7 +481,6 @@ export class MotionDetector {
       }
 
       // ===== PHASE 2: CALIBRATION TRIGGERS (ANNULAR PRIMARY) =====
-
       if (this.calibrationMode === 'imagedata_only') {
         // Skip annular calibration triggers if in imagedata_only mode
         return;
@@ -695,12 +782,26 @@ export class MotionDetector {
    * PHASE 2: Handle ImageData frame
    * NOW SERVES AS: Fallback calibration trigger + Confirmation for annular candidates
    */
-  handleFrame(currentFrame, previousFrame, opts = {}) {
+    handleFrame(currentFrame, previousFrame, opts = {}) {
     try {
       const cameraId = opts.cameraId || 'unknown';
 
       // Analyze motion
       const analysis = this.analyzeMotion(currentFrame, previousFrame);
+
+      // ============================================================================
+      // ✅ NEW: Persist motion analysis (DEBUG ONLY - controlled by feature flag)
+      // ============================================================================
+      if (this._persistDebugArtifacts) {
+        this._persistMotionAnalysis(
+          analysis,
+          cameraId,
+          opts.frameNumber || null
+        ).catch(err => {
+          // Non-fatal: log but continue processing
+          console.warn('MotionDetector: motion analysis persistence failed (non-fatal)', err);
+        });
+      }
 
       // ===== PHASE 2: CHECK FOR CALIBRATION CANDIDATES AWAITING CONFIRMATION =====
 
@@ -1011,12 +1112,10 @@ export class MotionDetector {
     const K = annular.length;
     if (K === 0) return null;
 
-    const centerZone = annular[0]; // Innermost zone
-    const outerZone = annular[K - 1]; // Outermost zone
+    const centerZone = annular[0];
+    const outerZone = annular[K - 1];
 
-    // Vignetting: outer significantly darker than center
     const ratio = outerZone / (centerZone + 1e-6);
-
     const vignettingThreshold = this._annularConfig.initialVignettingRatio || 0.6;
 
     if (ratio < vignettingThreshold) {
@@ -1024,6 +1123,342 @@ export class MotionDetector {
     }
 
     return null;
+  }
+
+// Add after Line 676 (before _persistAnnularAnalysis)
+
+/**
+ * Persist artifact and immediately pin with TTL (atomic ownership pattern)
+ * 
+ * SIMPLIFIED VERSION: No BC broadcast (MotionDetector artifacts are write-only)
+ * Consumers don't claim these artifacts (analytics/debugging only via queryArtifacts({ type }))
+ * 
+ * @param {Object} artifact - Artifact object to persist
+ * @param {Object} options - Pin configuration
+ * @param {string} options.owner - Pin owner identifier (default: 'motion_detector')
+ * @param {number} options.ttlMs - Time-to-live in ms (0 = no expiration)
+ * @param {string} options.pinType - 'soft' (evictable under pressure) or 'hard' (never evict)
+ * @returns {Promise<{ok, metaKey}>} Storage result with canonical metaKey
+ * @throws {Error} If persistence fails
+ * @private
+ */
+  async _persistAndPin(artifact, {
+    owner = 'motion_detector',
+    ttlMs = 0,
+    pinType = 'soft'
+  } = {}) {
+    
+    // GUARD: Storage API must be bound
+    if (!this._storageAPI) {
+      throw new Error('MotionDetector: Storage API not bound - cannot persist artifact');
+    }
+    
+    // STEP 1: Persist artifact to IndexedDB
+    let putResult;
+    try {
+      putResult = await this._storageAPI.putInboundArtifact(artifact);
+    } catch (putErr) {
+      console.error('[PERSIST] ✗ MotionDetector: putInboundArtifact failed', putErr);
+      throw new Error(`Artifact persistence failed: ${putErr.message}`);
+    }
+    
+    // Validate storage returned a canonical metaKey
+    if (!putResult?.ok || !putResult.metaKey) {
+      throw new Error('MotionDetector: Artifact persistence failed - no metaKey returned');
+    }
+    
+    const metaKey = putResult.metaKey;
+    
+    // STEP 2: Immediately claim ownership with pin
+    try {
+      await this._storageAPI.pinArtifact(metaKey, {
+        owner,
+        type: pinType,
+        ttlMs: ttlMs > 0 ? ttlMs : null // null = no storage-level expiration
+      });
+      
+      // Only log significant pins to avoid spam (annular analysis is 30fps)
+      if (ttlMs === 0 || ttlMs > 60000 || pinType === 'hard') {
+        console.log(`[PERSIST] ✓ MotionDetector claimed ${metaKey.slice(0, 20)}... (owner=${owner}, ttl=${ttlMs}ms, type=${pinType})`);
+      }
+      
+    } catch (pinErr) {
+      console.error(`[PERSIST] ✗ MotionDetector failed to pin ${metaKey.slice(0, 20)}...:`, pinErr);
+      // NON-FATAL: Artifact exists but unpinned (immediately evictable)
+      // don't throw here because the artifact was successfully persisted.
+      // Analytics tools can still query it, but it may be evicted before they do.
+    }
+    
+    return putResult;
+  }
+  
+  // ARTIFACT PERSISTENCE HELPERS
+  
+  /**
+   * Persist annular analysis artifact (ALWAYS - critical analytics)
+   * Primary motion analytics for reconstruction triggers
+   * Contains normalized annular data + EMA stats + spike/stability/uniformity detection
+   * Persisted every annular event (high frequency - 30fps typical)
+   * SIZE: ~10-15KB per artifact
+   * CONSUMERS:
+   * - Analytics dashboard (real-time motion visualization)
+   * - Debugging tools (understand why reconstruction triggered)
+   * - Post-processing analysis (correlate motion with reconstruction quality)
+   * @param {Object} data - Annular analysis data
+   * @param {string} data.cameraId - Camera identifier
+   * @param {Float32Array} data.annular - Normalized annular data [0,1]
+   * @param {Float32Array} data.annularRaw - Original unnormalized values
+   * @param {number} data.avgLuma - Average luminance
+   * @param {number} data.timestamp - Event timestamp
+   * @param {Object} data.meta - Original frame metadata
+   * @private
+   */
+  async _persistAnnularAnalysis(data) {
+    if (!this._storageAPI) {
+      return;
+    }
+    
+    try {
+      const stats = this._annularStatsPerCamera.get(data.cameraId);
+      
+      // Compute detection results (non-blocking)
+      let spike = false;
+      let stableScene = false;
+      let nonUniform = null;
+      let vignetting = null;
+      
+      try {
+        spike = this._detectAnnularSpikeAdaptive(data.annular, data.cameraId);
+        stableScene = this._detectStableAnnular(data.annular, data.cameraId);
+        nonUniform = this._detectNonUniformAnnular(data.annular);
+        vignetting = this._detectVignetting(data.annular);
+      } catch (detectionErr) {
+        console.warn('MotionDetector: detection failed during persistence', detectionErr);
+      }
+      
+      const artifact = {
+        type: 'annular_analysis',
+        data: {
+          cameraId: data.cameraId,
+          
+          // Annular data (normalized and raw)
+          annular: Array.from(data.annular),
+          annularRaw: data.annularRaw ? Array.from(data.annularRaw) : null,
+          avgLuma: data.avgLuma,
+          
+          // EMA statistics (adaptive thresholding)
+          stats: stats ? {
+            emaMin: stats.emaMin,
+            emaMax: stats.emaMax,
+            emaMean: stats.emaMean,
+            emaStd: stats.emaStd,
+            sampleCount: stats.sampleCount,
+            lastUpdated: stats.lastUpdated
+          } : null,
+          
+          // Detection results
+          detections: {
+            spike,
+            stableScene,
+            nonUniform: nonUniform ? { score: nonUniform.score } : null,
+            vignetting: vignetting ? { ratio: vignetting.ratio, severity: vignetting.severity } : null
+          },
+          
+          // Computed metrics
+          metrics: {
+            cv: this._computeCV(data.annular),
+            variance: this._computeAnnularVariance(data.annular)
+          },
+          
+          timestamp: data.timestamp
+        },
+        meta: {
+          cameraId: data.cameraId,
+          resolution: data.meta?.resolution || null,
+          width: data.meta?.width || null,
+          height: data.meta?.height || null,
+          jobId: data.meta?.jobId || null,
+          computedAt: Date.now()
+        },
+        createdAt: new Date().toISOString()
+      };
+      
+      // Persist with atomic pin
+      const result = await this._persistAndPin(artifact, {
+        owner: 'motion_detector',
+        ttlMs: 30000, // 30 seconds (high-frequency artifact)
+        pinType: 'soft'
+      });
+      
+      if (result?.ok) {
+        // Track for deduplication (optional)
+        if (!this._persistedArtifacts.has('annular_analysis')) {
+          this._persistedArtifacts.set('annular_analysis', new Set());
+        }
+        this._persistedArtifacts.get('annular_analysis').add(data.cameraId);
+      }
+      
+    } catch (err) {
+      console.warn('MotionDetector: failed to persist annular analysis', err);
+    }
+  }
+
+  /**
+   * Persist calibration decision artifact (ALWAYS - critical audit trail)
+   * 
+   * PURPOSE:
+   * Audit trail for calibration orchestration decisions
+   * Records why calibration was triggered, confidence level, source (annular vs imagedata)
+   * 
+   * WHEN PERSISTED:
+   * Every calibration trigger event (low frequency - minutes between triggers)
+   * 
+   * SIZE: ~15-20KB per artifact
+   * 
+   * CONSUMERS:
+   * - Debugging tools (understand calibration behavior)
+   * - Analytics dashboard (calibration frequency tracking)
+   * - Post-mortem analysis (correlate bad calibrations with triggers)
+   * 
+   * @param {Object} payload - Calibration decision payload
+   * @param {string} payload.reason - Trigger reason
+   * @param {string} payload.source - Detection source ('annular', 'imagedata', 'annular_confirmed_imagedata')
+   * @param {string} payload.cameraId - Camera identifier
+   * @param {Array} payload.annularSnapshot - Annular data at trigger time (optional)
+   * @param {number} payload.imageDataMotion - ImageData motion level (optional)
+   * @private
+   */
+  async _persistCalibrationDecision(payload) {
+    if (!this._storageAPI) {
+      return;
+    }
+    
+    try {
+      // Determine decision type based on reason
+      let decision = 'trigger';
+      let needsConfirmation = false;
+      let confirmed = false;
+      
+      if (payload.reason.includes('_confirmed')) {
+        decision = 'trigger';
+        confirmed = true;
+        needsConfirmation = false;
+      } else if (this.requireImageDataConfirmation && payload.source === 'annular') {
+        decision = 'pending_confirmation';
+        needsConfirmation = true;
+        confirmed = false;
+      }
+      
+      // Compute confidence from multiple signals
+      let confidence = 0.5; // Default medium confidence
+      
+      if (confirmed) {
+        confidence = 0.9; // High confidence - both annular and imagedata agree
+      } else if (payload.source === 'annular' && !needsConfirmation) {
+        confidence = 0.7; // Medium-high confidence - annular only
+      } else if (payload.source === 'imagedata_fallback') {
+        confidence = 0.6; // Medium confidence - imagedata fallback
+      } else if (payload.source === 'manual') {
+        confidence = 1.0; // Full confidence - manual trigger
+      }
+      
+      const artifact = {
+        type: 'calibration_decision',
+        data: {
+          decision, // 'trigger' | 'pending_confirmation' | 'defer'
+          reason: payload.reason,
+          source: payload.source,
+          confidence,
+          
+          // Trigger condition breakdown
+          triggerConditions: {
+            stableScene: payload.reason.includes('stable'),
+            exposureChange: payload.reason.includes('exposure'),
+            vignetting: payload.reason.includes('vignetting'),
+            flatFieldDegradation: payload.reason.includes('flat_field'),
+            manualForce: payload.reason.includes('manual')
+          },
+          
+          // Supporting data
+          annularSnapshot: payload.annularSnapshot ? new Float32Array(payload.annularSnapshot) : null,
+          imageDataMotion: typeof payload.imageDataMotion === 'number' ? payload.imageDataMotion : null,
+          
+          // Confirmation tracking
+          needsConfirmation,
+          confirmed,
+          
+          timestamp: payload.timestamp || Date.now()
+        },
+        meta: {
+          cameraId: payload.cameraId || 'unknown',
+          count: payload.count || this.defaultCalibrationCount,
+          resolution: payload.resolution || null,
+          computedAt: Date.now()
+        },
+        createdAt: new Date().toISOString()
+      };
+      
+      // ✅ FIX: Use atomic persist+pin pattern
+      const result = await this._persistAndPin(artifact, {
+        owner: 'motion_detector',
+        ttlMs: 300000, // 5 minutes (calibration audit trail - longer retention)
+        pinType: 'soft'
+      });
+      
+      if (result?.ok) {
+        console.log(`[PERSIST] ✓ Calibration decision persisted: ${payload.reason} (confidence=${confidence.toFixed(2)})`);
+      }
+      
+    } catch (err) {
+      console.warn('MotionDetector: failed to persist calibration decision', err);
+    }
+  }
+  
+  /**
+   * Helper: Compute coefficient of variation for annular array
+   * @private
+   */ 
+  _computeCV(annular) {
+    if (!annular || annular.length === 0) return 0;
+    
+    let sum = 0;
+    for (let i = 0; i < annular.length; i++) sum += annular[i];
+    const mean = sum / annular.length;
+    
+    let s2 = 0;
+    for (let i = 0; i < annular.length; i++) {
+      const d = annular[i] - mean;
+      s2 += d * d;
+    }
+    const std = Math.sqrt(s2 / annular.length);
+    
+    return std / (mean + 1e-6);
+  }
+  
+  /**
+   * Helper: Compute temporal variance for annular zones
+   * @private
+   */
+  _computeAnnularVariance(annular) {
+    const cameraId = 'unknown'; // Context not available in helper
+    if (!this._annularHistoryPerCamera.has(cameraId)) {
+      return 0;
+    }
+    
+    const history = this._annularHistoryPerCamera.get(cameraId);
+    if (history.length < 2) return 0;
+    
+    const K = annular.length;
+    let totalVariance = 0;
+    
+    for (let k = 0; k < K; k++) {
+      const samples = history.map(h => h[k]);
+      const mean = samples.reduce((s, v) => s + v, 0) / samples.length;
+      const variance = samples.reduce((s, v) => s + Math.pow(v - mean, 2), 0) / samples.length;
+      totalVariance += variance;
+    }
+    
+    return totalVariance / K;
   }
 
   /**
@@ -1105,7 +1540,7 @@ export class MotionDetector {
    * Emit calibration event with per-camera cooldown tracking
    * REFINEMENT: Tracks both global and per-camera timestamps.
    */
-  _emitCalibrationReason({ reason = 'unspecified', count = null, resolution = null, cameraId = 'unknown', source = 'unknown', ...extraData } = {}) {
+_emitCalibrationReason({ reason = 'unspecified', count = null, resolution = null, cameraId = 'unknown', source = 'unknown', ...extraData } = {}) {
     const now = Date.now();
     this._lastCalibrationEmit = now; // Global (backwards compat)
     this._lastCalibrationPerCamera.set(cameraId, now); // Per-camera
@@ -1120,12 +1555,108 @@ export class MotionDetector {
       ...extraData
     };
 
+    // ============================================================================
+    // ✅ NEW: Persist calibration decision (ALWAYS - critical audit trail)
+    // ============================================================================
+    this._persistCalibrationDecision(payload).catch(err => {
+      // Non-fatal: log but continue emitting event
+      console.warn('MotionDetector: calibration decision persistence failed (non-fatal)', err);
+    });
+
     try {
       this._emit('calibrationNeeded', payload);
       this._emit('needCalibration', payload);
       console.log('MotionDetector: emitted calibrationNeeded', payload);
     } catch (e) {
       console.warn('MotionDetector: failed to emit calibrationNeeded', e);
+    }
+  } 
+
+  /**
+   * Persist reconstruction intent artifact (ALWAYS - fairness audit)
+   * 
+   * PURPOSE:
+   * Track reconstruction requests for fairness debugging and analytics
+   * Records intent creation, priority, reason, and lifecycle status
+   * 
+   * WHEN PERSISTED:
+   * Every reconstruction intent creation (medium frequency - 1-10 per second during motion)
+   * 
+   * SIZE: ~5-8KB per artifact
+   * 
+   * CONSUMERS:
+   * - Fairness debugging (ensure cameras get equal reconstruction time)
+   * - Scheduler analysis (understand priority queue behavior)
+   * - Performance monitoring (correlate intent latency with system load)
+   * 
+   * @param {Object} intent - Intent object from scheduler
+   * @param {string} intent.intentId - Unique intent identifier
+   * @param {string} intent.jobId - Associated job identifier
+   * @param {string} intent.metaKey - Artifact metaKey (null until artifact ready)
+   * @param {string} intent.cameraId - Camera identifier
+   * @param {string} intent.reason - Reconstruction reason
+   * @param {number} intent.priority - Priority value
+   * @param {Array} intent.annular - Annular snapshot (optional)
+   * @param {number} intent.avgLuma - Average luminance (optional)
+   * @private
+   */
+  async _persistReconstructionIntent(intent) {
+    if (!this._storageAPI) {
+      return;
+    }
+    
+    try {
+      const artifact = {
+        type: 'reconstruction_intent',
+        data: {
+          intentId: intent.intentId,
+          jobId: intent.jobId,
+          metaKey: intent.metaKey || null,
+          cameraId: intent.cameraId,
+          reason: intent.reason,
+          priority: intent.priority,
+          
+          // Lifecycle timestamps
+          createdAt: intent.createdAt,
+          artifactReadyAt: intent.artifactReadyAt || null,
+          dispatchedAt: null, // Updated by _dispatchIntent (not tracked yet)
+          completedAt: null,  // Updated by notifyReconstructionFinished (not tracked yet)
+          
+          // Status tracking
+          status: 'pending', // 'pending' | 'queued' | 'dispatched' | 'completed' | 'failed'
+          retries: intent._retries || 0,
+          
+          // Supporting data
+          annularSnapshot: intent.annular ? new Float32Array(intent.annular) : null,
+          avgLuma: intent.avgLuma || null
+        },
+        meta: {
+          cameraId: intent.cameraId,
+          reason: intent.reason,
+          computedAt: Date.now()
+        },
+        createdAt: new Date().toISOString()
+      };
+      
+      // ✅ FIX: Use atomic persist+pin pattern
+      const result = await this._persistAndPin(artifact, {
+        owner: 'motion_detector',
+        ttlMs: 180000, // 3 minutes (intent lifecycle tracking - medium retention)
+        pinType: 'soft'
+      });
+      
+      if (result?.ok) {
+        // Track for lifecycle updates (optional)
+        if (!this._persistedArtifacts.has('reconstruction_intent')) {
+          this._persistedArtifacts.set('reconstruction_intent', new Map());
+        }
+        this._persistedArtifacts.get('reconstruction_intent').set(intent.intentId, result.metaKey);
+        
+        console.log(`[PERSIST] ✓ Reconstruction intent persisted: ${intent.intentId} (reason=${intent.reason})`);
+      }
+      
+    } catch (err) {
+      console.warn('MotionDetector: failed to persist reconstruction intent', err);
     }
   }
 
@@ -1169,6 +1700,85 @@ export class MotionDetector {
     };
   }
 
+  // ============================================================================
+  // ✅ NEW: PERIODIC METRICS PERSISTENCE (DEBUG ONLY)
+  // ============================================================================
+  
+  /**
+   * Persist detector metrics snapshot (DEBUG ONLY - controlled by feature flag)
+   * 
+   * PURPOSE:
+   * Aggregated performance metrics for monitoring and debugging
+   * 
+   * WHEN PERSISTED:
+   * Called periodically by main.js (e.g., every 10 seconds) when debug flag enabled
+   * 
+   * SIZE: ~10-15KB per artifact
+   * 
+   * CONSUMERS:
+   * - Performance dashboard (track detector health)
+   * - Debugging tools (correlate metrics with issues)
+   * 
+   * @returns {Promise<void>}
+   */
+  async persistMetrics() {
+    if (!this._storageAPI || !this._persistDebugArtifacts) {
+      return;
+    }
+    
+    try {
+      const stats = this.getRecentStats();
+      
+      // Compute per-camera statistics
+      const perCameraStats = {};
+      for (const [cameraId, camera] of this._cameras.entries()) {
+        const intentCount = this._perCameraQueues.get(cameraId)?.size || 0;
+        perCameraStats[cameraId] = {
+          ...camera.getStats(),
+          queueSize: intentCount,
+          annularStatsAvailable: this._annularStatsPerCamera.has(cameraId)
+        };
+      }
+      
+      const artifact = {
+        type: 'motion_detector_metrics',
+        data: {
+          // Global stats
+          calibrationMode: this.calibrationMode,
+          trackedCameras: this._cameras.size,
+          pendingCandidates: this._calibrationCandidates.size,
+          annularStatsCameras: this._annularStatsPerCamera.size,
+          
+          // Motion tracking
+          avgMotion: stats.avgMotion,
+          avgLuma: stats.avgLuma,
+          motionWindowSize: stats.motionWindowSize,
+          lastCalibrationAt: stats.lastCalibrationAt,
+          
+          // Intent tracking
+          totalIntents: this._intents.size,
+          inFlightIntents: this._inFlight.size,
+          heapSize: this._globalHeap.length,
+          
+          // Per-camera breakdown
+          perCamera: perCameraStats,
+          
+          timestamp: Date.now(),
+          uptime: Date.now() - (this._startTime || Date.now())
+        },
+        meta: {
+          computedAt: Date.now()
+        },
+        createdAt: new Date().toISOString()
+      };
+      
+      await this._storageAPI.putInboundArtifact(artifact);
+      
+    } catch (err) {
+      console.warn('MotionDetector: failed to persist metrics (debug)', err);
+    }
+  }
+
   // ===== RECONSTRUCTION SCHEDULER INTERNAL METHODS (NEW) =====
 
   /**
@@ -1206,7 +1816,80 @@ export class MotionDetector {
     this._intents.set(intentId, intent);
     this._intentsByJobId.set(jobId, intentId);
 
+    // ============================================================================
+    // ✅ NEW: Persist reconstruction intent (ALWAYS - fairness audit)
+    // ============================================================================
+    this._persistReconstructionIntent(intent).catch(err => {
+      // Non-fatal: log but continue scheduling
+      console.warn('MotionDetector: intent persistence failed (non-fatal)', err);
+    });
+
     console.log(`MotionDetector: created intent ${intentId} for jobId=${jobId}, reason=${reason}`);
+  }
+
+  /**
+   * Persist motion analysis artifact (DEBUG ONLY - controlled by feature flag)
+   * 
+   * PURPOSE:
+   * ImageData-based motion analytics for fallback/confirmation of annular triggers
+   * 
+   * WHEN PERSISTED:
+   * Only if _persistDebugArtifacts flag is enabled
+   * Every ImageData frame analysis (high frequency - 30fps typical)
+   * 
+   * SIZE: ~5-8KB per artifact
+   * 
+   * CONSUMERS:
+   * - Debugging tools (compare annular vs imagedata motion detection)
+   * - Algorithm tuning (adjust thresholds based on historical data)
+   * 
+   * @param {Object} analysis - Motion analysis result from analyzeMotion
+   * @param {string} cameraId - Camera identifier
+   * @param {number} frameNumber - Frame sequence number (optional)
+   * @private
+   */
+  async _persistMotionAnalysis(analysis, cameraId, frameNumber = null) {
+    if (!this._storageAPI || !this._persistDebugArtifacts) {
+      return; // Skip if debug artifacts disabled
+    }
+    
+    try {
+      const artifact = {
+        type: 'motion_analysis',
+        data: {
+          motionLevel: analysis.motionLevel,
+          motionPixels: analysis.motionPixels,
+          
+          // Limit motion areas to first 100 to keep size manageable
+          motionAreas: analysis.motionAreas.slice(0, 100).map(area => ({
+            x: area.x,
+            y: area.y,
+            intensity: area.intensity
+          })),
+          
+          coverage: analysis.coverage,
+          avgLuminance: analysis.avgLuminance,
+          
+          timestamp: Date.now(),
+          frameNumber
+        },
+        meta: {
+          cameraId,
+          sampleSize: analysis.motionAreas.length,
+          computedAt: Date.now()
+        },
+        createdAt: new Date().toISOString()
+      };
+      
+    await this._persistAndPin(artifact, {
+      owner: 'motion_detector',
+      ttlMs: 30000, // 30s (debug artifact, short retention)
+      pinType: 'soft'
+    });
+      
+    } catch (err) {
+      console.warn('MotionDetector: failed to persist motion analysis (debug)', err);
+    }
   }
 
   /**
@@ -1629,6 +2312,16 @@ export class MotionDetector {
     this._confirmedCalibrations.clear();
     this._annularStatsPerCamera.clear();
     this._lastCalibrationPerCamera.clear();
+
+    // ============================================================================
+    // ✅ NEW: Clear persistence tracking
+    // ============================================================================
+    if (this._persistedArtifacts) {
+      this._persistedArtifacts.clear();
+    }
+    
+    // Unbind storage API
+    this._storageAPI = null;
 
     // Reset calibration state
     this.reset();

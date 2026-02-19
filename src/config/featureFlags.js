@@ -24,6 +24,86 @@ const DEFAULTS = {
   enableSamplerPlugins: true,
   enableDevPanels: false,
 
+// ✅ NEW: Core pipeline control (calibrated pipeline modules)
+  enableTetrachromacy: true,          // Enable Tetrachromacy spectral decomposition
+  enableDirectionalLifting: true,      // Enable DirectionalLifting temporal aggregation
+
+  // ============================================================================
+  // ✅ NEW: Artifact Persistence Control
+  // ============================================================================
+  /**
+   * persistIntermediates: Controls persistence of intermediate pipeline artifacts
+   * 
+   * When enabled, motion.worker will persist:
+   * - tetra_field (Tetrachromacy output)
+   * - directional_field (DirectionalLifting output)
+   * - bump_map (Laplacian-based bump)
+   * - specular_mask (Chromaticity-based specular)
+   * - triangle_output (Triangle preprocessor depths/tilts/winding)
+   * 
+   * These artifacts are expensive to compute (1-5s) but primarily useful for debugging.
+   * Storage impact: ~2-5MB per reconstruction (5 artifacts × ~1MB each)
+   * 
+   * Recommended: false (production), true (development/debugging)
+   */
+  persistIntermediates: false,
+
+  /**
+   * persistDebugArtifacts: Controls persistence of MotionDetector debug artifacts
+   * 
+   * When enabled, MotionDetector will persist:
+   * - motion_analysis (ImageData motion detection results)
+   * - motion_detector_metrics (aggregated performance stats)
+   * 
+   * These artifacts are high-frequency (30fps for motion_analysis, 0.1Hz for metrics)
+   * and primarily useful for algorithm tuning and debugging.
+   * 
+   * Storage impact: ~5-8KB per frame for motion_analysis, ~15KB per 10s for metrics
+   * At 30fps, this is ~240KB/s or ~14MB/min of continuous capture
+   * 
+   * Recommended: false (always in production), true (short debugging sessions only)
+   */
+  persistDebugArtifacts: false,
+
+  /**
+   * MOTION_UNPIN_ON_CLAIM: Controls motion.worker pin release behavior
+   * 
+   * false (conservative, default):
+   *   - Producer keeps pin as fallback until consumer releases
+   *   - Higher pinnedBytes but safer (protects against consumer bugs)
+   *   - Recommended for development
+   * 
+   * true (aggressive, memory-optimized):
+   *   - Producer unpins immediately on consumer claim
+   *   - Lower pinnedBytes (frees memory early)
+   *   - Requires well-behaved consumers (always pin before use)
+   *   - Recommended for production after thorough testing
+   */
+  MOTION_UNPIN_ON_CLAIM: false,
+
+  // ✅ NEW: Module debug flags
+  calibDebug: false,                   // CalibratedFieldProducer debug logging
+  tetraDebug: false,                   // Tetrachromacy debug logging
+  dirLiftDebug: false,                 // DirectionalLifting debug logging
+  heartbeatDebug: false,               // Heartbeat success/failure logging
+
+  // ✅ NEW: DirectionalLifting buffer management
+  dirLiftBufferSize: null,            // Manual buffer size override (null = auto)
+  dirLiftMaxBufferMB: 32,             // Max MB for temporal buffer allocation
+
+  // ✅ NEW: Bump mapping (Laplacian-based depth-to-bump)
+  bumpScale: 1.0,                     // Bump intensity multiplier
+  bumpFusionMode: false,              // Enable stddev fusion with Laplacian
+
+  // ✅ NEW: Normal mapping (Sobel-based bump-to-normal)
+  normalScale: 1.0,                   // Normal map gradient scale
+
+  // ✅ NEW: Specular masking (chromaticity-based specular detection)
+  specularHpGain: 4.0,                // High-pass gain for specular detection
+  specularAlpha: 0.5,                 // Blend ratio for chroma component (0..1)
+  specularChromaScale: 3.0,           // Chroma deviation amplification
+  specularThreshold: 0.15,            // Minimum specular mask threshold (0..1)
+
   // Pipeline phase control (NEW)
   // enablePreprocessAnnotate: allow preprocessors to annotate manifests / metadata
   // enablePreprocessQuantize: allow preprocessors to emit quantized/solver-ready artifacts (SOC/A,b)
@@ -57,11 +137,12 @@ const DEFAULTS = {
   fluxPersistFullResOnDemand: true,
   fluxWorkerCount: 1,
 
-  // Triangle / depth / overhang related (new)
+  // Triangle / depth / overhang related
   enableOverhang: true,
   overhangCosineThresh: 0.7,
   overhangWindingThresh: 0.25,
   overhangMinGroupSize: 3,
+  gravity: [0, -1, 0],                // ✅ NEW: Gravity vector for overhang detection
   depthKL: 1.0,
   depthKD: 0.5,
   depthBase: 0.1,
@@ -427,13 +508,75 @@ function _coerceOrWarn(key, value) {
       return DEFAULTS[key];
     }
 
+    // ✅ NEW: Bump/normal/specular scales (0+, no upper limit)
+    if (['bumpScale', 'normalScale', 'specularHpGain', 'specularChromaScale'].includes(key)) {
+      const n = Number(value);
+      if (Number.isFinite(n) && n >= 0) return n;
+      return DEFAULTS[key];
+    }
+
+    // ✅ NEW: Alpha/threshold values (0..1)
+    if (['specularAlpha', 'specularThreshold'].includes(key)) {
+      const n = Number(value);
+      if (Number.isFinite(n)) return clamp(n, 0.0, 1.0);
+      return DEFAULTS[key];
+    }
+
+    // ✅ NEW: DirectionalLifting buffer size (positive integer or null)
+    if (key === 'dirLiftBufferSize') {
+      if (value === null || value === 'null') return null;
+      const n = Number(value);
+      if (Number.isFinite(n) && n > 0) return Math.floor(n);
+      return DEFAULTS.dirLiftBufferSize;
+    }
+
+    if (key === 'dirLiftMaxBufferMB') {
+      const n = Number(value);
+      if (Number.isFinite(n) && n > 0) return Math.max(1, Math.floor(n));
+      return DEFAULTS.dirLiftMaxBufferMB;
+    }
+
+    // ✅ NEW: Gravity vector (array of 3 numbers)
+    if (key === 'gravity') {
+      if (Array.isArray(value) && value.length === 3) {
+        const [x, y, z] = value.map(Number);
+        if (Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(z)) {
+          return [x, y, z];
+        }
+      }
+      return DEFAULTS.gravity;
+    }
+
+    // ✅ NEW: Debug flags (boolean)
+    if (['calibDebug', 'tetraDebug', 'dirLiftDebug', 'heartbeatDebug'].includes(key)) {
+      if (value === 'true' || value === true) return true;
+      if (value === 'false' || value === false) return false;
+      return DEFAULTS[key];
+    }
+
+    // ============================================================================
+    // ✅ NEW: Artifact persistence flags (boolean)
+    // ============================================================================
+    if (['persistIntermediates', 'persistDebugArtifacts', 'MOTION_UNPIN_ON_CLAIM'].includes(key)) {
+      if (value === 'true' || value === true) return true;
+      if (value === 'false' || value === false) return false;
+      return DEFAULTS[key];
+    }
+
+    // ✅ NEW: Pipeline toggles (boolean)
+    if (['enableTetrachromacy', 'enableDirectionalLifting', 'bumpFusionMode'].includes(key)) {
+      if (value === 'true' || value === true) return true;
+      if (value === 'false' || value === false) return false;
+      return DEFAULTS[key];
+    }
+
     // boolean-ish values that might arrive as strings
     if (typeof DEFAULTS[key] === 'boolean') {
       if (value === 'true' || value === true) return true;
       if (value === 'false' || value === false) return false;
     }
 
-    // ----- New keys coercion/validation -----
+    // ----- Existing keys coercion/validation -----
 
     // HFH heavy threshold (0..1)
     if (key === 'hfhHeavyPathThreshold') {

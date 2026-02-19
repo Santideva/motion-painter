@@ -47,6 +47,25 @@ export class PreprocessorWorker {
     // Track HFH-triggered frames
     this._hfhTriggeredFrames = new Set(); // jobIds that had shouldRun=true
 
+    // ============================================================================
+    // PIN LIFECYCLE TRACKING
+    // ============================================================================
+    /**
+     * Track producer pin lifecycle for main thread visibility
+     * 
+     * _pinnedByProducer: Mirrors worker-side _pinnedArtifacts map
+     * - Updated when worker broadcasts 'artifact:pinned' events
+     * - Removed when worker broadcasts 'artifact:unpinned' events
+     * - Structure: metaKey → { pinnedAt, ttlMs, owner, expiresAt, type }
+     * 
+     * _claimedByConsumers: Track which artifacts consumers have claimed
+     * - Updated when BC receives 'artifact:claimed' from consumers
+     * - Used to prevent duplicate claims and calculate metrics
+     * - Structure: Set<metaKey>
+     */
+    this._pinnedByProducer = new Map();
+    this._claimedByConsumers = new Set();
+
     // --- Worker creation (robust, supports override via workerPath) ---
     try {
       // If caller supplied a workerPath, accept string or URL; otherwise fall back to default build path.
@@ -216,12 +235,94 @@ export class PreprocessorWorker {
         } catch (e) {
           console.warn('PreprocessorWorker: error invoking ready callbacks', e);
         }
-      }
-      else if (data.event === 'worker:error') {
+      } else if (data.event === 'worker:error') {
         console.error('PreprocessorWorker: worker initialization error', data.error);
         this.workerReady = false;
         clearTimeout(this.readyTimeout);
 
+      // ============================================================================
+      // PIN LIFECYCLE EVENT HANDLERS
+      // ============================================================================
+      } else if (data.event === 'artifact:pinned') {
+        /**
+         * Worker pinned an artifact - track in main thread
+         */
+        if (data.metaKey) {
+          this._pinnedByProducer.set(data.metaKey, {
+            pinnedAt: data.timestamp || Date.now(),
+            ttlMs: data.ttlMs || 0,
+            owner: data.owner || 'preprocessor',
+            expiresAt: data.expiresAt || null,
+            type: data.type || 'soft'
+          });
+          
+          // Only log significant pins (avoid spam)
+          if (data.type === 'hard' || data.ttlMs === 0 || data.ttlMs > 300000) {
+            console.log(`PreprocessorWorker: Producer pinned ${data.metaKey?.slice(0, 20)}... (ttl=${data.ttlMs}ms, type=${data.type})`);
+          }
+        }
+        
+      } else if (data.event === 'artifact:unpinned') {
+        /**
+         * Worker unpinned an artifact - remove from tracking
+         */
+        if (data.metaKey) {
+          this._pinnedByProducer.delete(data.metaKey);
+          
+          // Log significant unpins
+          if (data.reason && data.reason !== 'ttl_expired') {
+            console.log(`PreprocessorWorker: Producer unpinned ${data.metaKey?.slice(0, 20)}... (reason=${data.reason})`);
+          }
+        }
+        
+      } else if (data.event === 'artifact:ttl_unpinned') {
+        /**
+         * Worker unpinned due to TTL expiration - with diagnostics
+         */
+        if (data.metaKey) {
+          this._pinnedByProducer.delete(data.metaKey);
+          
+          // Warn if refcount > 0 (orphaned pins)
+          if (data.finalRefCount && data.finalRefCount > 0) {
+            console.warn(`PreprocessorWorker: TTL unpin with remaining pins! metaKey=${data.metaKey?.slice(0, 20)}..., refCount=${data.finalRefCount}`);
+          }
+          
+          // Log unclaimed artifacts
+          if (data.wasUnclaimed) {
+            console.log(`PreprocessorWorker: Artifact ${data.metaKey?.slice(0, 20)}... expired unclaimed (TTL=${data.ttlMs}ms)`);
+          }
+        }
+        
+      } else if (data.event === 'artifact:claimed') {
+        /**
+         * Consumer claimed an artifact (worker relayed BC event)
+         */
+        if (data.metaKey) {
+          this._claimedByConsumers.add(data.metaKey);
+          
+          const consumer = data.claimedBy || data.consumer || data.claimant || 'unknown';
+          console.log(`PreprocessorWorker: Artifact ${data.metaKey?.slice(0, 20)}... claimed by ${consumer}`);
+          
+          // Track derived keys if present
+          if (data.derivedKeys && Array.isArray(data.derivedKeys)) {
+            for (const derivedKey of data.derivedKeys) {
+              this._claimedByConsumers.add(derivedKey);
+            }
+            console.log(`PreprocessorWorker: + ${data.derivedKeys.length} derived keys claimed`);
+          }
+        }
+        
+      } else if (data.event === 'artifact:released') {
+        /**
+         * Consumer released an artifact
+         */
+        if (data.metaKey) {
+          this._claimedByConsumers.delete(data.metaKey);
+          
+          const consumer = data.releasedBy || data.consumer || 'unknown';
+          console.log(`PreprocessorWorker: Artifact ${data.metaKey?.slice(0, 20)}... released by ${consumer}`);
+        }
+        
       } else if (data.event === 'artifact:ready') {
         // Centralized handling for artifact readiness:
         // - update processing metrics
@@ -700,8 +801,8 @@ export class PreprocessorWorker {
     }
   }
 
-  // Enhanced metrics including backpressure status
-  getMetrics() {
+    // Enhanced metrics including backpressure status
+    getMetrics() {
     // Defensive check to prevent undefined errors
     if (!this.pending) {
       console.warn('PreprocessorWorker.getMetrics: pending Map not initialized');
@@ -714,14 +815,22 @@ export class PreprocessorWorker {
         droppedCount: this.droppedCount || 0,
         backpressureActive: this.backpressureActive || false,
         calibrationSupported: true,
-        hfhSupported: !!this._metaKeyToJobId, // presence implies support
+        hfhSupported: !!this._metaKeyToJobId,
         trackedCameras: this._cameraStats ? this._cameraStats.size : 0,
         hfhTriggeredPending: this._hfhTriggeredFrames ? this._hfhTriggeredFrames.size : 0,
-        ...this.metrics
+        ...this.metrics,
+        // ✅ ENHANCEMENT: Include pin lifecycle stats even in error state
+        pinLifecycle: {
+          producerPinned: this._pinnedByProducer ? this._pinnedByProducer.size : 0,
+          claimedByConsumers: this._claimedByConsumers ? this._claimedByConsumers.size : 0,
+          claimEfficiency: 0,
+          stats: null
+        }
       };
     }
 
-    return {
+    // ✅ ENHANCEMENT: Add comprehensive pin lifecycle statistics
+    const base = {
       workerReady: this.workerReady,
       pending: this.pending.size,
       queuedFrames: this.queuedFrames.length,
@@ -735,6 +844,42 @@ export class PreprocessorWorker {
       hfhTriggeredPending: this._hfhTriggeredFrames.size,
       ...this.metrics
     };
+
+    // Get detailed pin lifecycle stats
+    let pinLifecycleStats = null;
+    try {
+      pinLifecycleStats = this.getPinLifecycleStats();
+    } catch (err) {
+      console.warn('PreprocessorWorker.getMetrics: getPinLifecycleStats failed', err);
+      pinLifecycleStats = {
+        producerPinned: this._pinnedByProducer.size,
+        claimedByConsumers: this._claimedByConsumers.size,
+        claimEfficiency: 0,
+        error: err.message
+      };
+    }
+
+    return {
+      ...base,
+      pinLifecycle: {
+        producerPinned: this._pinnedByProducer.size,
+        claimedByConsumers: this._claimedByConsumers.size,
+        claimEfficiency: this._pinnedByProducer.size > 0 
+          ? (this._claimedByConsumers.size / this._pinnedByProducer.size) 
+          : 0,
+        stats: pinLifecycleStats,
+        // Include abbreviated pin list (up to 10 most recent)
+        pinnedArtifacts: this.getProducerPinnedArtifacts()
+          .sort((a, b) => b.pinnedAt - a.pinnedAt)
+          .slice(0, 10)
+          .map(p => ({
+            metaKey: p.metaKey.slice(0, 20) + '...',
+            remainingMs: p.remainingMs,
+            type: p.type,
+            isExpired: p.isExpired
+          }))
+      }
+    };
   }
 
   // Method to check if worker can accept more frames
@@ -743,13 +888,200 @@ export class PreprocessorWorker {
   }
 
   // Method to get processing capacity status
-  getCapacityStatus() {
+    getCapacityStatus() {
     const utilization = this.metrics.queueUtilization;
 
     if (utilization < 0.3) return 'low';
     if (utilization < 0.7) return 'medium';
     if (utilization < 0.9) return 'high';
     return 'critical';
+  }
+
+  // ============================================================================
+  // PIN LIFECYCLE QUERY METHODS
+  // ============================================================================
+
+  /**
+   * Check if artifact is currently pinned by producer
+   */
+  isProducerPinned(metaKey) {
+    if (!metaKey) return false;
+    return this._pinnedByProducer.has(metaKey);
+  }
+
+  /**
+   * Check if artifact has been claimed by a consumer
+   */
+  isClaimedByConsumer(metaKey) {
+    if (!metaKey) return false;
+    return this._claimedByConsumers.has(metaKey);
+  }
+
+  /**
+   * Get producer pin info with TTL expiration time
+   */
+  getProducerPinInfo(metaKey) {
+    if (!metaKey) return null;
+    
+    const info = this._pinnedByProducer.get(metaKey);
+    if (!info) return null;
+    
+    // Calculate remaining TTL
+    const now = Date.now();
+    let remainingMs = Infinity;
+    let isExpired = false;
+    
+    if (info.expiresAt !== null && typeof info.expiresAt === 'number') {
+      remainingMs = Math.max(0, info.expiresAt - now);
+      isExpired = remainingMs === 0;
+    }
+    
+    return {
+      pinnedAt: info.pinnedAt,
+      ttlMs: info.ttlMs,
+      owner: info.owner,
+      expiresAt: info.expiresAt,
+      type: info.type,
+      remainingMs,
+      isExpired
+    };
+  }
+
+  /**
+   * Get all producer-pinned artifacts
+   */
+  getProducerPinnedArtifacts() {
+    const now = Date.now();
+    const results = [];
+    
+    for (const [metaKey, info] of this._pinnedByProducer.entries()) {
+      let remainingMs = Infinity;
+      let isExpired = false;
+      
+      if (info.expiresAt !== null && typeof info.expiresAt === 'number') {
+        remainingMs = Math.max(0, info.expiresAt - now);
+        isExpired = remainingMs === 0;
+      }
+      
+      results.push({
+        metaKey,
+        pinnedAt: info.pinnedAt,
+        ttlMs: info.ttlMs,
+        owner: info.owner,
+        expiresAt: info.expiresAt,
+        type: info.type,
+        remainingMs,
+        isExpired
+      });
+    }
+    
+    return results;
+  }
+
+  /**
+   * Request producer to release a specific artifact
+   */
+  async requestProducerRelease(metaKey) {
+    if (!metaKey) {
+      throw new Error('metaKey required for requestProducerRelease');
+    }
+    
+    if (!this.workerReady) {
+      throw new Error('Worker not ready - cannot request release');
+    }
+
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.worker.removeEventListener('message', handleResponse);
+        reject(new Error(`Producer release timeout for ${metaKey.slice(0, 20)}...`));
+      }, 5000);
+
+      const handleResponse = (ev) => {
+        const data = ev.data || {};
+
+        if (data.event === 'artifact:unpinned' && data.metaKey === metaKey) {
+          clearTimeout(timeout);
+          this.worker.removeEventListener('message', handleResponse);
+          this._pinnedByProducer.delete(metaKey);
+          
+          resolve({ 
+            ok: true, 
+            metaKey, 
+            reason: data.reason || 'manual_release' 
+          });
+        }
+      };
+
+      this.worker.addEventListener('message', handleResponse);
+
+      try {
+        this.worker.postMessage({
+          op: 'unpinArtifact',
+          metaKey,
+          owner: 'preprocessor'
+        });
+      } catch (err) {
+        clearTimeout(timeout);
+        this.worker.removeEventListener('message', handleResponse);
+        reject(new Error(`Failed to send unpin request: ${err.message}`));
+      }
+    });
+  }
+
+  /**
+   * Get summary statistics for pin lifecycle
+   */
+  getPinLifecycleStats() {
+    const now = Date.now();
+    const pinned = this.getProducerPinnedArtifacts();
+    
+    let expiringSoon = 0;  // < 30s
+    let expired = 0;
+    let hardPins = 0;
+    let softPins = 0;
+    let totalRemainingMs = 0;
+    let countWithTTL = 0;
+    
+    for (const info of pinned) {
+      if (info.type === 'hard') {
+        hardPins++;
+      } else {
+        softPins++;
+      }
+      
+      if (info.remainingMs !== Infinity) {
+        totalRemainingMs += info.remainingMs;
+        countWithTTL++;
+        
+        if (info.isExpired) {
+          expired++;
+        } else if (info.remainingMs < 30000) {
+          expiringSoon++;
+        }
+      }
+    }
+    
+    const producerPinned = pinned.length;
+    const claimedByConsumers = this._claimedByConsumers.size;
+    const claimEfficiency = producerPinned > 0 
+      ? (claimedByConsumers / producerPinned) 
+      : 0;
+    
+    const avgRemainingMs = countWithTTL > 0 
+      ? (totalRemainingMs / countWithTTL) 
+      : null;
+    
+    return {
+      producerPinned,
+      claimedByConsumers,
+      claimEfficiency,
+      expiringSoon,
+      expired,
+      hardPins,
+      softPins,
+      avgRemainingMs,
+      totalPinnedBytes: null
+    };
   }
 
   /**
@@ -1139,8 +1471,36 @@ export class PreprocessorWorker {
         if (this._jobIdToMetaKey) this._jobIdToMetaKey.clear();
         if (this._cameraStats) this._cameraStats.clear();
         if (this._hfhTriggeredFrames) this._hfhTriggeredFrames.clear();
+        
+        // ✅ CLEANUP: Clear pin tracking maps
+        /**
+         * CRITICAL: Prevent memory leaks on wrapper termination
+         * 
+         * Worker-side timers are cleared by worker.terminate() or worker's shutdown handler
+         * But main thread tracking maps hold references to metaKeys that must be cleared
+         * 
+         * Without clearing, Maps/Sets hold string references (metaKeys)
+         * For long-running apps with frequent worker restart, this accumulates
+         */
+        if (this._pinnedByProducer) {
+          const pinnedCount = this._pinnedByProducer.size;
+          this._pinnedByProducer.clear();
+          if (pinnedCount > 0) {
+            console.log(`PreprocessorWorker.terminate: Cleared ${pinnedCount} producer pins from tracking`);
+          }
+        }
+        
+        if (this._claimedByConsumers) {
+          const claimedCount = this._claimedByConsumers.size;
+          this._claimedByConsumers.clear();
+          if (claimedCount > 0) {
+            console.log(`PreprocessorWorker.terminate: Cleared ${claimedCount} claimed artifacts from tracking`);
+          }
+        }
+        
       } catch (e) {
         // ignore cleanup errors
+        console.warn('PreprocessorWorker.terminate: Cleanup error (non-fatal)', e);
       }
     }
   }

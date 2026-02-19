@@ -102,10 +102,61 @@ self.addEventListener('unhandledrejection', (e) => {
   } catch (_) {}
 });
 
-// Define constants first
 const DEFAULT_THUMB_MAX_SIDE = 256;
 const BROADCAST_CHANNEL = 'motion-painter-store';
 const INIT_TIMEOUT_MS = 30000; // 30 seconds
+
+// ============================================================================
+// PIN LIFECYCLE CONFIGURATION
+// ============================================================================
+/**
+ * TTL (Time-To-Live) constants for auto-unpinning artifacts
+ * 
+ * DESIGN RATIONALE:
+ * - Frame artifacts (thumbnail/phash/manifest): 2 minutes
+ *   Short TTL because consumers typically claim within seconds
+ *   If unclaimed after 2min, likely orphaned/unwanted
+ * 
+ * - Calibration artifacts (dark/flat/bias/calibrated): 5 minutes
+ *   Longer TTL because:
+ *   1. Expensive to compute (5-10 seconds)
+ *   2. Consumers may take longer to discover (accumulate frames, start reconstruction)
+ *   3. Shared across many frames (higher reuse value)
+ * 
+ * - Calibration meta: 0 (no auto-unpin)
+ *   Never auto-unpin because:
+ *   1. Tiny size (~1KB) - doesn't contribute to memory pressure
+ *   2. Long-lived - valid until user invalidates calibration
+ *   3. Critical - losing it orphans expensive child artifacts
+ *   4. Manual lifecycle - only unpinned via invalidateCalibration()
+ */
+const ARTIFACT_PIN_TTL_MS = 120000; // 2 minutes for frame artifacts
+const CALIBRATION_PIN_TTL_MS = 300000; // 5 minutes for calibration children
+const CALIBRATION_META_TTL_MS = 0; // No auto-unpin for meta (manual only)
+
+/**
+ * Track pinned artifacts with TTL timers
+ * 
+ * PURPOSE:
+ * Maps metaKey to pin metadata + cancellable timer
+ * When consumer claims artifact, we cancel timer to prevent premature unpin
+ * 
+ * STRUCTURE:
+ * metaKey → {
+ *   pinnedAt: timestamp,
+ *   ttlMs: duration,
+ *   timer: setTimeout handle,
+ *   owner: 'preprocessor',
+ *   expiresAt: timestamp
+ * }
+ * 
+ * LIFECYCLE:
+ * 1. _persistAndPin() creates entry and schedules timer
+ * 2. BC 'artifact:claimed' event triggers _cancelTTL() → removes entry
+ * 3. Timer expires → auto-unpin → removes entry
+ * 4. invalidateCalibration() → _cancelTTL() all children → removes entries
+ */
+const _pinnedArtifacts = new Map();
 
 let bc;
 let storageReady = false;
@@ -168,7 +219,7 @@ console.log('[WORKER] About to start dynamic import IIFE');
     // NOW initialize - storageAPI is available
     if (typeof storageAPI.initStorage === 'function') {
       console.log('[WORKER] calling storageAPI.initStorage...');
-      await storageAPI.initStorage({ quota: undefined, startEvictor: true });
+      await storageAPI.initStorage({ quota: 500 * 1024 * 1024, startEvictor: true });
       console.log('[WORKER] ✓ storageAPI.initStorage completed');
       
       // Bind methods to self
@@ -183,6 +234,20 @@ console.log('[WORKER] About to start dynamic import IIFE');
       self.releaseReservation = storageAPI.releaseReservation.bind(storageAPI);
       self.checkQuotaAndEvict = storageAPI.checkQuotaAndEvict.bind(storageAPI);
       self.getStorageStats = storageAPI.getStorageStats.bind(storageAPI);
+      
+      // ============================================================================
+      // ✅ NEW: Bind pin lifecycle storage APIs
+      // ============================================================================
+      // CRITICAL: These must be bound for _persistAndPin and BC handlers to work
+      // Without these, self.getPins will be undefined → BC handlers will fail
+      self.getPins = storageAPI.getPins.bind(storageAPI);
+      self.getPinRefCount = storageAPI.getPinRefCount.bind(storageAPI);
+      self.touchArtifact = storageAPI.touchArtifact.bind(storageAPI);
+      self.unpinAll = storageAPI.unpinAll.bind(storageAPI); // Admin only (optional)
+      self.getPinnedArtifacts = storageAPI.getPinnedArtifacts.bind(storageAPI); // Diagnostics
+      self.fetchPartByKey = storageAPI.fetchPartByKey.bind(storageAPI); // Parts support
+      
+      console.log('[WORKER] ✓ All storage APIs bound (including pin lifecycle methods)');
       
       storageReady = true;
       console.log('[WORKER] ✓ Storage initialized successfully, sending worker:ready');
@@ -213,6 +278,196 @@ console.log('[WORKER] Dynamic import IIFE scheduled (execution is async)')
 try {
   bc = new BroadcastChannel(BROADCAST_CHANNEL);
   console.log('preprocessor.worker: BroadcastChannel created');
+  
+  // ============================================================================
+  // BC EVENT LISTENERS (Consumer Claims & Releases)
+  // ============================================================================
+  /**
+   * PROTOCOL EXPLANATION:
+   * 
+   * 1. ARTIFACT LIFECYCLE:
+   *    Producer creates → pins with TTL → broadcasts 'artifact:ready'
+   *    Consumer discovers → pins → broadcasts 'artifact:claimed'
+   *    Producer receives claim → cancels TTL (keeps pin as fallback)
+   *    Consumer finishes → unpins → broadcasts 'artifact:released'
+   *    Producer receives release → checks refcount → unpins if last owner
+   * 
+   * 2. TIMING SAFETY (addressing correctness observation):
+   *    - Consumer MUST: pin BEFORE broadcasting 'claimed'
+   *    - Producer cancelling TTL is OPTIMIZATION, not required for correctness
+   *    - If TTL fires before consumer pins: producer unpins → consumer pins → safe
+   *    - If consumer pins before TTL: consumer pin protects → TTL cancel avoids waste
+   * 
+   * 3. DUAL TTL MODEL:
+   *    - Storage-level TTL: Authoritative, survives worker death
+   *    - Worker-level TTL: Advisory optimization, faster proactive cleanup
+   *    - Both use same duration for consistency
+   * 
+   * 4. FEATURE FLAG (optional):
+   *    PREPROCESSOR_UNPIN_ON_CLAIM controls whether producer unpins on claim
+   *    (see Change 7 for flag definition)
+   */
+  bc.addEventListener('message', async (ev) => {
+    const data = ev.data || {};
+    
+    // ============================================================================
+    // IGNORE SELF-POSTED MESSAGES (prevent double-handling)
+    // ============================================================================
+    // BroadcastChannel delivers messages to sender too
+    // Check both 'source' and 'producer' fields for compatibility
+    if (data.source === 'preprocessor' || data.producer === 'preprocessor') {
+      return; // Skip - we sent this message
+    }
+    
+    // ============================================================================
+    // EVENT: artifact:claimed
+    // ============================================================================
+    /**
+     * Consumer has pinned artifact and is claiming ownership
+     * 
+     * FIELDS (backward compatible):
+     * - metaKey: Primary artifact key
+     * - claimedBy / consumer / claimant: Consumer identifier
+     * - derivedKeys: Optional array of child keys also claimed
+     * 
+     * ACTIONS:
+     * - Conservative mode (default): Cancel TTL, keep producer pin
+     * - Aggressive mode (UNPIN_ON_CLAIM=true): Unpin producer, cancel TTL
+     */
+    if (data.event === 'artifact:claimed') {
+      const metaKey = data.metaKey;
+      const claimedBy = data.claimedBy || data.consumer || data.claimant || 'unknown';
+      const derivedKeys = data.derivedKeys || [];
+      
+      if (!metaKey) {
+        console.warn('[PIN] artifact:claimed event missing metaKey', data);
+        return;
+      }
+      
+      // Check if UNPIN_ON_CLAIM flag is enabled (see Change 7)
+      const unpinOnClaim = typeof PREPROCESSOR_UNPIN_ON_CLAIM !== 'undefined' 
+        ? PREPROCESSOR_UNPIN_ON_CLAIM 
+        : false;
+      
+      if (unpinOnClaim) {
+        // ✅ AGGRESSIVE MODE: Unpin immediately to free memory
+        (async () => {
+          try {
+            const unpinFn = self.unpinArtifact || 
+                           (typeof storageAPI !== 'undefined' && storageAPI.unpinArtifact);
+            
+            if (typeof unpinFn === 'function') {
+              await unpinFn(metaKey, { owner: 'preprocessor' });
+              _cancelTTL(metaKey); // Cancel timer after successful unpin
+              
+              // Unpin derived keys too
+              for (const derivedKey of derivedKeys) {
+                await unpinFn(derivedKey, { owner: 'preprocessor' });
+                _cancelTTL(derivedKey);
+              }
+              
+              console.log(`[PIN] ✓ Unpinned ${metaKey.slice(0, 20)}... on claim by ${claimedBy} (aggressive mode)`);
+            }
+          } catch (err) {
+            console.warn(`[PIN] ✗ Aggressive unpin failed for ${metaKey.slice(0, 20)}...:`, err);
+            // Fallback: at least cancel timer to prevent double-unpin
+            _cancelTTL(metaKey);
+            derivedKeys.forEach(dk => _cancelTTL(dk));
+          }
+        })();
+      } else {
+        // ✅ CONSERVATIVE MODE: Cancel TTL only, keep producer pin as fallback
+        _cancelTTL(metaKey);
+        
+        // Cancel derived key TTLs
+        for (const derivedKey of derivedKeys) {
+          _cancelTTL(derivedKey);
+        }
+        
+        console.log(`[PIN] 🚫 TTL cancelled for ${metaKey.slice(0, 20)}... claimed by ${claimedBy} (conservative - keeping fallback pin)${derivedKeys.length > 0 ? ` + ${derivedKeys.length} children` : ''}`);
+      }
+    }
+    
+    // ============================================================================
+    // EVENT: artifact:released
+    // ============================================================================
+    /**
+     * Consumer has finished using artifact and unpinned
+     * Producer checks if it should also unpin (if no other consumers remain)
+     * 
+     * RACE CONDITION ANALYSIS (safe):
+     * Between getPins() check and unpinArtifact() call, another consumer might pin.
+     * OUTCOME: We still unpin preprocessor (refcount decrements by 1)
+     *          New consumer's pin keeps artifact protected (refcount still > 0)
+     * RESULT: Safe - reduces pinnedBytes opportunistically
+     *         No correctness failure even if race occurs
+     * 
+     * NOTE: Storage doesn't provide transaction-level check-then-unpin
+     *       This is acceptable - unpinning preprocessor early is optimization
+     */
+    if (data.event === 'artifact:released') {
+      const metaKey = data.metaKey;
+      const releasedBy = data.releasedBy || data.consumer || 'unknown';
+      
+      if (!metaKey) {
+        console.warn('[PIN] artifact:released event missing metaKey', data);
+        return;
+      }
+      
+      // Query current pins to decide if producer should unpin
+      (async () => {
+        try {
+          const getPinsFn = self.getPins || 
+                           (typeof storageAPI !== 'undefined' && storageAPI.getPins);
+          
+          if (typeof getPinsFn !== 'function') {
+            console.warn('[PIN] getPins not available, cannot check refcount');
+            return;
+          }
+          
+          const pins = await getPinsFn(metaKey);
+          
+          // If only preprocessor pin remains, unpin it
+          if (pins.length === 1 && pins[0].owner === 'preprocessor') {
+            const unpinFn = self.unpinArtifact || 
+                           (typeof storageAPI !== 'undefined' && storageAPI.unpinArtifact);
+            
+            if (typeof unpinFn === 'function') {
+              await unpinFn(metaKey, { owner: 'preprocessor' });
+              console.log(`[PIN] ✓ Released ${metaKey.slice(0, 20)}... (last consumer ${releasedBy} released - no pins remain)`);
+              
+              // Broadcast final unpin
+              if (bc) {
+                bc.postMessage({
+                  event: 'artifact:unpinned',
+                  metaKey,
+                  owner: 'preprocessor',
+                  reason: 'all_consumers_released',
+                  producer: 'preprocessor',
+                  source: 'preprocessor',
+                  timestamp: Date.now()
+                });
+              }
+            }
+          } else if (pins.length > 1) {
+            console.log(`[PIN] ⏸️  Keeping fallback pin for ${metaKey.slice(0, 20)}... (${pins.length - 1} other consumers remain after ${releasedBy} released)`);
+          } else if (pins.length === 0) {
+            console.log(`[PIN] ℹ️  ${metaKey.slice(0, 20)}... already fully unpinned (no action needed)`);
+          }
+        } catch (err) {
+          console.warn(`[PIN] ✗ Failed to check/release ${metaKey.slice(0, 20)}...:`, err);
+        }
+      })();
+    }
+    
+    // ============================================================================
+    // FUTURE: Additional BC events
+    // ============================================================================
+    // - pin:heartbeat: Consumer signals continued usage (extend TTL)
+    // - artifact:promote: Consumer requests work queue promotion
+    // - calibration:* events: Already handled below
+  });
+  
 } catch (err) {
   console.error('preprocessor.worker: Failed to create BroadcastChannel', err);
   bc = null;
@@ -263,6 +518,335 @@ async function _retryStoragePut(putFn, maxAttempts = 4, baseDelayMs = 150) {
   throw lastErr;
 }
 
+// ============================================================================
+// HELPER: Persist + Auto-Pin with TTL Management
+// ============================================================================
+/**
+ * Persist artifact to storage and immediately claim ownership with a pin.
+ * Implements the "producer pins on create" lifecycle pattern.
+ * 
+ * EXPLANATION:
+ * This is the CRITICAL helper that enforces ownership semantics:
+ * 
+ * 1. Persist artifact to IndexedDB via putInboundArtifact
+ * 2. Immediately pin with producer ownership (prevents eviction)
+ * 3. Schedule TTL auto-unpin timer (allows cleanup if unclaimed)
+ * 4. Broadcast pin event (allows consumers to discover and claim)
+ * 
+ * WHY THIS MATTERS:
+ * Without this, artifacts are created unpinned → immediately evictable → race condition.
+ * With this, artifacts are protected until:
+ *   - Consumer claims them (cancels TTL), OR
+ *   - TTL expires and no consumer claimed (auto-cleanup)
+ * 
+ * DUAL TTL MODEL:
+ * - Storage-level TTL (via pinArtifact ttlMs): Authoritative, survives worker death
+ * - Worker-level TTL (via setTimeout): Advisory optimization, faster cleanup
+ * - Both use same duration for consistency
+ * 
+ * ERROR HANDLING:
+ * - Persistence failure → throws (artifact not created)
+ * - Pin failure → warns but returns result (artifact exists but unprotected)
+ * 
+ * @param {Object} artifact - Artifact object to persist
+ * @param {Object} options - Pin configuration
+ * @param {string} options.owner - Pin owner identifier (default: 'preprocessor')
+ * @param {number} options.ttlMs - Time-to-live in ms (0 = no expiration)
+ * @param {string} options.pinType - 'soft' (evictable under pressure) or 'hard' (never evict)
+ * @returns {Promise<{ok, metaKey}>} Storage result with canonical metaKey
+ * @throws {Error} If persistence fails
+ */
+async function _persistAndPin(artifact, {
+  owner = 'preprocessor',
+  ttlMs = ARTIFACT_PIN_TTL_MS,
+  pinType = 'soft'
+} = {}) {
+  
+  // ============================================================================
+  // STEP 1: Persist artifact to IndexedDB (with retry on transient errors)
+  // ============================================================================
+  const putResult = await _retryStoragePut(async () => {
+    const putFn = self.putInboundArtifact || 
+                  (typeof storageAPI !== 'undefined' && storageAPI.putInboundArtifact);
+    
+    if (typeof putFn !== 'function') {
+      throw new Error('putInboundArtifact not available in worker context');
+    }
+    
+    return await putFn(artifact);
+  });
+  
+  // Validate storage returned a canonical metaKey
+  if (!putResult?.ok || !putResult.metaKey) {
+    throw new Error('Artifact persistence failed - no metaKey returned');
+  }
+  
+  const metaKey = putResult.metaKey;
+  
+  // ============================================================================
+  // STEP 2: Immediately claim ownership with pin
+  // ============================================================================
+  try {
+    const pinFn = self.pinArtifact || 
+                  (typeof storageAPI !== 'undefined' && storageAPI.pinArtifact);
+    
+    if (typeof pinFn !== 'function') {
+      console.warn(`[PIN] ⚠️  pinArtifact not available for ${metaKey.slice(0, 20)}... - ARTIFACT UNPROTECTED (will be immediately evictable)`);
+      return putResult;
+    }
+    
+    // CRITICAL: Pin with explicit owner to establish refcount
+    // ttlMs is passed to storage for authoritative TTL enforcement
+    await pinFn(metaKey, {
+      owner,
+      type: pinType,
+      ttlMs: ttlMs > 0 ? ttlMs : null // null = no storage-level expiration
+    });
+    
+    console.log(`[PIN] ✓ Claimed ${metaKey.slice(0, 20)}... (owner=${owner}, ttl=${ttlMs}ms, type=${pinType})`);
+    
+    // ============================================================================
+    // STEP 3: Schedule worker-level TTL auto-unpin (if ttlMs > 0)
+    // ============================================================================
+    // EXPLANATION: This is separate from storage pin TTL.
+    // - Storage pin TTL: Prevents eviction (authoritative)
+    // - Worker TTL: Schedules proactive cleanup (advisory optimization)
+    // 
+    // Worker timer can be cancelled by consumer claim → avoids redundant unpin
+    if (ttlMs > 0) {
+      _scheduleTTLUnpin(metaKey, owner, ttlMs);
+    }
+    
+    // ============================================================================
+    // STEP 4: Broadcast pin event for consumer discovery
+    // ============================================================================
+    if (bc) {
+      try {
+        bc.postMessage({
+          event: 'artifact:pinned',
+          metaKey,
+          owner,
+          claimedBy: owner, // BC protocol consistency
+          type: pinType,
+          ttlMs,
+          expiresAt: ttlMs > 0 ? Date.now() + ttlMs : null,
+          producer: 'preprocessor',
+          source: 'preprocessor', // For self-message filtering
+          timestamp: Date.now()
+        });
+      } catch (bcErr) {
+        console.warn('[PIN] BC broadcast failed (non-fatal):', bcErr);
+      }
+    }
+    
+  } catch (pinErr) {
+    console.error(`[PIN] ✗ Failed to pin ${metaKey.slice(0, 20)}...:`, pinErr);
+    // NON-FATAL: Artifact exists but unpinned (will be evictable immediately)
+    // We don't throw here because the artifact was successfully persisted.
+    // Consumers can still discover it via BC artifact:ready event.
+    // However, it may be evicted before they can claim it (race condition).
+  }
+  
+  return putResult;
+}
+
+// ============================================================================
+// TTL TIMER MANAGEMENT (Worker-Level Advisory Timers)
+// ============================================================================
+/**
+ * DUAL TTL MODEL EXPLANATION:
+ * 
+ * 1. STORAGE-LEVEL TTL (via pinArtifact ttlMs parameter):
+ *    - Stored in IndexedDB pins table with expiresAt timestamp
+ *    - Enforced by storage.js getPins() filtering expired pins
+ *    - Enforced by storage.js reaper (reapStaleRunning, eviction checks)
+ *    - AUTHORITATIVE for correctness (survives worker death)
+ * 
+ * 2. WORKER-LEVEL TTL (via setTimeout in _scheduleTTLUnpin):
+ *    - Stored in _pinnedArtifacts Map with timer handle
+ *    - ADVISORY optimization to avoid storage polling
+ *    - Allows producer to proactively unpin before storage GC
+ *    - Lost on worker crash (storage TTL takes over)
+ * 
+ * CONSISTENCY:
+ * Both TTLs use same duration (ARTIFACT_PIN_TTL_MS, CALIBRATION_PIN_TTL_MS)
+ * 
+ * FAILURE MODES:
+ * - Worker dies → worker timers lost → storage TTL still protects
+ * - Storage dies → worker timer fires but unpin fails → safe (idempotent)
+ * 
+ * WHY DUAL TIMERS:
+ * - Worker timers = fast proactive cleanup (reduces pinnedBytes early)
+ * - Storage TTL = guaranteed cleanup (correctness even if worker crashes)
+ */
+
+/**
+ * Schedule auto-unpin after TTL expires (cancellable by consumer claim)
+ * 
+ * LIFECYCLE:
+ * 1. Producer creates artifact → schedules TTL unpin
+ * 2. Consumer discovers artifact via BC → claims by pinning with own owner
+ * 3. Consumer sends 'artifact:claimed' BC event → producer cancels TTL
+ * 4. Consumer processes artifact → unpins when done
+ * 
+ * TIMEOUT SCENARIOS:
+ * - If consumer claims: Timer cancelled, producer keeps pin until consumer releases
+ * - If TTL expires unclaimed: Producer auto-unpins, artifact becomes evictable
+ * 
+ * @param {string} metaKey - Artifact key to schedule unpin for
+ * @param {string} owner - Pin owner (must match for unpin)
+ * @param {number} ttlMs - Time-to-live in milliseconds
+ */
+function _scheduleTTLUnpin(metaKey, owner, ttlMs) {
+  // Cancel existing timer if present (defensive - shouldn't happen normally)
+  _cancelTTL(metaKey);
+  
+  const timer = setTimeout(async () => {
+    try {
+      console.log(`[PIN] ⏰ TTL expired for ${metaKey.slice(0, 20)}..., auto-unpinning...`);
+      
+      const unpinFn = self.unpinArtifact || 
+                      (typeof storageAPI !== 'undefined' && storageAPI.unpinArtifact);
+      
+      if (typeof unpinFn === 'function') {
+        // CRITICAL: Must specify owner to decrement correct refcount
+        // If owner doesn't match, storage will return error (safe)
+        await unpinFn(metaKey, { owner });
+        console.log(`[PIN] ✓ Auto-unpinned ${metaKey.slice(0, 20)}... (TTL expired, unclaimed by consumers)`);
+        
+        // Broadcast enhanced unpin event with diagnostics
+        if (bc) {
+          // Query final refcount for diagnostics (optional)
+          let finalRefCount = null;
+          try {
+            const getPinRefCountFn = self.getPinRefCount || 
+                                     (typeof storageAPI !== 'undefined' && storageAPI.getPinRefCount);
+            if (typeof getPinRefCountFn === 'function') {
+              finalRefCount = await getPinRefCountFn(metaKey);
+            }
+          } catch (refErr) {
+            // Non-fatal - diagnostics only
+          }
+          
+          bc.postMessage({
+            event: 'artifact:ttl_unpinned', // Specific event name for TTL expiration
+            metaKey,
+            owner,
+            reason: 'ttl_expired',
+            producer: 'preprocessor',
+            source: 'preprocessor',
+            timestamp: Date.now(),
+            finalRefCount, // How many pins remain (should be 0)
+            wasUnclaimed: true // No consumer claimed before expiration
+          });
+        }
+      } else {
+        console.warn(`[PIN] ⚠️  unpinArtifact not available, cannot auto-unpin ${metaKey.slice(0, 20)}...`);
+      }
+      
+      // Remove from tracking map
+      _pinnedArtifacts.delete(metaKey);
+      
+    } catch (err) {
+      console.error(`[PIN] ✗ Auto-unpin failed for ${metaKey.slice(0, 20)}...:`, err);
+      // Non-fatal: Pin may have already been removed by consumer
+      // or storage may have garbage-collected it via its own TTL
+      // Ensure we still remove from tracking map to prevent leak
+      _pinnedArtifacts.delete(metaKey);
+    }
+  }, ttlMs);
+  
+  // Store timer handle for cancellation
+  _pinnedArtifacts.set(metaKey, {
+    pinnedAt: Date.now(),
+    ttlMs,
+    timer,
+    owner,
+    expiresAt: Date.now() + ttlMs
+  });
+  
+  console.log(`[PIN] ⏱️  Scheduled TTL for ${metaKey.slice(0, 20)}... (expires in ${(ttlMs / 1000).toFixed(1)}s)`);
+}
+
+/**
+ * Cancel TTL timer when consumer claims artifact
+ * 
+ * SAFE PROTOCOL (addressing correctness observation):
+ * Consumer should: (1) pin artifact, (2) broadcast 'artifact:claimed'
+ * Producer on receiving claim: cancel TTL to avoid redundant unpin
+ * 
+ * WHY THIS IS SAFE (race analysis):
+ * - If consumer pins BEFORE TTL fires → consumer pin protects artifact
+ * - If TTL fires BEFORE consumer pins → producer unpins (refcount=0 temporarily)
+ *   → consumer pins → refcount=1 → artifact protected
+ * - Storage refcount is atomic; no use-after-free possible
+ * 
+ * OPTIMIZATION:
+ * Cancelling TTL avoids unnecessary unpin operations and timer overhead.
+ * Not strictly required for correctness, but recommended for efficiency.
+ * 
+ * REAL RISK:
+ * Consumer broadcasting 'claimed' AFTER unpinning (consumer bug).
+ * Correct sequence: pin → claim → use → release → unpin
+ * 
+ * @param {string} metaKey - Artifact key to cancel timer for
+ */
+function _cancelTTL(metaKey) {
+  const entry = _pinnedArtifacts.get(metaKey);
+  
+  if (entry && entry.timer) {
+    clearTimeout(entry.timer);
+    console.log(`[PIN] 🚫 Cancelled TTL for ${metaKey.slice(0, 20)}... (claimed by consumer - avoiding redundant unpin)`);
+  }
+  
+  _pinnedArtifacts.delete(metaKey);
+}
+
+// ============================================================================
+// FEATURE FLAGS (Runtime Configuration)
+// ============================================================================
+/**
+ * PREPROCESSOR_UNPIN_ON_CLAIM:
+ * 
+ * Controls producer pin behavior when consumer claims artifact:
+ * 
+ * FALSE (conservative, default):
+ *   - Producer keeps pin as fallback until consumer releases
+ *   - Higher pinnedBytes but safer (protects against consumer bugs)
+ *   - Good for debugging and early deployment
+ *   - Recommended for development environments
+ * 
+ * TRUE (aggressive, memory-optimized):
+ *   - Producer unpins immediately on consumer claim
+ *   - Lower pinnedBytes (frees memory early)
+ *   - Requires consumers to be well-behaved (always pin before use)
+ *   - Can reduce memory pressure 
+ * 
+ * SETTING OPTIONS:
+ * 1. featureFlags BC message (dynamic, preferred)
+ * 2. Storage config (persistent)
+ * 3. Hardcoded for testing (below)
+ * 
+ * COMPATIBILITY:
+ * Works with both modes - consumers don't need to change behavior
+ */
+let PREPROCESSOR_UNPIN_ON_CLAIM = false;
+
+// Listen for feature flag updates via BC 
+// Listen for feature flag updates via BC
+if (bc) {
+  // Handler already added in BC listener - this is just for flag updates
+  const originalBCHandler = bc.onmessage;
+  bc.addEventListener('message', (ev) => {
+    const data = ev.data || {};
+    if (data.event === 'featureFlags:update' && data.flags) {
+      if (typeof data.flags.PREPROCESSOR_UNPIN_ON_CLAIM === 'boolean') {
+        PREPROCESSOR_UNPIN_ON_CLAIM = data.flags.PREPROCESSOR_UNPIN_ON_CLAIM;
+        console.log(`[CONFIG] PREPROCESSOR_UNPIN_ON_CLAIM = ${PREPROCESSOR_UNPIN_ON_CLAIM}`);
+      }
+    }
+  });
+}
 // ==================== UTILITY: Safe bitmap cloning ====================
 // CHANGE 2: NEW FUNCTION
 // PURPOSE: Safely clone ImageBitmaps that might be closed/transferred
@@ -745,13 +1329,13 @@ function initializeStorage() {
   console.warn('preprocessor.worker: initializeStorage() shim called — delegating to storageAPI.initStorage (module mode)');
   initializationStarted = true;
 
-  return storageAPI.initStorage({ quota: undefined, startEvictor: true })
+  return storageAPI.initStorage({ quota: 500 * 1024 * 1024, startEvictor: true })
     .then(() => {
       clearTimeout(initTimeout);
       storageReady = true;
       console.log('preprocessor.worker: Storage initialized successfully (via shim)');
 
-      try {
+  try {
         self.putInboundArtifact = storageAPI.putInboundArtifact.bind(storageAPI);
         self.getArtifact = storageAPI.getArtifact.bind(storageAPI);
         self.pinArtifact = storageAPI.pinArtifact.bind(storageAPI);
@@ -762,6 +1346,17 @@ function initializeStorage() {
         self.releaseReservation = storageAPI.releaseReservation.bind(storageAPI);
         self.checkQuotaAndEvict = storageAPI.checkQuotaAndEvict.bind(storageAPI);
         self.getStorageStats = storageAPI.getStorageStats.bind(storageAPI);
+        
+        // ============================================================================
+        // ✅ NEW: Bind pin lifecycle APIs (shim path)
+        // ============================================================================
+        self.getPins = storageAPI.getPins.bind(storageAPI);
+        self.getPinRefCount = storageAPI.getPinRefCount.bind(storageAPI);
+        self.touchArtifact = storageAPI.touchArtifact.bind(storageAPI);
+        self.fetchPartByKey = storageAPI.fetchPartByKey.bind(storageAPI);
+        
+        console.log('preprocessor.worker: ✓ Storage APIs bound (shim path, including pin lifecycle)');
+        
       } catch (bindErr) {
         console.warn('preprocessor.worker: failed to bind storageAPI methods to self', bindErr);
       }
@@ -1064,19 +1659,90 @@ async function processFrame({ jobId, meta = {}, imageBitmap, options = {} }) {
       createdAt: new Date().toISOString()
     };
 
-    // Persist thumbnail -> capture canonical key
+// ============================================================================
+    // ✅ CHANGE: Persist + Pin thumbnail (claim ownership with TTL)
+    // ============================================================================
     postMessage({ event: 'progress', jobId, stage: 'writing_thumb' });
-    if (typeof self.putInboundArtifact !== 'function') {
-      throw new Error('putInboundArtifact not available in worker context');
+    
+    // EXPLANATION: Use _persistAndPin instead of raw putInboundArtifact
+    // This ensures thumbnail is protected from eviction for ARTIFACT_PIN_TTL_MS (2 min)
+    // Consumers (MotionDetector, motion.worker) have 2 minutes to discover and claim
+    // 
+    // WHY THUMBNAIL IS CRITICAL:
+    // - Primary artifact consumers need for frame processing
+    // - Motion detection analyzes thumbnail for movement
+    // - HFH uses thumbnail dimensions for reconstruction
+    // - If evicted before consumption → frame processing fails
+    const thumbRes = await _persistAndPin({
+      type: 'thumbnail',
+      blob: thumbBlob,
+      meta: {
+        srcHash,
+        frameNumber,
+        timestamp,
+        sizeBytes: thumbBlob.size,
+        origin: 'preprocessor',
+        producerVersion,
+        dimensions: { width: w, height: h },
+        downsampleScale: downsampleScale !== 1.0 ? downsampleScale : undefined,
+        calibrationApplied: options.applyCalibration && CALIB && CALIB.isCalibrated,
+        calibrationKey: CALIB && CALIB.metaKey ? CALIB.metaKey : undefined,
+        cameraId: (meta.cameraContainer && meta.cameraContainer.cameraId) || meta.cameraId || 'unknown'
+      },
+      createdAt: new Date().toISOString()
+    }, {
+      owner: 'preprocessor',
+      ttlMs: ARTIFACT_PIN_TTL_MS, // 2 minutes
+      pinType: 'soft' // Evictable under extreme memory pressure
+    }).catch(e => { 
+      throw new Error('thumb persist+pin failed: ' + (e && e.message ? e.message : String(e))); 
+    });
+
+    const thumbKeyStored = thumbRes?.metaKey || null;
+    
+    if (!thumbKeyStored) {
+      throw new Error('Thumbnail persist returned no metaKey');
     }
 
-    const thumbRes = await self.putInboundArtifact(thumbArtifact).catch(e => { throw new Error('thumb persist failed: ' + (e && e.message ? e.message : String(e))); });
-    const thumbKeyStored = thumbRes?.metaKey || thumbArtifact.key || null;
-
-    // Persist phash -> capture canonical key
+// ============================================================================
+    // ✅ CHANGE: Persist + Pin phash
+    // ============================================================================
     postMessage({ event: 'progress', jobId, stage: 'writing_phash' });
-    const phashRes = await self.putInboundArtifact(phashArtifact).catch(e => { throw new Error('phash persist failed: ' + (e && e.message ? e.message : String(e))); });
-    const phashKeyStored = phashRes?.metaKey || phashArtifact.key || null;
+    
+    // EXPLANATION: Phash is used by motion detection and similarity search
+    // Must be protected while consumers query it for motion analysis
+    // 
+    // WHY PHASH IS CRITICAL:
+    // - Motion detector compares phash across frames to detect movement
+    // - Similarity search uses phash for frame deduplication
+    // - Small size (~100 bytes) but high reuse value
+    const phashRes = await _persistAndPin({
+      type: 'phash',
+      data: { phash, hashVersion, algorithm: 'aHash' },
+      meta: {
+        srcHash,
+        frameNumber,
+        timestamp,
+        producerVersion,
+        hashVersion,
+        sizeBytes: JSON.stringify({ phash, hashVersion, algorithm: 'aHash' }).length,
+        calibrationKey: CALIB && CALIB.metaKey ? CALIB.metaKey : undefined,
+        cameraId: (meta.cameraContainer && meta.cameraContainer.cameraId) || meta.cameraId || 'unknown'
+      },
+      createdAt: new Date().toISOString()
+    }, {
+      owner: 'preprocessor',
+      ttlMs: ARTIFACT_PIN_TTL_MS, // 2 minutes
+      pinType: 'soft'
+    }).catch(e => { 
+      throw new Error('phash persist+pin failed: ' + (e && e.message ? e.message : String(e))); 
+    });
+
+    const phashKeyStored = phashRes?.metaKey || null;
+    
+    if (!phashKeyStored) {
+      throw new Error('Phash persist returned no metaKey');
+    }
 
     // Update manifest keys with canonical keys reported by storage
     manifestArtifact.data.keys = [thumbKeyStored, phashKeyStored].filter(Boolean);
@@ -1088,10 +1754,33 @@ async function processFrame({ jobId, meta = {}, imageBitmap, options = {} }) {
       manifestArtifact.meta.sizeBytes = 0;
     }
 
-    // Persist manifest and capture canonical metaKey (this is the authoritative metaKey consumers should use)
+// ============================================================================
+    // ✅ CHANGE: Persist + Pin manifest (canonical frame metadata)
+    // ============================================================================
     postMessage({ event: 'progress', jobId, stage: 'writing_manifest' });
-    const manifestRes = await self.putInboundArtifact(manifestArtifact).catch(e => { throw new Error('manifest persist failed: ' + (e && e.message ? e.message : String(e))); });
-    const canonicalMetaKey = manifestRes?.metaKey || manifestArtifact.key || null;
+    
+    // EXPLANATION: Manifest is the CANONICAL artifact that ties everything together
+    // It contains keys to thumbnail, phash, and HFH data
+    // This is what consumers (MotionDetector, motion.worker) pin when claiming a frame
+    // 
+    // WHY MANIFEST IS CRITICAL:
+    // - Entry point for all frame processing
+    // - Contains references to all child artifacts
+    // - If evicted, consumers lose access to entire frame
+    // - Small size but highest importance in the artifact graph
+    const manifestRes = await _persistAndPin(manifestArtifact, {
+      owner: 'preprocessor',
+      ttlMs: ARTIFACT_PIN_TTL_MS, // 2 minutes
+      pinType: 'soft'
+    }).catch(e => { 
+      throw new Error('manifest persist+pin failed: ' + (e && e.message ? e.message : String(e))); 
+    });
+
+    const canonicalMetaKey = manifestRes?.metaKey || null;
+    
+    if (!canonicalMetaKey) {
+      throw new Error('Manifest persist returned no metaKey');
+    }
 
     const durationMs = Date.now() - startTime;
 
@@ -1173,6 +1862,7 @@ async function processFrame({ jobId, meta = {}, imageBitmap, options = {} }) {
                     event: 'calibration:unpin',
                     metaKey: toUnpin,
                     producer: 'preprocessor',
+                    source: 'preprocessor',
                     timestamp: Date.now()
                   });
                 } catch (bcErr) {
@@ -1383,49 +2073,77 @@ async function handleComputeCalibration({ jobId, frames, framesNeeded, resolutio
       }
     ];
 
-    // Persist child artifacts sequentially with retry
+// ============================================================================
+    // ✅ CHANGE: Persist + Pin calibration child artifacts with LONGER TTL
+    // ============================================================================
+    // EXPLANATION:
+    // Calibration artifacts are expensive to compute (5-10 seconds)
+    // and shared across many frames (reused until invalidated).
+    // 
+    // We use CALIBRATION_PIN_TTL_MS (5 minutes) instead of ARTIFACT_PIN_TTL_MS (2 min)
+    // because consumers may take longer to discover calibration:
+    // 1. MotionDetector must accumulate frames (10-30 frames @ 30fps = 0.3-1 sec)
+    // 2. motion.worker must start reconstruction job (queue + worker spawn = 1-2 sec)
+    // 3. Reconstruction worker must fetch calibration (storage lookup = 0.1 sec)
+    // 
+    // This longer TTL prevents premature eviction during discovery phase.
+    // Still uses 'soft' pin type → evictable under extreme memory pressure
+    
     for (const artifact of artifactsToPersist) {
       if (!artifact.blob) continue;
       
-      await _retryStoragePut(async () => {
-        const putFn = self.putInboundArtifact || 
-                      (typeof storageAPI !== 'undefined' && storageAPI.putInboundArtifact);
-        
-        if (typeof putFn !== 'function') {
-          throw new Error('putInboundArtifact not available in worker context');
-        }
-        
-        await putFn({
-          key: artifact.key,
-          type: artifact.type,
-          blob: artifact.blob,
-          meta: artifact.meta,
-          createdAt: new Date().toISOString()
-        });
+      await _persistAndPin({
+        key: artifact.key,
+        type: artifact.type,
+        blob: artifact.blob,
+        meta: artifact.meta,
+        createdAt: new Date().toISOString()
+      }, {
+        owner: 'preprocessor',
+        ttlMs: CALIBRATION_PIN_TTL_MS, // 5 minutes (longer for expensive calibration)
+        pinType: 'soft' // Still evictable under extreme pressure
       });
     }
 
-    // Persist meta manifest LAST (atomic commit point)
-    await _retryStoragePut(async () => {
-      const putFn = self.putInboundArtifact || 
-                    (typeof storageAPI !== 'undefined' && storageAPI.putInboundArtifact);
-      
-      if (typeof putFn !== 'function') {
-        throw new Error('putInboundArtifact not available for manifest');
-      }
-      
-      await putFn({
-        key: metaKey,
-        type: 'calibration.meta',
-        data: manifestData,
-        meta: {
-          producer: 'preprocessor',
-          calibVersion: 'calib-v1',
-          artifactKeys: [darkKey, flatKey, biasKey, calibratedKey],
-          createdAt: new Date().toISOString()
-        },
+    // ============================================================================
+    // ✅ CHANGE: Persist + Pin meta with HARD pin (NO auto-unpin)
+    // ============================================================================
+    // EXPLANATION:
+    // calibration.meta is the CANONICAL entry point for calibration data.
+    // It's tiny (~1KB) but CRITICAL - without it, all calibration children are orphaned.
+    // 
+    // We use HARD pin (never evict) + ttlMs=0 (no auto-unpin) because:
+    // 1. It's small - doesn't contribute to memory pressure (~1KB)
+    // 2. It's long-lived - valid until user invalidates calibration
+    // 3. It's critical - losing it orphans expensive child artifacts
+    // 4. Manual lifecycle - only unpinned via invalidateCalibration()
+    // 
+    // HARD PIN BEHAVIOR:
+    // - Storage will NEVER evict this artifact, even under extreme memory pressure
+    // - Only removable via explicit unpinArtifact(metaKey, {owner: 'preprocessor'})
+    // - Ensures calibration metadata survives for entire session
+    // 
+    // TTL=0 BEHAVIOR:
+    // - No worker-level timer scheduled (no auto-unpin)
+    // - No storage-level expiration (ttlMs: null)
+    // - Pin persists until manual cleanup
+    
+    await _persistAndPin({
+      key: metaKey,
+      type: 'calibration.meta',
+      data: manifestData,
+      meta: {
+        producer: 'preprocessor',
+        source: 'preprocessor',
+        calibVersion: 'calib-v1',
+        artifactKeys: [darkKey, flatKey, biasKey, calibratedKey],
         createdAt: new Date().toISOString()
-      });
+      },
+      createdAt: new Date().toISOString()
+    }, {
+      owner: 'preprocessor',
+      pinType: 'hard', // ✅ HARD pin - NEVER evict (even under memory pressure)
+      ttlMs: CALIBRATION_META_TTL_MS // ✅ 0 = NO auto-unpin (manual lifecycle only)
     });
 
     postMessage({ event: 'progress', jobId, stage: 'finalization' });
@@ -1435,18 +2153,19 @@ async function handleComputeCalibration({ jobId, frames, framesNeeded, resolutio
     CALIB.meta = manifestData;
     CALIB.metaRefCount = 1;
     
-    console.log(`CALIB: Calibration persisted successfully. metaKey=${metaKey}, calibratedFrameKey=${calibratedKey}`);
-
-    // Pin meta artifact (prevents premature eviction)
-    try {
-      const pinFn = self.pinArtifact || 
-                    (typeof storageAPI !== 'undefined' && storageAPI.pinArtifact);
-      if (typeof pinFn === 'function') {
-        await pinFn(metaKey, { owner: 'preprocessor', type: 'soft' });
-      }
-    } catch (pinErr) {
-      console.warn('handleComputeCalibration: pinArtifact failed (non-fatal)', pinErr);
-    }
+    // ============================================================================
+    // ✅ NEW: Store child keys for cleanup on invalidate
+    // ============================================================================
+    // EXPLANATION:
+    // When invalidateCalibration() is called, we need to:
+    // 1. Cancel TTL timers for all children (prevent orphaned timers)
+    // 2. Unpin all children (free memory)
+    // 
+    // Without this array, we'd have to parse manifestData.artifactKeys every time
+    // Storing here makes cleanup code simpler and more robust
+    CALIB.childKeys = [darkKey, flatKey, biasKey, calibratedKey];
+    
+    console.log(`CALIB: Calibration persisted successfully. metaKey=${metaKey}, calibratedFrameKey=${calibratedKey}, childKeys=${CALIB.childKeys.length}`);
 
     // Generate release token
     let releaseToken = null;
@@ -1481,6 +2200,7 @@ async function handleComputeCalibration({ jobId, frames, framesNeeded, resolutio
           meta: manifestData,
           releaseToken,
           producer: 'preprocessor',
+          source: 'preprocessor',
           timestamp: Date.now()
         });
         console.log('preprocessor.worker: Broadcasted calibration:ready with calibratedFrameKey');
@@ -1507,6 +2227,7 @@ async function handleComputeCalibration({ jobId, frames, framesNeeded, resolutio
           jobId, 
           error: String(err), 
           producer: 'preprocessor', 
+          source: 'preprocessor',
           timestamp: Date.now() 
         });
       } catch (bcErr) {}
@@ -1611,6 +2332,7 @@ self.onmessage = async (ev) => {
               meta,
               releaseToken,
               producer: 'preprocessor',
+              source: 'preprocessor',
               timestamp: Date.now()
             });
             console.log('preprocessor.worker: broadcasted calibration:fetched', canonicalKey);
@@ -1634,6 +2356,7 @@ self.onmessage = async (ev) => {
               metaKey: msg.metaKey || null,
               error: String(fErr),
               producer: 'preprocessor',
+              source: 'preprocessor',
               timestamp: Date.now()
             });
           } catch (bcErr) {
@@ -1669,7 +2392,7 @@ self.onmessage = async (ev) => {
               console.log(`CALIB: Unpinned pending key ${toUnpin} after release`);
               if (bc) {
                 try {
-                  bc.postMessage({ event: 'calibration:unpin', metaKey: toUnpin, producer: 'preprocessor', timestamp: Date.now() });
+                  bc.postMessage({ event: 'calibration:unpin', metaKey: toUnpin, producer: 'preprocessor', source: 'preprocessor', timestamp: Date.now() });
                 } catch (bcErr) {
                   console.warn('preprocessor.worker: broadcast calibration:unpin failed', bcErr);
                 }
@@ -1686,7 +2409,7 @@ self.onmessage = async (ev) => {
 
         try {
           if (bc) {
-            bc.postMessage({ event: 'calibration:released', token, metaKey: key, producer: 'preprocessor', timestamp: Date.now() });
+            bc.postMessage({ event: 'calibration:released', token, metaKey: key, producer: 'preprocessor', source: 'preprocessor', timestamp: Date.now() });
             console.log('preprocessor.worker: broadcasted calibration:released', key);
           }
         } catch (bcErr) {
@@ -1698,7 +2421,7 @@ self.onmessage = async (ev) => {
         postMessage({ event: 'calibration:release_error', token: msg.token, error: String(err) });
         if (bc) {
           try {
-            bc.postMessage({ event: 'calibration:release_error', token: msg.token, error: String(err), producer: 'preprocessor', timestamp: Date.now() });
+            bc.postMessage({ event: 'calibration:release_error', token: msg.token, error: String(err), producer: 'preprocessor', source: 'preprocessor', timestamp: Date.now() });
           } catch (bcErr) {
             console.warn('preprocessor.worker: failed to broadcast calibration:release_error', bcErr);
           }
@@ -1707,23 +2430,88 @@ self.onmessage = async (ev) => {
 
     } else if (msg.op === 'invalidateCalibration') {
       const oldMetaKey = CALIB.metaKey;
+      const oldMeta = CALIB.meta;
+      const childKeys = CALIB.childKeys || []; // Use stored child keys
+      
+      // ============================================================================
+      // ✅ FIX: Cancel TTL for meta AND all children
+      // ============================================================================
+      // EXPLANATION: Calibration creates 5 artifacts:
+      // - calibration.meta (no TTL - hard pin, but still track for consistency)
+      // - calib-dark, calib-flat, calib-bias, calib-calibrated (5min TTL each)
+      // 
+      // CRITICAL: Must cancel timers for ALL to prevent orphaned unpins
+      
       if (oldMetaKey) {
+        _cancelTTL(oldMetaKey); // Cancel meta timer (if any - shouldn't exist for hard pins)
+        
+        // Cancel child timers using stored keys
+        if (childKeys.length > 0) {
+          for (const childKey of childKeys) {
+            _cancelTTL(childKey);
+            console.log(`[PIN] 🗑️  Cancelled TTL for calibration child: ${childKey.slice(0, 20)}...`);
+          }
+        } else if (oldMeta && Array.isArray(oldMeta.artifactKeys)) {
+          // Fallback: use meta.artifactKeys if childKeys not stored
+          for (const childKey of oldMeta.artifactKeys) {
+            _cancelTTL(childKey);
+            console.log(`[PIN] 🗑️  Cancelled TTL for calibration child (fallback): ${childKey.slice(0, 20)}...`);
+          }
+        }
+        
+        // ============================================================================
+        // Unpin preprocessor ownership (deferred if in-flight usage)
+        // ============================================================================
         if (CALIB.metaRefCount && CALIB.metaRefCount > 0) {
           CALIB.pendingUnpinKey = oldMetaKey;
-          console.log(`invalidateCalibration: deferring unpin of ${oldMetaKey} until metaRefCount reaches 0 (currently ${CALIB.metaRefCount})`);
+          console.log(`invalidateCalibration: deferring unpin of ${oldMetaKey.slice(0, 20)}... until metaRefCount reaches 0 (currently ${CALIB.metaRefCount})`);
         } else {
+          // Unpin meta immediately
           try {
-            await self.unpinArtifact(oldMetaKey);
-            console.log(`invalidateCalibration: unpinned ${oldMetaKey}`);
-            if (bc) {
-              try {
-                bc.postMessage({ event: 'calibration:unpin', metaKey: oldMetaKey, producer: 'preprocessor', timestamp: Date.now() });
-              } catch (bcErr) {
-                console.warn('preprocessor.worker: broadcast calibration:unpin failed', bcErr);
-              }
+            const unpinFn = self.unpinArtifact || 
+                           (typeof storageAPI !== 'undefined' && storageAPI.unpinArtifact);
+            
+            if (typeof unpinFn === 'function') {
+              await unpinFn(oldMetaKey, { owner: 'preprocessor' });
+              console.log(`[PIN] ✓ Unpinned calibration meta ${oldMetaKey.slice(0, 20)}... (invalidated)`);
             }
           } catch (unpErr) {
-            console.warn('invalidateCalibration: unpinArtifact failed', unpErr);
+            console.warn('invalidateCalibration: meta unpin failed (may already be unpinned)', unpErr);
+          }
+          
+          // Unpin children (consumers may still hold pins - only removes preprocessor pin)
+          const unpinFn = self.unpinArtifact || 
+                         (typeof storageAPI !== 'undefined' && storageAPI.unpinArtifact);
+          
+          if (typeof unpinFn === 'function') {
+            const keysToUnpin = childKeys.length > 0 
+              ? childKeys 
+              : (oldMeta && Array.isArray(oldMeta.artifactKeys) ? oldMeta.artifactKeys : []);
+            
+            for (const childKey of keysToUnpin) {
+              try {
+                await unpinFn(childKey, { owner: 'preprocessor' });
+                console.log(`[PIN] ✓ Unpinned calibration child ${childKey.slice(0, 20)}...`);
+              } catch (childErr) {
+                console.warn(`invalidateCalibration: child unpin failed for ${childKey.slice(0, 20)}...`, childErr);
+              }
+            }
+          }
+          
+          // Broadcast unpin event
+          if (bc) {
+            try {
+              bc.postMessage({ 
+                event: 'calibration:invalidated', 
+                metaKey: oldMetaKey, 
+                childKeys: childKeys.length > 0 ? childKeys : (oldMeta?.artifactKeys || []),
+                producer: 'preprocessor', 
+                source: 'preprocessor',
+                timestamp: Date.now() 
+              });
+            } catch (bcErr) {
+              console.warn('preprocessor.worker: broadcast calibration:invalidated failed', bcErr);
+            }
           }
         }
       }
@@ -1732,6 +2520,7 @@ self.onmessage = async (ev) => {
 
       CALIB.metaKey = null;
       CALIB.meta = null;
+      CALIB.childKeys = null; // ✅ Clear stored child keys
 
       postMessage({ 
         event: 'calibration:invalidated',
@@ -1740,7 +2529,7 @@ self.onmessage = async (ev) => {
 
       try {
         if (bc) {
-          bc.postMessage({ event: 'calibration:invalidated', metaKey: oldMetaKey || null, producer: 'preprocessor', timestamp: Date.now() });
+          bc.postMessage({ event: 'calibration:invalidated', metaKey: oldMetaKey || null, producer: 'preprocessor', source: 'preprocessor', timestamp: Date.now() });
           console.log('preprocessor.worker: broadcasted calibration:invalidated', oldMetaKey);
         }
       } catch (bcErr) {
@@ -1755,11 +2544,31 @@ self.onmessage = async (ev) => {
       });
       
     } else if (msg.op === 'shutdown') {
+      // Clean up queued frames
       pendingFrames.forEach(({ imageBitmap }) => {
         try { imageBitmap.close(); } catch (e) {}
       });
       pendingFrames.length = 0;
       
+      // ============================================================================
+      // ✅ FIX: Clear all TTL timers before shutdown
+      // ============================================================================
+      // EXPLANATION: Worker shutdown doesn't automatically clear setTimeout timers
+      // If worker stays alive (rare but possible in some environments), timers would leak  
+      console.log(`[PIN] 🧹 Clearing ${_pinnedArtifacts.size} TTL timers on shutdown...`);
+      
+      for (const [metaKey, entry] of _pinnedArtifacts.entries()) {
+        if (entry.timer) {
+          try {
+            clearTimeout(entry.timer);
+          } catch (e) {
+            console.warn(`[PIN] Failed to clear timer for ${metaKey.slice(0, 20)}...`, e);
+          }
+        }
+      }
+      _pinnedArtifacts.clear();
+      
+      // Invalidate calibration (includes its own timer cleanup now from Change 14)
       CALIB.invalidateCalibration();
       
       try { if (bc) bc.close(); } catch (e) {}
@@ -1780,7 +2589,7 @@ self.onmessage = async (ev) => {
     });
     if (bc) {
       try {
-        bc.postMessage({ event: 'worker:error', error: String(err), stack: err.stack, producer: 'preprocessor', timestamp: Date.now() });
+        bc.postMessage({ event: 'worker:error', error: String(err), stack: err.stack, producer: 'preprocessor', source: 'preprocessor', timestamp: Date.now() });
       } catch (bcErr) {
         console.warn('preprocessor.worker: broadcast worker:error failed', bcErr);
       }
