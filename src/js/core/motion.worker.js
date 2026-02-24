@@ -298,6 +298,12 @@ let _tetrachromacy = null;
 let _directionalLifting = null;
 let _gpuCapabilities = null;
 
+// --- Stage 0: computed once when DirectionalLifting is first instantiated ---
+// Derived from bufferSize × frameInterval × geometric decay sum.
+// Written by _getDirectionalLifting(), broadcast in RECON_DONE payload
+// so main.js can update cameraContainer.plenopticSampling.effectiveWindowMs.
+let _effectiveWindowMs = null;
+
 // Configuration: integers and thresholds can be overridden via _flags
 const DEFAULTS = {
   heartbeatIntervalMs: 20_000,     // worker heartbeat to storage
@@ -1281,19 +1287,47 @@ function _getTetrachromacy() {
   return _tetrachromacy;
 }
 
-async function _getDirectionalLifting(resolution) {
+async function _getDirectionalLifting(resolution, frameRateHz = null) {
   if (!_directionalLifting) {
     const bufferSize = _getDirectionalLiftingBufferSize(resolution);
+    const decayFactor = 0.8;
     
     _directionalLifting = new DirectionalLifting({
       bufferSize,
       weightingMode: 'exponential',
-      decayFactor: 0.8,
+      decayFactor,
       enableDerivatives: true,
       debug: _flags.dirLiftDebug || false
     });
+
+    // --- Stage 0: compute effectiveWindowMs ---
+    // Priority order for frameRate source:
+    // 1. frameRateHz argument — passed from manifest.data.plenopticContext.frameRate,
+    //    which was snapshotted by FrameEvictionHook._enhanceMetadata() at capture time.
+    //    This is the authoritative value: it reflects the actual camera, is available
+    //    synchronously, and needs no await or flags bridge.
+    // 2. _flags.frameRateHz — only present if something explicitly bridges camera
+    //    metadata into feature flags (not currently done). Kept as a secondary fallback.
+    // 3. 30fps — only if neither of the above is available (e.g. synthetic/file sources
+    //    that genuinely have no declared frame rate).
+    const resolvedFrameRateHz =
+      (Number.isFinite(frameRateHz) && frameRateHz > 0) ? frameRateHz :
+      (Number.isFinite(_flags.frameRateHz) && _flags.frameRateHz > 0) ? _flags.frameRateHz :
+      30;
+    const frameIntervalMs = 1000 / resolvedFrameRateHz;
+    const geometricSum = (1 - Math.pow(decayFactor, bufferSize)) / (1 - decayFactor);
+    _effectiveWindowMs = frameIntervalMs * geometricSum;
+    // --- End Stage 0 ---
     
-    console.log(`motion.worker: DirectionalLifting initialized with bufferSize=${bufferSize}, resolution=${resolution}`);
+    console.log(
+      `motion.worker: DirectionalLifting initialized — ` +
+      `bufferSize=${bufferSize}, resolution=${resolution}, ` +
+      `frameRateHz=${resolvedFrameRateHz} (source: ${
+        (Number.isFinite(frameRateHz) && frameRateHz > 0) ? 'manifest.plenopticContext' :
+        (Number.isFinite(_flags.frameRateHz) && _flags.frameRateHz > 0) ? '_flags' :
+        'fallback-30fps'
+      }), effectiveWindowMs=${_effectiveWindowMs.toFixed(1)}ms`
+    );
   }
   return _directionalLifting;
 }
@@ -1919,7 +1953,11 @@ async function _computeDepthNormalsFlux(frameBitmap, calibData, options = {}) {
 
     if (_flags.enableDirectionalLifting !== false) {
       try {
-        const dirLift = await _getDirectionalLifting(gridSize);
+        // Pass frameRate from the manifest's plenopticContext snapshot.
+        // options.plenopticContext is populated by _handleReconstructMeta
+        // from manifest.data.plenopticContext before calling _computeDepthNormalsFlux.
+        const manifestFrameRate = options.plenopticContext?.frameRate ?? null;
+        const dirLift = await _getDirectionalLifting(gridSize, manifestFrameRate);
         
         liftResult = await dirLift.process(
           tetraField,
@@ -2871,7 +2909,10 @@ console.log('[STAGE4] Final calibData state before depth computation:', {
         resolution: options.resolution || chosenRes,
         quality: options.priority > 50 ? 'high' : 'medium',
         priority: options.priority,
-        storageWrapper: storageWrapper
+        storageWrapper: storageWrapper,
+        // Pass plenopticContext from manifest so _getDirectionalLifting
+        // receives the actual camera frameRate without depending on _flags.
+        plenopticContext: manifest.data.plenopticContext ?? null
       }
     );
 
@@ -3044,6 +3085,12 @@ console.log('[STAGE4] Final calibData state before depth computation:', {
         cameraContainer: cameraContainer || undefined,
         priority: options.priority || 50,
         resolution: options.resolution,
+        // --- Stage 0: sampling context fields ---
+        // Mirror of the RECON_DONE broadcast fields so the persisted record
+        // matches what main.js receives and writes into the container.
+        reconstructionResolution: depthMap ? depthMap.resolution : (options.resolution || null),
+        effectiveWindowMs: _effectiveWindowMs,
+        // --- End Stage 0 ---
         stages: telemetry.stages,
         modules: telemetry.modules, // Include per-module telemetry
         processingMs: processingMs,
@@ -3125,13 +3172,31 @@ console.log('[STAGE4] Final calibData state before depth computation:', {
     // ========================================
     // STAGE 12: Reply & Broadcast RECON_DONE
     // ========================================
-    const replyPayload = {
+const replyPayload = {
       event: 'RECON_DONE',
       msgId: generateMsgId(),
       jobId,
       metaKey,
       derivedKeys,
       cached: false,
+
+      // --- Stage 0: container writeback fields ---
+      // cameraId: used by main.js _updateCameraContainer handler to match
+      //   against this.cameraContainer.cameraId before applying update.
+      cameraId: cameraId || null,
+      // reconstructionResolution: first concrete resolution used in a
+      //   completed reconstruction — written into
+      //   differentialGeometry.reconstructionResolution. Represents the
+      //   grid size at which the mathematical pipeline operated, not the
+      //   input frame size.
+      reconstructionResolution: depthMap ? depthMap.resolution : (options.resolution || null),
+      // effectiveWindowMs: temporal integration window of DirectionalLifting
+      //   in wall-clock milliseconds. null until first DirectionalLifting
+      //   instantiation completes. Written into
+      //   plenopticSampling.effectiveWindowMs.
+      effectiveWindowMs: _effectiveWindowMs,
+      // --- End Stage 0 fields ---
+
       telemetry: {
         processingMs,
         depthResolution: depthMap ? depthMap.resolution : null,
@@ -3139,9 +3204,9 @@ console.log('[STAGE4] Final calibData state before depth computation:', {
         hasFlux: !!fluxData,
         fallback: depthMap ? depthMap.fallback || false : true,
         stages: telemetry.stages,
-        modules: telemetry.modules, // ✅ Include module-level telemetry
+        modules: telemetry.modules,
         errors: telemetry.errors,
-        warnings: telemetry.warnings // ✅ Include warnings
+        warnings: telemetry.warnings
       }
     };
 

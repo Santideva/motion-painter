@@ -86,6 +86,47 @@ class CameraContainer {
     if (kind === 'local' && !this.stream && !this.videoElement) {
       console.warn('CameraContainer: local camera created without stream or videoElement');
     }
+
+    // Plenoptic sampling descriptor sub-objects ---
+    // All fields start null or with safe defaults.
+    // Populated progressively: startCamera() fills what getSettings() knows,
+    // motion.worker writeback fills reconstructionResolution + effectiveWindowMs,
+    // AmbiAnamorph (Stage 5) fills ambiFrame fields.
+
+    this.differentialGeometry = {
+      orientationConvention: 'CCW',   // 'CCW' rear-facing | 'CW' front-facing (mirrored)
+      reconstructionResolution: null, // set after first motion.worker reconstruction
+      pipelineVersion: '1.0'          // increment when pipeline changes affect output space
+    };
+
+    this.plenopticSampling = {
+      // Physical instrument — populated at startCamera() from getCapabilities()/getSettings()
+      nativeWidthPx:  null,           // capabilities.width.max  (definitive sensor max)
+      nativeHeightPx: null,           // capabilities.height.max (definitive sensor max)
+      activeWidthPx:  null,           // settings.width  (currently active capture size)
+      activeHeightPx: null,           // settings.height
+      frameRate:      null,           // settings.frameRate
+      spectralModel:  'srgb',         // settings.colorSpace — 'srgb' | 'display-p3'
+      angularApertureSr: null,        // null until FOV known (program inference or native binary)
+      shutterType:    'rolling',      // CMOS universal default; 'global' only if declared
+
+      // Temporal — set at startCamera() and updated after first reconstruction
+      temporalEpochUTC:     null,     // Date.now() at stream acquisition
+      effectiveWindowMs:    null,     // set from DirectionalLifting config by motion.worker
+      clockDriftPpmEstimate: 0,       // updated by cross-device sync when available
+
+      // Spectral processing state — updated when Tetrachromacy runs
+      tetrachromaticExpanded: false
+    };
+
+    this.ambiFrame = {
+      // All null until AmbiAnamorph runs (Stage 5)
+      worldFrameId:          null,
+      legibilityScore:       null,
+      viewManifoldComponent: null,
+      positionInManifold:    null,
+      sharedStructureId:     null
+    };
   }
 
   _generateCameraId(kind, deviceId) {
@@ -301,7 +342,65 @@ export class MediaInput {
       });
       cam.status = 'ready';
 
-this.sources.set(cam.cameraId, cam);
+      // --- Stage 0: Populate plenopticSampling and differentialGeometry ---
+      // getCapabilities() gives definitive hardware maximums.
+      // Not available in Firefox or some mobile WebViews — null-coalesce safely.
+      try {
+        const track = stream.getVideoTracks()[0];
+        const settings = track.getSettings();
+        const capabilities = (typeof track.getCapabilities === 'function')
+          ? track.getCapabilities()
+          : {};
+
+        // Orientation convention: front-facing cameras are mirrored by browser APIs,
+        // producing CW winding numbers vs CCW for rear-facing. This is geometric fact,
+        // not heuristic — it determines winding number sign interpretation downstream.
+        cam.differentialGeometry.orientationConvention =
+          (settings.facingMode === 'user') ? 'CW' : 'CCW';
+
+        // Native sensor resolution — definitively known from capabilities.
+        // Falls back to active settings if getCapabilities() unavailable.
+        cam.plenopticSampling.nativeWidthPx  = capabilities.width?.max  ?? settings.width  ?? null;
+        cam.plenopticSampling.nativeHeightPx = capabilities.height?.max ?? settings.height ?? null;
+
+        // Active capture dimensions — what the stream is actually delivering
+        cam.plenopticSampling.activeWidthPx  = settings.width  ?? null;
+        cam.plenopticSampling.activeHeightPx = settings.height ?? null;
+
+        // Frame rate — used to compute effectiveWindowMs in motion.worker
+        cam.plenopticSampling.frameRate = settings.frameRate ?? preferFrameRate ?? null;
+
+        // Spectral model — declared standard value from stream encoding.
+        // 'srgb' is mandatory baseline for all browser video pipelines; safe default.
+        cam.plenopticSampling.spectralModel = settings.colorSpace || 'srgb';
+
+        // Temporal epoch — wall clock at the moment the stream was acquired
+        cam.plenopticSampling.temporalEpochUTC = Date.now();
+
+        // angularApertureSr remains null — populated later via:
+        //   (a) program inference from curvature consistency (after Stage 1), or
+        //   (b) native binary query (V4L2/AVFoundation/Camera2)
+        // Both paths write back via _updateCameraContainer() re-freeze protocol.
+
+        console.log('[Stage0] CameraContainer plenoptic sampling populated:', {
+          cameraId: cam.cameraId,
+          orientationConvention: cam.differentialGeometry.orientationConvention,
+          nativeWidthPx:  cam.plenopticSampling.nativeWidthPx,
+          nativeHeightPx: cam.plenopticSampling.nativeHeightPx,
+          activeWidthPx:  cam.plenopticSampling.activeWidthPx,
+          activeHeightPx: cam.plenopticSampling.activeHeightPx,
+          frameRate:      cam.plenopticSampling.frameRate,
+          spectralModel:  cam.plenopticSampling.spectralModel,
+          capabilities_available: typeof track.getCapabilities === 'function'
+        });
+
+      } catch (trackErr) {
+        // Non-fatal — container retains null defaults if track inspection fails
+        console.warn('[Stage0] Failed to populate plenoptic sampling from track:', trackErr);
+      }
+      // --- End Stage 0 population ---
+
+  this.sources.set(cam.cameraId, cam);
       this.activeCameraId = cam.cameraId;
 
       if (createdLocalVideo) {

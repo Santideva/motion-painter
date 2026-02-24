@@ -528,11 +528,37 @@ export class FrameEvictionHook {
     return false;
   }
 
-    _enhanceMetadata(meta) {
+  _enhanceMetadata(meta) {
     // Prefer stored camera container, fallback to meta
     const cameraContainer = this.cameraContainer || 
                            (meta && meta.cameraContainer ? meta.cameraContainer : null) ||
                            (meta && meta.cameraId ? { cameraId: meta.cameraId } : null);
+
+    // snapshot plenoptic sampling context at capture time ---
+    // These are frozen snapshots of the container state *at the moment of eviction*.
+    // The container may be re-frozen later (e.g. after RECON_DONE writeback), so
+    // snapshotting here ensures each frame's metadata accurately reflects what was
+    // known when the frame was captured — not some later updated state.
+    // Optional chaining throughout: if container or sub-objects are absent, fields
+    // default to null/safe values and downstream consumers degrade gracefully.
+
+    const plenopticContext = cameraContainer ? Object.freeze({
+      spectralModel:          cameraContainer.plenopticSampling?.spectralModel          ?? 'srgb',
+      frameRate:              cameraContainer.plenopticSampling?.frameRate              ?? null,
+      effectiveWindowMs:      cameraContainer.plenopticSampling?.effectiveWindowMs      ?? null,
+      temporalEpochUTC:       cameraContainer.plenopticSampling?.temporalEpochUTC       ?? null,
+      tetrachromaticExpanded: cameraContainer.plenopticSampling?.tetrachromaticExpanded ?? false,
+      angularApertureSr:      cameraContainer.plenopticSampling?.angularApertureSr      ?? null,
+      capturedAt: Date.now()
+    }) : null;
+
+    const differentialGeometryAtCapture = cameraContainer ? Object.freeze({
+      orientationConvention:    cameraContainer.differentialGeometry?.orientationConvention    ?? 'CCW',
+      reconstructionResolution: cameraContainer.differentialGeometry?.reconstructionResolution ?? null,
+      pipelineVersion:          cameraContainer.differentialGeometry?.pipelineVersion          ?? '1.0',
+      capturedAt: Date.now()
+    }) : null;
+    // --- End Stage 0 snapshots ---
 
     return {
       ...meta,
@@ -541,7 +567,11 @@ export class FrameEvictionHook {
       captureTime: Date.now(),
       downsampleScale: this.downsampleScale,
       priority: this._calculateFramePriority(meta),
-      systemLoad: this._getSystemLoad()
+      systemLoad: this._getSystemLoad(),
+
+      // Stage 0: plenoptic sampling context snapshots
+      plenopticContext,
+      differentialGeometryAtCapture
     };
   }
 

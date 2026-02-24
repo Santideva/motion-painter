@@ -423,6 +423,45 @@ class MotionPainter {
           deviceId: container.deviceId || null,
           status: container.status || 'unknown',
           meta: container.meta || {},
+
+          // --- Stage 0: plenoptic sampling descriptor sub-objects ---
+          // Spread from container instance (populated by startCamera()).
+          // Fallback objects mirror CameraContainer constructor defaults so
+          // file/synthetic sources that skip track inspection still produce
+          // a valid, consistent container.
+          differentialGeometry: Object.freeze({
+            ...(container.differentialGeometry || {
+              orientationConvention: 'CCW',
+              reconstructionResolution: null,
+              pipelineVersion: '1.0'
+            })
+          }),
+          plenopticSampling: Object.freeze({
+            ...(container.plenopticSampling || {
+              nativeWidthPx: null,
+              nativeHeightPx: null,
+              activeWidthPx: null,
+              activeHeightPx: null,
+              frameRate: null,
+              spectralModel: 'srgb',
+              angularApertureSr: null,
+              shutterType: 'rolling',
+              temporalEpochUTC: null,
+              effectiveWindowMs: null,
+              clockDriftPpmEstimate: 0,
+              tetrachromaticExpanded: false
+            })
+          }),
+          ambiFrame: Object.freeze({
+            ...(container.ambiFrame || {
+              worldFrameId: null,
+              legibilityScore: null,
+              viewManifoldComponent: null,
+              positionInManifold: null,
+              sharedStructureId: null
+            })
+          }),
+
           hasStream: !!container.stream,
           hasVideoElement: !!container.videoElement,
           createdAt: container.createdAt || Date.now()
@@ -459,6 +498,7 @@ class MotionPainter {
         this._bc = new BroadcastChannel('motion-painter-store');
         this._bc.addEventListener('message', (ev) => {
           const msg = ev.data || {};
+
           // Forward release requests from MotionWorker (or any worker) to the preprocessor wrapper
           if (msg && msg.event === 'calibration:release_request') {
             const token = msg.releaseToken || msg.token || null;
@@ -478,6 +518,44 @@ class MotionPainter {
               console.warn('Main: no preprocessor wrapper available to handle release token', token);
             }
           }
+
+          // --- Stage 0: container writeback from motion.worker after first reconstruction ---
+          // motion.worker broadcasts RECON_DONE with reconstructionResolution and effectiveWindowMs
+          // once it has completed its first reconstruction pass and instantiated DirectionalLifting.
+          // We re-freeze the container with these values so all subsequent artifact snapshots
+          // carry the fully calibrated sampling context.
+          if (msg && msg.event === 'RECON_DONE' &&
+              this.cameraContainer &&
+              msg.cameraId === this.cameraContainer.cameraId) {
+
+            const updates = {};
+
+            if (msg.reconstructionResolution != null) {
+              updates.differentialGeometry = {
+                reconstructionResolution: msg.reconstructionResolution
+              };
+            }
+
+            if (msg.effectiveWindowMs != null) {
+              updates.plenopticSampling = {
+                effectiveWindowMs: msg.effectiveWindowMs
+              };
+            }
+
+            if (Object.keys(updates).length > 0) {
+              try {
+                this._updateCameraContainer(updates);
+                console.log('[Stage0] main.js: container updated from RECON_DONE writeback', {
+                  cameraId: this.cameraContainer.cameraId,
+                  reconstructionResolution: this.cameraContainer.differentialGeometry?.reconstructionResolution,
+                  effectiveWindowMs: this.cameraContainer.plenopticSampling?.effectiveWindowMs
+                });
+              } catch (e) {
+                console.warn('[Stage0] main.js: _updateCameraContainer failed on RECON_DONE', e);
+              }
+            }
+          }
+          // --- End Stage 0 RECON_DONE handler ---
         });
       } catch (e) {
         console.warn('Main: failed to create BroadcastChannel for orchestration', e);
@@ -1184,8 +1262,89 @@ displayHardwareLimitations() {
     return validation;
   }
 
-  // ------------------ CALIBRATION: orchestration-only helpers ------------------
+  // ------------------ Stage 0: container update protocol ------------------
 
+  /**
+   * _updateCameraContainer(updates)
+   *
+   * Immutably updates this.cameraContainer by spread-and-refreeze.
+   * Only the three Stage 0 sub-objects can be updated via this path:
+   * differentialGeometry, plenopticSampling, ambiFrame.
+   *
+   * Called by:
+   *  - RECON_DONE BC handler (Stage 0) — reconstructionResolution + effectiveWindowMs
+   *  - AmbiAnamorph result handler (Stage 5) — ambiFrame fields
+   *  - Future: angularApertureSr inference (Stage 1+) — plenopticSampling.angularApertureSr
+   *
+   * @param {Object} updates - object with optional keys:
+   *   differentialGeometry?: Partial<differentialGeometry>
+   *   plenopticSampling?: Partial<plenopticSampling>
+   *   ambiFrame?: Partial<ambiFrame>
+   */
+  _updateCameraContainer(updates = {}) {
+    if (!this.cameraContainer) {
+      console.warn('[Stage0] _updateCameraContainer: no cameraContainer to update');
+      return;
+    }
+
+    const current = this.cameraContainer;
+
+    const merged = Object.freeze({
+      ...current,
+
+      differentialGeometry: updates.differentialGeometry
+        ? Object.freeze({
+            ...current.differentialGeometry,
+            ...updates.differentialGeometry
+          })
+        : current.differentialGeometry,
+
+      plenopticSampling: updates.plenopticSampling
+        ? Object.freeze({
+            ...current.plenopticSampling,
+            ...updates.plenopticSampling
+          })
+        : current.plenopticSampling,
+
+      ambiFrame: updates.ambiFrame
+        ? Object.freeze({
+            ...current.ambiFrame,
+            ...updates.ambiFrame
+          })
+        : current.ambiFrame
+    });
+
+    this.cameraContainer = merged;
+
+    // Propagate to eviction hook — subsequent frame snapshots will carry
+    // the updated sampling context
+    if (this.evictionHook && typeof this.evictionHook.setCameraContainer === 'function') {
+      try {
+        this.evictionHook.setCameraContainer(merged);
+      } catch (e) {
+        console.warn('[Stage0] _updateCameraContainer: evictionHook.setCameraContainer failed', e);
+      }
+    }
+
+    // Broadcast updated container to any other BC consumers (e.g. motion.worker
+    // querying container state, future AmbiAnamorph listener)
+    if (this._bc) {
+      try {
+        this._bc.postMessage({
+          event: 'cameraContainer:updated',
+          cameraId: merged.cameraId,
+          differentialGeometry: merged.differentialGeometry,
+          plenopticSampling: merged.plenopticSampling,
+          ambiFrame: merged.ambiFrame,
+          timestamp: Date.now()
+        });
+      } catch (e) {
+        console.warn('[Stage0] _updateCameraContainer: BC postMessage failed', e);
+      }
+    }
+  }
+
+  // ------------------ CALIBRATION: orchestration-only helpers ------------------
   /**
    * requestCalibrationFromWorker(frames, framesNeeded, resolution)
    *
