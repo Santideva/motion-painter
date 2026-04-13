@@ -1132,44 +1132,69 @@ export class PreprocessorWorker {
     const jobId = `cal-${Date.now()}-${(this.jobCounter++).toString(36)}`;
 
     return new Promise((resolve, reject) => {
-      // response handler
-      const handleResponse = (ev) => {
-        const data = ev.data || {};
-          // FIXED: Only process messages with matching jobId
-            if (!data.jobId || data.jobId !== jobId) {
-            return; // Silently ignore, don't throw
-          }
+      let timeout = null;
 
-        // Worker replied for our jobId — remove listener
+      const finishSuccess = (data) => {
+        clearTimeout(timeout);
         this.worker.removeEventListener('message', handleResponse);
 
-        if (data.event === 'calibration:ready') {
-          // Worker computed calibration and (ideally) persisted artifacts.
-          // Accept metaKey, meta, darkFrame, flatFrame, and optional releaseToken
-          this.calibrationMetaKey = data.metaKey || this.calibrationMetaKey;
-          this.calibrationMeta = data.meta || this.calibrationMeta;
+        this.calibrationMetaKey = data.metaKey || this.calibrationMetaKey;
+        this.calibrationMeta = data.meta || this.calibrationMeta;
 
-          // Resolve with extra releaseToken if worker provided it
-          resolve({
-            darkFrame: data.darkFrame || null,
-            flatFrame: data.flatFrame || null,
-            meta: data.meta || null,
-            metaKey: data.metaKey || null,
-            releaseToken: data.releaseToken || null
-          });
+        resolve({
+          darkFrame: data.darkFrame || null,
+          flatFrame: data.flatFrame || null,
+          meta: data.meta || null,
+          metaKey: data.metaKey || null,
+          releaseToken: data.releaseToken || null
+        });
+      };
 
-        } else if (data.event === 'calibration:error') {
-          reject(new Error(data.error || 'calibration_failed'));
-        } else {
-          // Only reject for truly unexpected responses with matching jobId
-          reject(new Error(`unexpected_calibration_response: ${data.event}`));
+      const finishError = (message) => {
+        clearTimeout(timeout);
+        this.worker.removeEventListener('message', handleResponse);
+        reject(new Error(message));
+      };
+
+      const handleResponse = (ev) => {
+        const data = ev.data || {};
+
+        // Ignore unrelated messages
+        if (data.jobId !== jobId) {
+          return;
         }
+
+        // Intermediate progress events: keep waiting
+        if (
+          data.event === 'calibration_start' ||
+          data.event === 'cloning_calibration_bitmaps' ||
+          data.event === 'progress'
+        ) {
+          console.log('PreprocessorWorker: calibration progress:', data.event, data);
+          return;
+        }
+
+        // Final success
+        if (data.event === 'calibration:ready') {
+          finishSuccess(data);
+          return;
+        }
+
+        // Final error
+        if (data.event === 'calibration:error') {
+          finishError(data.error || 'calibration_failed');
+          return;
+        }
+
+        // Anything else for this jobId is unexpected, but do not kill the promise
+        // unless you are certain the worker uses only terminal messages.
+        console.warn('PreprocessorWorker: ignoring unexpected calibration message:', data);
       };
 
       this.worker.addEventListener('message', handleResponse);
 
       // Timeout guard
-      const timeout = setTimeout(() => {
+      timeout = setTimeout(() => {
         this.worker.removeEventListener('message', handleResponse);
         reject(new Error('Calibration computation timeout'));
       }, 60000); // 60s - keep same as before

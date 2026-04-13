@@ -13,6 +13,9 @@ import MultiSampler from '/src/js/sampler/MultiSampler.js';
 import { CalibratedFieldProducer } from '/src/js/core/CalibratedFieldProducer.js';
 import { Tetrachromacy } from '/src/js/core/Tetrachromacy.js';
 import { DirectionalLifting } from '/src/js/core/DirectionalLifting.js';
+import { PenumbraAnalyzer } from '/src/js/core/PenumbraAnalyzer.js';  
+import PackingSDF from '/src/js/core/PackingSDF.js';
+import { DifferentialGeometry } from '/src/js/core/DifferentialGeometry.js';
 
 const BC_CHANNEL = 'motion-painter-store';
 const bc = (typeof BroadcastChannel !== 'undefined') ? new BroadcastChannel(BC_CHANNEL) : null;
@@ -259,7 +262,8 @@ if (bc) {
 
 let _flags = {};                    // feature flags / runtime config snapshot
 let _running = true;
-let _jobs = new Map();              // jobId -> { heartbeatTimer, createdAt, meta }
+let _jobs = new Map();
+let _inFlightMetaKeys = new Set();              // jobId -> { heartbeatTimer, createdAt, meta }
 let _metrics = {
   jobsHandled: 0,
   lastError: null,
@@ -303,14 +307,46 @@ let _gpuCapabilities = null;
 // Written by _getDirectionalLifting(), broadcast in RECON_DONE payload
 // so main.js can update cameraContainer.plenopticSampling.effectiveWindowMs.
 let _effectiveWindowMs = null;
+let _penumbraAnalyzer  = null; 
+let _packingSDF        = null;
+let _diffGeo           = null;
 
 // Configuration: integers and thresholds can be overridden via _flags
 const DEFAULTS = {
-  heartbeatIntervalMs: 20_000,     // worker heartbeat to storage
-  takeoverMsDefault: 10 * 60_000, // 10 minutes takeover window
-  maxWorkerMemoryBytes: 1 << 28,   // ~268MB default safety cap (tunable via flags)
-  defaultResolutions: { low: 256, normal: 512, high: 1024 }
+  heartbeatIntervalMs:  20_000,        // worker heartbeat to storage
+  takeoverMsDefault:    10 * 60_000,   // 10 minutes takeover window
+  maxWorkerMemoryBytes: 1 << 28,       // ~268MB default safety cap (tunable via flags)
+  defaultResolutions:   { low: 256, normal: 512, high: 1024 },
+
+  // ── Stage 2: PackingSDF defaults ─────────────────────────────────────────
+  // All keys are also valid _flags overrides so they can be changed at runtime
+  // via a flagsChanged BroadcastChannel event without restarting the worker.
+  packingDefaults: {
+    enablePackingSDF:     true,
+    packingUmbraPolicy:   'half-weight', // 'half-weight' | 'include' | 'exclude'
+    packingBandBase:      0.03,          // fraction of sdfRange (GPT latent heat floor)
+    packingBandScale:     3.0,           // penumbra width × this = extra band width
+    packingFalloffExp:    2.0,           // narrow band smooth fall-off exponent
+    packingSeedRMin:      0.01,          // minimum seed radius (normalised image coords)
+    packingSeedRMax:      0.08,          // maximum seed radius (normalised image coords)
+    packingMaxSeeds:      2048,          // MultiSampler ceiling across all partitions
+    packingDensitySmooth: 4,             // box-blur radius for density map smoothing
+    packingSamplerSeed:   0xF1E2D3C4,    // deterministic RNG seed (uint32)
+    packingDebug:         false          // persist medStressMap + scaleneVariance diags
+  }
 };
+
+// Merge Stage 2 defaults into _flags so they take effect immediately on first
+// reconstruction (before any flagsChanged event arrives from the main thread).
+// Any subsequent flagsChanged event will override these via _applyFlagsSnapshot.
+Object.assign(_flags, DEFAULTS.packingDefaults);
+
+// ── Stage 3: Horn-Schunck optical flow defaults ───────────────────────────
+Object.assign(_flags, {
+  enableOpticalFlow:     false,  // gate entire H-S pass — default false (adds GPU + readback cost)
+  opticalFlowAlpha:      1.0,    // smoothness weight α² [0.1, 10]
+  opticalFlowIterations: 30      // ping-pong passes [10, 100]
+});
 
 // ---------------------------------------------------------------------------
 // Helper utilities
@@ -853,34 +889,33 @@ async function _loadThreeModule() {
 
   console.log('motion.worker: Loading THREE.js module...');
 
-  const threeErrs = [];
-  const tryImport = async (spec) => {
-    try {
-      const mod = await import(spec);
-      return mod;
-    } catch (e) {
-      threeErrs.push(`${spec}: ${e && e.message ? e.message : String(e)}`);
-      return null;
+  // CRITICAL: import() must use a static string literal so webpack can detect
+  // the dependency at build time and include THREE.js in the worker bundle.
+  //
+  // The previous approach used import(spec) where spec is a variable — webpack
+  // cannot statically analyze a variable import, emits the "Critical dependency:
+  // the request of a dependency is an expression" warning, and THREE.js is never
+  // bundled. At runtime all three import attempts fail ("Cannot find module").
+  //
+  // CDN and /node_modules/ path fallbacks are removed:
+  //   - CDN is blocked under COEP require-corp
+  //   - /node_modules/ devServer path is unreliable in production
+  // The webpack bundle is the only correct path in this architecture.
+  try {
+    let mod = await import('three');
+    // Normalise namespace vs. default export shapes
+    if (mod && mod.default && typeof mod.default.Scene === 'function') {
+      mod = mod.default;
     }
-  };
-
-  // Try multiple import strategies (bare specifier, absolute path, CDN)
-  let THREE = await tryImport('three');
-  if (!THREE) THREE = await tryImport('/node_modules/three/build/three.module.js');
-  if (!THREE) THREE = await tryImport('https://cdn.jsdelivr.net/npm/three@0.158.0/build/three.module.js');
-
-  if (!THREE) {
-    throw new Error(`Failed to import THREE.js (tried multiple locations): ${threeErrs.join(' | ')}`);
+    _threeModule = mod;
+    console.log('motion.worker: THREE.js module loaded and cached');
+    return _threeModule;
+  } catch (e) {
+    throw new Error(
+      `Failed to import THREE.js — ensure three is in package.json and webpack ` +
+      `has bundled the worker: ${e && e.message ? e.message : String(e)}`
+    );
   }
-
-  // Handle namespace/default export variations
-  if (THREE && THREE.default) THREE = THREE.default;
-
-  // Cache for future calls
-  _threeModule = THREE;
-
-  console.log('motion.worker: THREE.js module loaded and cached');
-  return _threeModule;
 }
 
 // ---------------------------------------------------------------------------
@@ -1220,12 +1255,33 @@ async function _detectGPUCapabilities() {
       throw new Error('Could not retrieve WebGL context from renderer');
     }
     
+    const isWebGL2 = typeof WebGL2RenderingContext !== 'undefined' && gl instanceof WebGL2RenderingContext;
+
+    // Float texture support:
+    // - WebGL2: float textures (RGBA32F) are core. The WebGL1 extension
+    //   OES_texture_float does not exist in WebGL2 and returns null, but
+    //   float DataTexture + FloatType render targets work natively.
+    //   EXT_color_buffer_float must be enabled for float *render targets*
+    //   (readback via readRenderTargetPixels), which Horn-Schunck requires.
+    // - WebGL1: OES_texture_float extension required.
+    let floatTexturesSupported = false;
+    if (isWebGL2) {
+      // Enable float render targets (required for readRenderTargetPixels)
+      const extFloat = gl.getExtension('EXT_color_buffer_float');
+      floatTexturesSupported = !!extFloat;
+      if (!floatTexturesSupported) {
+        console.warn('motion.worker: EXT_color_buffer_float not available — float render targets disabled, falling back to 8-bit textures');
+      }
+    } else {
+      floatTexturesSupported = !!gl.getExtension('OES_texture_float');
+    }
+
     _gpuCapabilities = {
       available: true,
-      isWebGL2: typeof WebGL2RenderingContext !== 'undefined' && gl instanceof WebGL2RenderingContext,
-      maxTextureSize: gl.getParameter(gl.MAX_TEXTURE_SIZE),
-      maxTextureUnits: gl.getParameter(gl.MAX_TEXTURE_IMAGE_UNITS),
-      floatTexturesSupported: !!gl.getExtension('OES_texture_float')
+      isWebGL2,
+      maxTextureSize:       gl.getParameter(gl.MAX_TEXTURE_SIZE),
+      maxTextureUnits:      gl.getParameter(gl.MAX_TEXTURE_IMAGE_UNITS),
+      floatTexturesSupported
     };
     
     console.log('motion.worker: GPU capabilities detected', _gpuCapabilities);
@@ -1329,7 +1385,79 @@ async function _getDirectionalLifting(resolution, frameRateHz = null) {
       }), effectiveWindowMs=${_effectiveWindowMs.toFixed(1)}ms`
     );
   }
-  return _directionalLifting;
+return _directionalLifting;
+}
+
+// --- Stage 1: PenumbraAnalyzer lazy singleton ---
+// Follows the same pattern as _getCalibratedProducer and _getTetrachromacy.
+// Options are resolved from _flags at first call so runtime flag overrides apply.
+function _getPenumbraAnalyzer() {
+  if (!_penumbraAnalyzer) {
+    _penumbraAnalyzer = new PenumbraAnalyzer({
+      profileWindowPx:     _flags.penumbraProfileWindow   || 17,
+      brightnessThreshold: _flags.penumbraBrightnessThresh || 0.75,
+      minEdgeGradient:     _flags.penumbraMinEdgeGrad      || 0.05,
+      minEdgeLength:       _flags.penumbraMinEdgeLength    || 8,
+      maxLightSources:     _flags.penumbraMaxLights        || 8,
+      minFitR2:            _flags.penumbraMinFitR2         || 0.6,
+      stabilityWeight:     _flags.penumbraStabilityWeight  || 0.6,
+      debug:               _flags.penumbraDebug            || false
+    });
+    console.log('motion.worker: PenumbraAnalyzer initialized');
+  }
+  return _penumbraAnalyzer;
+}
+
+/**
+ * _getDifferentialGeometry
+ * Lazy-initialises the DifferentialGeometry singleton.
+ * The storageWrapper is passed at call time so the module stays stateless.
+ */
+function _getDifferentialGeometry() {
+  if (!_diffGeo) {
+    _diffGeo = new DifferentialGeometry({ flags: _flags });   // no storageWrapper — passed per-call
+    console.log('motion.worker: DifferentialGeometry initialized');
+  }
+  return _diffGeo;
+}
+
+/**
+ * _getPackingSDF
+ *
+ * Lazy-initialises the singleton PackingSDF instance.
+ * Re-reads _flags on first call per worker lifetime so flag changes
+ * that arrive between reconstruction jobs are honoured without restarting
+ * the worker.
+ *
+ * @returns {PackingSDF}
+ */
+function _getPackingSDF() {
+  if (!_packingSDF) {
+    _packingSDF = new PackingSDF({
+      // Narrow band
+      bandBase:    safeNumeric(_flags.packingBandBase,    0.03, 0.001, 0.5),
+      bandScale:   safeNumeric(_flags.packingBandScale,   3.0,  0.1,   20),
+      falloffExp:  safeNumeric(_flags.packingFalloffExp,  2.0,  0.5,   6),
+
+      // Seeding
+      seedRMin:         safeNumeric(_flags.packingSeedRMin,    0.01,  0.001, 0.5),
+      seedRMax:         safeNumeric(_flags.packingSeedRMax,    0.08,  0.01,  1.0),
+      samplerMaxPoints: Math.max(64, Math.floor(_flags.packingMaxSeeds ?? 2048)),
+      samplerMinPoints: 64,
+      samplerSeed:      _flags.packingSamplerSeed ?? 0xF1E2D3C4,
+
+      // Umbra policy: 'half-weight' | 'include' | 'exclude'
+      umbraPolicy: _flags.packingUmbraPolicy ?? 'half-weight',
+
+      // Density smoothing
+      densitySmoothRadius: Math.max(1, Math.floor(_flags.packingDensitySmooth ?? 4)),
+
+      // Debug
+      enableDebug: !!_flags.packingDebug
+    });
+    console.log('motion.worker: PackingSDF initialized');
+  }
+  return _packingSDF;
 }
 
 // ============================================================================
@@ -1539,6 +1667,462 @@ function _computeSpecularMask(intensityField, chromaticity, resolution, options 
   return maskField;
 }
 
+ /* _computeDOAAndModal
+ *
+ * Computes two groups of per-pixel quantities from the already-available
+ * pipeline outputs — no depth or GPU required.
+ *
+ * GROUP 1: Direction-of-Arrival (DOA)
+ *   kappa    — angular concentration of incoming light at each pixel.
+ *              High kappa (>kappaThreshold): dominant direction is tightly
+ *              focused → point-like source, likely direct illumination.
+ *              Low kappa (<1): broad spread → diffuse or skylight.
+ *   meanDir  — unit vector (x,y in image tangent plane) pointing toward
+ *              the dominant incoming direction, derived from the gradient
+ *              of the directional field's primary channel.
+ *
+ * GROUP 2: Modal light-transport probabilities
+ *   Four fields that sum to 1.0 per pixel:
+ *   direct      — fraction explained by straight-line source rays
+ *   diffuse     — fraction from area/skylight transport
+ *   specular    — fraction from single-bounce specular reflection
+ *   multiBounce — fraction from multiply-scattered indirect transport
+ *
+ * These feed modal_decomposition artifact (Stage 1) and the DOA histogram
+ * stored in that artifact for use by Stage 7 (TopologicalCorrespondence).
+ *
+ * @param {Float32Array} directionalField  res²×4, from DirectionalLifting
+ * @param {Float32Array} tetraField        res²×4, from Tetrachromacy
+ * @param {Object}       coherence         { perPixel: Float32Array[res²] }
+ * @param {Float32Array} specularMask      res²×4, from _computeSpecularMask
+ * @param {Object}       chromaticity      { chromaR, chromaG, chromaB }
+ * @param {number}       resolution
+ * @returns {{
+ *   kappa:       Float32Array,   res²
+ *   meanDir:     Float32Array,   res²×2  (x,y pairs)
+ *   direct:      Float32Array,   res²
+ *   diffuse:     Float32Array,   res²
+ *   specular:    Float32Array,   res²
+ *   multiBounce: Float32Array,   res²
+ *   telemetry:   Object
+ * }}
+ */
+function _computeDOAAndModal(
+  directionalField, tetraField, coherence, specularMask, chromaticity, resolution
+) {
+  const startTime = performance.now();
+  const count     = resolution * resolution;
+
+  const kappa        = new Float32Array(count);
+  const meanDir      = new Float32Array(count * 2);
+  const direct       = new Float32Array(count);
+  const diffuseOut   = new Float32Array(count);   // named diffuseOut to avoid shadowing
+  const specularOut  = new Float32Array(count);
+  const multiBounce  = new Float32Array(count);
+
+  // coherence.perPixel: temporal stability proxy for visible fraction f(P).
+  // High coherence → pixel barely changed across DirectionalLifting's buffer
+  // → geometrically stable → more likely to be direct-dominated.
+  const perPixel = (coherence && coherence.perPixel instanceof Float32Array)
+    ? coherence.perPixel
+    : new Float32Array(count).fill(0.5);
+
+  // kappaThreshold: the concentration value separating point-like (direct)
+  // from diffuse. Above this value the incoming distribution is tight enough
+  // to be modelled as a direct ray. Empirically 3.0 works for indoor scenes;
+  // expose via flags for outdoor and studio scenarios.
+  const kappaThreshold = Number.isFinite(_flags.doaKappaThreshold)
+    ? _flags.doaKappaThreshold
+    : 3.0;
+
+  // ── Per-pixel loop ────────────────────────────────────────────────────────
+  for (let y = 0; y < resolution; y++) {
+    for (let x = 0; x < resolution; x++) {
+      const i    = y * resolution + x;
+      const base = i * 4;
+
+      // ── Kappa: gradient magnitude of directional field ─────────────────
+      // Central differences on all three colour channels; border pixels
+      // use one-sided differences (clamped indices).
+      const xl = Math.max(0, x - 1);
+      const xr = Math.min(resolution - 1, x + 1);
+      const yu = Math.max(0, y - 1);
+      const yd = Math.min(resolution - 1, y + 1);
+
+      const df = (ch, px, py) =>
+        directionalField[(py * resolution + px) * 4 + ch];
+
+      let gradSqSum  = 0;
+      let gxPrimary  = 0;
+      let gyPrimary  = 0;
+
+      for (let ch = 0; ch < 3; ch++) {
+        const gx = (df(ch, xr, y) - df(ch, xl, y)) * 0.5;
+        const gy = (df(ch, x, yd) - df(ch, x, yu)) * 0.5;
+        gradSqSum += gx * gx + gy * gy;
+        if (ch === 0) { gxPrimary = gx; gyPrimary = gy; }   // R channel for direction
+      }
+
+      // Normalise by local field magnitude so kappa is scale-independent.
+      // A high gradient in a dim field means less directional change than
+      // the same gradient in a bright field.
+      const localMag = Math.sqrt(
+        directionalField[base]   * directionalField[base]   +
+        directionalField[base+1] * directionalField[base+1] +
+        directionalField[base+2] * directionalField[base+2]
+      ) + 1e-6;
+
+      kappa[i] = Math.sqrt(gradSqSum) / localMag;
+
+      // ── Mean direction ─────────────────────────────────────────────────
+      const gLen = Math.sqrt(gxPrimary * gxPrimary + gyPrimary * gyPrimary) + 1e-9;
+      meanDir[i * 2]     = gxPrimary / gLen;
+      meanDir[i * 2 + 1] = gyPrimary / gLen;
+
+      // ── Modal decomposition ────────────────────────────────────────────
+      // f proxy: coherence (high = stable = more direct)
+      const coh     = perPixel[i];
+      // Specular: R channel of specularMask (already in [0,1])
+      const specVal = specularMask ? specularMask[base] : 0;
+
+      // Multi-bounce: low coherence AND low f proxy.
+      // Squaring sharpens the response so only genuinely indirect pixels
+      // are labelled multi-bounce rather than mildly penumbral ones.
+      multiBounce[i] = Math.min(1.0, (1.0 - coh) * (1.0 - coh));
+
+      // Specular: attenuated in multi-bounce zones because multiply-scattered
+      // light cannot form the sharp highlights that specularMask detects.
+      specularOut[i] = Math.min(1.0, specVal * (1.0 - multiBounce[i] * 0.5));
+
+      // Remaining budget for direct + diffuse
+      const remaining = Math.max(0.0, 1.0 - specularOut[i] - multiBounce[i]);
+
+      // Direct: high coherence × kappa sigmoid.
+      // The sigmoid smoothly gates at kappaThreshold rather than a hard step
+      // so intermediate-concentration distributions are partially direct.
+      const kSig    = 1.0 / (1.0 + Math.exp(-(kappa[i] - kappaThreshold)));
+      direct[i]     = remaining * coh * kSig;
+      diffuseOut[i] = Math.max(0.0, remaining - direct[i]);
+
+      // Enforce exact sum = 1.0 per pixel to correct floating-point drift
+      const total = direct[i] + diffuseOut[i] + specularOut[i] + multiBounce[i];
+      if (total > 1e-6) {
+        direct[i]      /= total;
+        diffuseOut[i]  /= total;
+        specularOut[i] /= total;
+        multiBounce[i] /= total;
+      } else {
+        // Degenerate (all-dark pixel): classify as diffuse
+        diffuseOut[i] = 1.0;
+      }
+    }
+  }
+
+  // ── Summary telemetry ─────────────────────────────────────────────────────
+  let sumKappa = 0;
+  let highKappaCnt = 0;   // kappa > threshold: point-like
+  let lowKappaCnt  = 0;   // kappa < 1.0:       diffuse
+  for (let i = 0; i < count; i++) {
+    sumKappa += kappa[i];
+    if (kappa[i] > kappaThreshold) highKappaCnt++;
+    if (kappa[i] < 1.0)            lowKappaCnt++;
+  }
+
+  return {
+    kappa,
+    meanDir,
+    direct:      direct,
+    diffuse:     diffuseOut,
+    specular:    specularOut,
+    multiBounce,
+    telemetry: {
+      processingMs:  (performance.now() - startTime).toFixed(2),
+      meanKappa:     (sumKappa / count).toFixed(4),
+      pointLikeFrac: (highKappaCnt / count).toFixed(4),
+      diffuseFrac:   (lowKappaCnt  / count).toFixed(4),
+      kappaThreshold
+    }
+  };
+}
+
+// CHANGE B — _computeFMapRouteB()
+/**
+ * _computeFMapRouteB
+ *
+ * Immediate visible-fraction proxy using DirectionalLifting coherence.
+ * No depth required. Executes in the CPU parallel branch while the GPU
+ * pipeline computes depth.
+ *
+ * Rationale:
+ *   coherence.perPixel measures temporal stability — how little each pixel
+ *   changed across the rolling buffer window. Stable pixels are more likely
+ *   to be directly illuminated (direct illumination is geometrically fixed;
+ *   indirect / multi-bounce light fluctuates). Coherence is therefore a
+ *   first-order proxy for f(P).
+ *
+ * This result is persisted immediately as the directness_field artifact.
+ * When Route A completes (after depth is available), its result replaces
+ * this artifact via a second persist call with the same key convention,
+ * and the route field changes from 'temporal_proxy' to 'depth_mc'.
+ *
+ * @param {Float32Array|null} coherencePerPixel  coherence.perPixel, length res²
+ * @param {number}            resolution
+ * @returns {{
+ *   fMap:        Float32Array,  [0,1] proxy for visible fraction, res²
+ *   directness:  Float32Array,  D/(D+S) proxy, res²
+ *   modalLabels: Uint8Array,    0=UMBRA 1=PENUMBRA 2=DIRECT, res²
+ *   route:       'temporal_proxy',
+ *   N_samples:   0
+ * }}
+ */
+function _computeFMapRouteB(coherencePerPixel, resolution) {
+  const count       = resolution * resolution;
+  const fMap        = new Float32Array(count);
+  const directness  = new Float32Array(count);
+  const modalLabels = new Uint8Array(count);
+
+  const directThresh = Number.isFinite(_flags.fMapDirectThresh) ? _flags.fMapDirectThresh : 0.9;
+  const umbraThresh  = Number.isFinite(_flags.fMapUmbraThresh)  ? _flags.fMapUmbraThresh  : 0.1;
+
+  for (let i = 0; i < count; i++) {
+    const coh = (coherencePerPixel && coherencePerPixel[i] != null)
+      ? coherencePerPixel[i]
+      : 0.5;
+
+    fMap[i]       = coh;
+    directness[i] = coh;
+
+    if      (coh >= directThresh) modalLabels[i] = 2;   // DIRECT
+    else if (coh <= umbraThresh)  modalLabels[i] = 0;   // UMBRA
+    else                          modalLabels[i] = 1;   // PENUMBRA
+  }
+
+  return { fMap, directness, modalLabels, route: 'temporal_proxy', N_samples: 0 };
+}
+
+// CHANGE C — _computeFMapRouteA()
+/**
+ * _computeFMapRouteA
+ *
+ * Monte Carlo visible-fraction map using screen-space depth buffer occlusion.
+ * Runs AFTER depth is available (i.e. after the GPU branch of Promise.all).
+ *
+ * Algorithm:
+ *   1. Locate the primary light source from lightTrack (PenumbraAnalyzer output).
+ *      Fall back to frame centre-top if no lightTrack is available.
+ *   2. Sample N source points around the source centre using stratified
+ *      polar sampling. Importance-weight each sample by the Fresnel density
+ *      map: Fresnel-zone boundaries coincide with penumbra edges, so this
+ *      concentrates samples where the visibility transition is sharpest and
+ *      where Monte Carlo variance matters most.
+ *   3. For each pixel P, march from P toward each source sample S along the
+ *      screen-space ray in (marchSteps) discrete steps. At each step, compare
+ *      the depth buffer value against the linearly interpolated ray depth.
+ *      If the buffer is shallower by more than occlusionBias, the ray is
+ *      occluded and the source sample is invisible from P.
+ *   4. f(P) = sum(weights of visible samples) — already normalised to [0,1]
+ *      because all sample weights are normalised to sum to 1.0.
+ *
+ * Screen-space march limitations:
+ *   Correctly handles planar and gently curved occluders.
+ *   May misclassify concave geometry or silhouette edges at working resolution.
+ *   Route B coherence proxy is retained as the fallback if this fails.
+ *
+ * @param {Object}            depthMap         { data: Float32Array, resolution, min, max }
+ * @param {Float32Array}      calibratedField  res²×4
+ * @param {number}            resolution
+ * @param {Array}             lightTrack       [{imageXY, conf, radius, centroidI}]
+ * @param {Float32Array|null} fresnelDensityMap  length res², importance prior
+ * @param {Object}            samplingContext  from _buildSamplingContext()
+ * @param {Object}            [options]
+ * @param {number}            [options.N_samples=128]
+ * @returns {{
+ *   fMap:        Float32Array,
+ *   directness:  Float32Array,
+ *   modalLabels: Uint8Array,
+ *   route:       'depth_mc',
+ *   N_samples:   number
+ * }}
+ */
+function _computeFMapRouteA(
+  depthMap, calibratedField, resolution,
+  lightTrack, fresnelDensityMap, samplingContext, options = {}
+) {
+  const t0         = performance.now();
+  const count      = resolution * resolution;
+  const N          = Math.max(8, Math.min(512, options.N_samples ?? 128));
+
+  const fMap        = new Float32Array(count);
+  const directness  = new Float32Array(count);
+  const modalLabels = new Uint8Array(count);
+
+  const depths     = depthMap.data;
+  const depthMin   = depthMap.min ?? 0;
+  const depthRange = Math.max(1e-6, (depthMap.max ?? 2) - depthMin);
+
+  const directThresh  = Number.isFinite(_flags.fMapDirectThresh)  ? _flags.fMapDirectThresh  : 0.9;
+  const umbraThresh   = Number.isFinite(_flags.fMapUmbraThresh)   ? _flags.fMapUmbraThresh   : 0.1;
+  const occlusionBias = Number.isFinite(_flags.fMapOcclusionBias) ? _flags.fMapOcclusionBias : 0.04;
+  const marchSteps    = Number.isInteger(_flags.fMapMarchSteps)   ? _flags.fMapMarchSteps    : 8;
+
+  // ── Source position ───────────────────────────────────────────────────────
+  // lightTrack is sorted by confidence descending (PenumbraAnalyzer contract).
+  // Fallback: frame centre at 10% from top (typical ceiling fixture position).
+  let srcX      = resolution * 0.5;
+  let srcY      = resolution * 0.1;
+  let srcRadius = Math.max(4, resolution * 0.05);
+
+  if (lightTrack && lightTrack.length > 0) {
+    const primary = lightTrack[0];
+    srcX      = primary.imageXY[0];
+    srcY      = primary.imageXY[1];
+    // 1.5× detected radius so samples spread slightly beyond the blob boundary.
+    // Prevents all N samples landing on the same pixels when the source is small.
+    srcRadius = Math.max(4, primary.radius * 1.5);
+  }
+
+  // ── Source depth (average over the source region) ─────────────────────────
+  // Light sources at ceiling or window are typically at maximum scene depth.
+  let srcDepthSum = 0;
+  let srcDepthCnt = 0;
+  const srcR2     = srcRadius * srcRadius;
+
+  for (let y = 0; y < resolution; y++) {
+    for (let x = 0; x < resolution; x++) {
+      const dx = x - srcX;
+      const dy = y - srcY;
+      if (dx*dx + dy*dy <= srcR2) {
+        srcDepthSum += depths[y * resolution + x];
+        srcDepthCnt++;
+      }
+    }
+  }
+  const srcDepthNorm = srcDepthCnt > 0
+    ? (srcDepthSum / srcDepthCnt - depthMin) / depthRange
+    : 1.0;
+
+  // ── Importance-sampled source points ─────────────────────────────────────
+  // Stratified polar sampling (sqrt(r) for area-uniform radial distribution).
+  // Each point is importance-weighted by the Fresnel density map.
+  // Fresnel density is high where Fresnel-zone geometry is active, which
+  // coincides with penumbra edges — exactly where visibility transitions occur.
+  // Without Fresnel map, all weights are 1.0 (uniform sampling).
+  const sourcePoints = [];
+  let totalWeight    = 0;
+
+  for (let si = 0; si < N; si++) {
+    const angle = (si / N) * 2 * Math.PI;
+    const rFrac = Math.sqrt((si + 0.5) / N);
+    const spx   = srcX + rFrac * srcRadius * Math.cos(angle);
+    const spy   = srcY + rFrac * srcRadius * Math.sin(angle);
+    const bx    = Math.max(0, Math.min(resolution - 1, Math.round(spx)));
+    const by    = Math.max(0, Math.min(resolution - 1, Math.round(spy)));
+
+    let weight = 1.0;
+    if (fresnelDensityMap) {
+      const fd = fresnelDensityMap[by * resolution + bx] ?? 0;
+      // Rescale to [0.1, 1.0]: floor at 0.1 so no sample has zero probability.
+      weight = 0.1 + 0.9 * Math.max(0, Math.min(1, fd));
+    }
+
+    sourcePoints.push({
+      nx: spx / resolution,   // normalised image coordinates
+      ny: spy / resolution,
+      nd: srcDepthNorm,
+      weight
+    });
+    totalWeight += weight;
+  }
+
+  // Normalise weights to form a probability distribution summing to 1.0
+  totalWeight = totalWeight || 1;
+  for (const sp of sourcePoints) sp.weight /= totalWeight;
+
+  // ── Per-pixel Monte Carlo visibility ─────────────────────────────────────
+  for (let y = 0; y < resolution; y++) {
+    for (let x = 0; x < resolution; x++) {
+      const i       = y * resolution + x;
+      const pDepthN = (depths[i] - depthMin) / depthRange;
+      const pnx     = x / resolution;
+      const pny     = y / resolution;
+
+      let visibleW = 0;
+
+      for (const sp of sourcePoints) {
+        const dx = sp.nx - pnx;
+        const dy = sp.ny - pny;
+        const dd = sp.nd - pDepthN;
+
+        let occluded = false;
+
+        // March intermediate steps (skip step 0 = pixel itself, step N = source)
+        for (let step = 1; step < marchSteps && !occluded; step++) {
+          const t   = step / marchSteps;
+          const mx  = Math.round((pnx + t * dx) * resolution);
+          const my  = Math.round((pny + t * dy) * resolution);
+
+          // Ray exits image → source is outside frame → treat as unoccluded
+          if (mx < 0 || mx >= resolution || my < 0 || my >= resolution) break;
+
+          const sampledN = (depths[my * resolution + mx] - depthMin) / depthRange;
+          const marchN   = pDepthN + t * dd;
+
+          // Occluder: buffer shallower than march ray by more than bias.
+          // The bias prevents self-occlusion from depth quantisation errors.
+          if (sampledN < marchN - occlusionBias) occluded = true;
+        }
+
+        if (!occluded) visibleW += sp.weight;
+      }
+
+      fMap[i]       = visibleW;
+      directness[i] = visibleW;
+
+      if      (visibleW >= directThresh) modalLabels[i] = 2;
+      else if (visibleW <= umbraThresh)  modalLabels[i] = 0;
+      else                               modalLabels[i] = 1;
+    }
+  }
+
+  if (_flags.fMapDebug) {
+    console.log(
+      `[FMAP-RouteA] N=${N} srcXY=(${srcX.toFixed(1)},${srcY.toFixed(1)}) ` +
+      `srcR=${srcRadius.toFixed(1)} srcDepthN=${srcDepthNorm.toFixed(3)} ` +
+      `fresnel=${!!fresnelDensityMap} ms=${(performance.now()-t0).toFixed(1)}`
+    );
+  }
+
+  return { fMap, directness, modalLabels, route: 'depth_mc', N_samples: N };
+}
+
+/**
+ * _buildSamplingContext
+ *
+ * Assembles the samplingContext object embedded in every Stage 1 artifact.
+ * Captures the Stage 0 sampling geometry so downstream stages
+ * (TopologicalCorrespondence, AmbiAnamorph, UR-MD-02) can relate Stage 1
+ * outputs back to the temporal window and spatial resolution they were
+ * computed at.
+ *
+ * @param {Object|null} manifest   Full artifact from storageWrapper.getArtifact,
+ *                                  or null for calls originating inside
+ *                                  _computeDepthNormalsFlux where the manifest
+ *                                  is passed via options.manifest.
+ * @param {number}      resolution  The gridSize used for this job.
+ * @returns {Object}   Frozen samplingContext.
+ */
+function _buildSamplingContext(manifest, resolution) {
+  return Object.freeze({
+    reconstructionResolution: resolution,
+    effectiveWindowMs:        _effectiveWindowMs,
+    plenopticContext:
+      (manifest && manifest.data && manifest.data.plenopticContext)
+        ? manifest.data.plenopticContext
+        : null,
+    builtAt: Date.now()
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Heartbeat helpers (ensure reconStatus isn't mistaken as dead)
 // ---------------------------------------------------------------------------
@@ -1568,15 +2152,29 @@ async function _startHeartbeat(storageWrapper, reqId, metaKey) {
         console.warn(`Heartbeat miss #${consecutiveFails} for ${metaKey} (reqId: ${reqId})`);
         
         if (consecutiveFails >= maxConsecutiveFails) {
-          console.error(`Heartbeat failed ${maxConsecutiveFails} times - aborting job ${metaKey}`);
-          
+          // Before aborting, verify this job was genuinely displaced and not
+          // just a victim of a storage race (e.g. a concurrent invocation of
+          // the same manifest called markReconFailed before our first heartbeat).
+          // If the reqId in storage no longer matches ours, we were displaced —
+          // safe to stop. If it matches or is missing, reset and keep going.
           try {
-            await storageWrapper.markReconFailed(reqId, 'heartbeat_timeout');
-          } catch (err) {
-            console.error('Failed to mark job as failed:', err);
+            const currentStatus = await storageWrapper.getReconStatus(metaKey);
+            if (currentStatus?.reqId && currentStatus.reqId !== reqId) {
+              // Genuinely displaced by a different job — stop without marking
+              // failed (the new owner is responsible for its own lifecycle).
+              console.error(`Heartbeat: job ${reqId} displaced by ${currentStatus.reqId} — stopping timer`);
+              clearInterval(timer);
+            } else {
+              // Storage inconsistency or transient failure — reset miss count
+              // and keep the job alive. The computation is still running.
+              console.warn(`Heartbeat: ${maxConsecutiveFails} misses but reqId still matches — resetting (storage transient?)`);
+              consecutiveFails = 0;
+            }
+          } catch (statusErr) {
+            // Can't read status — assume transient, reset and keep going.
+            console.warn('Heartbeat: getReconStatus failed during abort check — resetting miss count', statusErr);
+            consecutiveFails = 0;
           }
-          
-          clearInterval(timer);
         }
       } else {
         consecutiveFails = 0;
@@ -1608,270 +2206,301 @@ function _stopHeartbeat(timer) {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Main Depth/Normal/Flux Computation Pipeline (UPDATED WITH CALIBRATED PIPELINE)
-// ---------------------------------------------------------------------------
+/**
+ * GPU-accelerated Horn-Schunck optical flow via WebGL ping-pong iterations.
+ * All GPU resources (textures, RTs, materials) are created and disposed within
+ * this call — no persistent GPU state left behind.
+ *
+ * Cost guide (upload + 30 passes + readback):
+ *   512² → ~5ms   |   1024² → ~15ms
+ *
+ * @param {object}       THREE       - THREE.js module namespace
+ * @param {WebGLRenderer} renderer   - Existing worker renderer
+ * @param {Float32Array} It          - Temporal derivative,   length w×h
+ * @param {Float32Array} Ix          - Spatial derivative X,  length w×h
+ * @param {Float32Array} Iy          - Spatial derivative Y,  length w×h
+ * @param {number}       width
+ * @param {number}       height
+ * @param {number}       alpha       - Smoothness weight [0.1, 10]
+ * @param {number}       iterations  - Ping-pong passes [10, 100]
+ * @returns {{ u: Float32Array, v: Float32Array, width, height, processingMs }}
+ */
+function _runHornSchunck(THREE, renderer, It, Ix, Iy, width, height, alpha, iterations) {
+  const t0    = performance.now();
+  const count = width * height;
 
+  if (It.length !== count || Ix.length !== count || Iy.length !== count) {
+    throw new Error(`_runHornSchunck: field length mismatch (expected ${count})`);
+  }
+
+  const alpha2 = alpha * alpha;
+
+  // ── Input textures (scalar → RGBA, scalar in R channel) ──────────────────
+  // RGBA used throughout for maximum WebGL1/WebGL2 compatibility.
+  const packScalar = (src) => {
+    const rgba = new Float32Array(count * 4);
+    for (let i = 0; i < count; i++) rgba[i * 4] = src[i];
+    return rgba;
+  };
+
+  const makeInputTex = (data) => {
+    const tex = new THREE.DataTexture(
+      packScalar(data), width, height,
+      THREE.RGBAFormat, THREE.FloatType
+    );
+    tex.needsUpdate = true;
+    tex.minFilter = tex.magFilter = THREE.LinearFilter;
+    tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
+    return tex;
+  };
+
+  // ── Ping-pong render targets (RG = u,v; stored in R and G channels) ───────
+  const makeRT = () => new THREE.WebGLRenderTarget(width, height, {
+    format:          THREE.RGBAFormat,
+    type:            THREE.FloatType,
+    minFilter:       THREE.LinearFilter,
+    magFilter:       THREE.LinearFilter,
+    wrapS:           THREE.ClampToEdgeWrapping,
+    wrapT:           THREE.ClampToEdgeWrapping,
+    depthBuffer:     false,
+    stencilBuffer:   false,
+    generateMipmaps: false
+  });
+
+  const texIt = makeInputTex(It);
+  const texIx = makeInputTex(Ix);
+  const texIy = makeInputTex(Iy);
+  let ping = makeRT();   // starts as zero-initialised (no flow)
+  let pong = makeRT();
+
+  // ── Shaders ───────────────────────────────────────────────────────────────
+  const VS = `
+    varying vec2 vUv;
+    void main() {
+      vUv = uv;
+      gl_Position = vec4(position.xy, 0.0, 1.0);
+    }
+  `;
+
+  // Horn-Schunck update: one Gauss-Seidel iteration using the standard
+  // 3×3 Laplacian average weights (1/12 at corners, 1/6 at edges).
+  const FS = `
+    precision highp float;
+    uniform sampler2D uFlow;
+    uniform sampler2D uIt;
+    uniform sampler2D uIx;
+    uniform sampler2D uIy;
+    uniform float     uAlpha2;
+    uniform vec2      uTexel;
+    varying vec2      vUv;
+
+    void main() {
+      vec2 ts = uTexel;
+
+      vec2 avg =
+        (1.0/12.0)*texture2D(uFlow, vUv+vec2(-ts.x,-ts.y)).rg +
+        (1.0/ 6.0)*texture2D(uFlow, vUv+vec2( 0.0, -ts.y)).rg +
+        (1.0/12.0)*texture2D(uFlow, vUv+vec2( ts.x,-ts.y)).rg +
+        (1.0/ 6.0)*texture2D(uFlow, vUv+vec2(-ts.x, 0.0)).rg +
+        (1.0/ 6.0)*texture2D(uFlow, vUv+vec2( ts.x, 0.0)).rg +
+        (1.0/12.0)*texture2D(uFlow, vUv+vec2(-ts.x, ts.y)).rg +
+        (1.0/ 6.0)*texture2D(uFlow, vUv+vec2( 0.0,  ts.y)).rg +
+        (1.0/12.0)*texture2D(uFlow, vUv+vec2( ts.x, ts.y)).rg;
+
+      float ix = texture2D(uIx, vUv).r;
+      float iy = texture2D(uIy, vUv).r;
+      float it = texture2D(uIt, vUv).r;
+
+      float denom  = uAlpha2 + ix*ix + iy*iy;
+      float factor = (ix*avg.x + iy*avg.y + it) / max(denom, 1.0e-7);
+
+      gl_FragColor = vec4(avg.x - ix*factor, avg.y - iy*factor, 0.0, 1.0);
+    }
+  `;
+
+  // ── Scene ─────────────────────────────────────────────────────────────────
+  const material = new THREE.ShaderMaterial({
+    vertexShader:   VS,
+    fragmentShader: FS,
+    uniforms: {
+      uFlow:   { value: ping.texture },
+      uIt:     { value: texIt },
+      uIx:     { value: texIx },
+      uIy:     { value: texIy },
+      uAlpha2: { value: alpha2 },
+      uTexel:  { value: new THREE.Vector2(1.0 / width, 1.0 / height) }
+    }
+  });
+
+  const geo    = new THREE.PlaneGeometry(2, 2);
+  const mesh   = new THREE.Mesh(geo, material);
+  const scene  = new THREE.Scene();
+  const cam    = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+  scene.add(mesh);
+
+  // ── Ping-pong iterations ──────────────────────────────────────────────────
+  for (let i = 0; i < iterations; i++) {
+    material.uniforms.uFlow.value = ping.texture;
+    renderer.setRenderTarget(pong);
+    renderer.render(scene, cam);
+    const tmp = ping; ping = pong; pong = tmp;   // swap
+  }
+  renderer.setRenderTarget(null);   // restore default
+
+  // ── Readback (ping holds the final result after last swap) ────────────────
+  const rgba = new Float32Array(count * 4);
+  renderer.readRenderTargetPixels(ping, 0, 0, width, height, rgba);
+
+  const u = new Float32Array(count);
+  const v = new Float32Array(count);
+  for (let i = 0; i < count; i++) {
+    u[i] = rgba[i * 4];       // R → u
+    v[i] = rgba[i * 4 + 1];   // G → v
+  }
+
+  // ── Dispose ───────────────────────────────────────────────────────────────
+  texIt.dispose(); texIx.dispose(); texIy.dispose();
+  ping.dispose(); pong.dispose();
+  material.dispose(); geo.dispose();
+
+  return { u, v, width, height, processingMs: performance.now() - t0 };
+}
+
+//   async function _computeDepthNormalsFlux(frameBitmap, calibData, options = {}) {
+// ─────────────────────────────────────────────────────────────────────────────
 async function _computeDepthNormalsFlux(frameBitmap, calibData, options = {}) {
   const startTime = performance.now();
   const telemetry = {
-    stages: {},
-    errors: [],
-    warnings: [],  // ✅ KEPT: warnings array
+    stages:  {},
+    errors:  [],
+    warnings: [],
     success: false,
-    // Module-specific telemetry containers
     modules: {
-      calibratedProducer: null,
-      tetrachromacy: null,
-      directionalLifting: null,
-      trianglePreprocessor: null,
-      overhangPreprocessor: null
+      calibratedProducer:    null,
+      tetrachromacy:         null,
+      directionalLifting:    null,
+      doaModal:              null,   // Stage 1
+      penumbra:              null,   // Stage 1
+      trianglePreprocessor:  null,
+      overhangPreprocessor:  null
     }
   };
 
-  let depthMap = null;
-  let normalMap = null;
-  let fluxData = null;
+  let depthMap         = null;
+  let normalMap        = null;
+  let fluxData         = null;
   let selectorArtifact = null;
 
-  try {
-    const resolution = options.resolution || DEFAULTS.defaultResolutions.normal;
-    const gridSize = resolution;
+  // Stage 1 outputs — populated in the parallel CPU branch and Route A.
+  let fMapFinal      = null;
+  let doaModalResult = null;
+  let penumbraResult = null;
+  let directionalFieldArtResult = null;
+  let flowField      = null;   // ← must be function-scope, not try-scope
 
-    // ✅ HARDENED: Validate resolution bounds
+  try {
+    // Identifiers passed from _handleReconstructMeta so intermediate
+    // _persistAndPin calls inside this function have correct provenance.
+    const metaKey  = options.metaKey  || null;
+    const cameraId = options.cameraId || null;
+
+    const resolution = options.resolution || DEFAULTS.defaultResolutions.normal;
+    const gridSize   = resolution;
+
     if (!Number.isInteger(gridSize) || gridSize < 4 || gridSize > 4096) {
       throw new Error(`Invalid resolution: ${gridSize} (must be integer between 4 and 4096)`);
     }
 
-    // Memory safety check
-    const estimateMemoryBytes = (res) => {
-      const pixels = res * res;
-      const bytesPerPixel = 4 * 4; // RGBA Float32 = 4 channels * 4 bytes
-      const extraBuffers = 4;      // calibrated, tetra, directional, scratch
-      return pixels * bytesPerPixel * extraBuffers;
-    };
+    const estimateMemoryBytes = (res) =>
+      res * res * (4 * 4) * 4;   // RGBA Float32 × 4 scratch buffers
 
     const estimatedBytes = estimateMemoryBytes(gridSize);
-    const maxBytes = Number(_flags.maxWorkerMemoryBytes) || DEFAULTS.maxWorkerMemoryBytes;
-    
+    const maxBytes       = Number(_flags.maxWorkerMemoryBytes) || DEFAULTS.maxWorkerMemoryBytes;
+
     if (estimatedBytes > maxBytes) {
       telemetry.errors.push(`memoryEstimate ${estimatedBytes} > max ${maxBytes}, reducing resolution`);
       if (gridSize > DEFAULTS.defaultResolutions.low) {
-        const reduced = Math.max(DEFAULTS.defaultResolutions.low, Math.floor(gridSize / 2));
-        options.resolution = reduced;
+        options.resolution = Math.max(
+          DEFAULTS.defaultResolutions.low,
+          Math.floor(gridSize / 2)
+        );
         return _computeDepthNormalsFlux(frameBitmap, calibData, options);
       } else {
         return await _fallbackDepthEstimation(frameBitmap, resolution);
       }
     }
 
-    // ========================================
-    // STAGE 1: Load Calibrated Field
-    // ========================================
+    // =========================================================================
+    // STEP 1: CalibratedFieldProducer  (unchanged)
+    // =========================================================================
     telemetry.stages.calibrated_start = performance.now();
 
     let calibratedField = null;
-    let calibResult = null;
+    let calibResult     = null;
 
-    // ✅ DIAGNOSTIC: Log what calibData we received from Stage 4
     console.log('[DEPTH-STAGE1] Calibration data check:', {
-      calibDataExists: !!calibData,
-      calibDataType: typeof calibData,
-      calibDataNull: calibData === null,
-      calibDataUndefined: calibData === undefined,
-      calibDataKeys: calibData ? Object.keys(calibData) : [],
+      calibDataExists:          !!calibData,
       calibratedFrameKeyExists: !!(calibData && calibData.calibratedFrameKey),
-      calibratedFrameKeyValue: calibData?.calibratedFrameKey,
-      calibratedFrameKeyType: typeof calibData?.calibratedFrameKey,
-      calibratedFrameKeyLength: typeof calibData?.calibratedFrameKey === 'string' ? calibData.calibratedFrameKey.length : 'N/A',
-      hasMetaKey: !!(calibData && calibData.meta),
-      metaKeys: calibData?.meta ? Object.keys(calibData.meta) : [],
-      hasDarkKey: !!(calibData && calibData.darkKey),
-      hasFlatKey: !!(calibData && calibData.flatKey),
-      hasBiasKey: !!(calibData && calibData.biasKey)
+      calibratedFrameKeyValue:  calibData?.calibratedFrameKey
     });
 
-    // GUARD CHECK: Ensure calibration metadata is present
     if (!calibData || !calibData.calibratedFrameKey) {
-      // ✅ DIAGNOSTIC: Log exactly why we're failing
-      const failureReason = !calibData 
-        ? 'calibData is null/undefined' 
+      const failureReason = !calibData
+        ? 'calibData is null/undefined'
         : 'calibData exists but calibratedFrameKey is missing/undefined';
-      
-      console.error('[DEPTH-STAGE1] ❌ GUARD CHECK FAILED:', {
-        reason: failureReason,
-        calibDataNull: calibData === null,
-        calibDataUndefined: calibData === undefined,
-        calibDataTruthy: !!calibData,
-        calibratedFrameKey: calibData?.calibratedFrameKey,
-        calibratedFrameKeyType: typeof calibData?.calibratedFrameKey,
-        calibDataKeys: calibData ? Object.keys(calibData) : [],
-        calibDataStringified: calibData ? JSON.stringify(calibData).slice(0, 500) : 'null',
-        metaKey: metaKey,
-        cameraId: cameraId,
-        resolution: gridSize
-      });
-
+      console.error('[DEPTH-STAGE1] GUARD CHECK FAILED:', { failureReason });
       throw new Error(
         `Calibration metadata required but missing (no calibratedFrameKey). ` +
-        `Reason: ${failureReason}. ` +
-        `calibData=${calibData ? 'exists' : 'null'}, ` +
-        `calibratedFrameKey=${calibData?.calibratedFrameKey || 'undefined'}. ` +
-        `Reconstruction cannot proceed.`
+        `Reason: ${failureReason}. Reconstruction cannot proceed.`
       );
     }
 
-    // ✅ DIAGNOSTIC: Log guard check success
-    console.log('[DEPTH-STAGE1] ✅ Guard check passed, proceeding with calibrated field loading:', {
-      calibratedFrameKey: calibData.calibratedFrameKey,
-      calibratedFrameKeyLength: calibData.calibratedFrameKey.length,
-      resolution: gridSize,
-      hasStorageWrapper: !!options.storageWrapper
-    });
-
     try {
       const producer = _getCalibratedProducer();
-      
-      // ✅ DIAGNOSTIC: Log before calling producer
-      console.log('[DEPTH-STAGE1] Calling CalibratedFieldProducer.produce:', {
-        calibratedFrameKey: calibData.calibratedFrameKey,
-        frameBitmapExists: !!frameBitmap,
-        frameBitmapWidth: frameBitmap?.width,
-        frameBitmapHeight: frameBitmap?.height,
-        targetResolution: gridSize,
-        hasStorageWrapper: !!options.storageWrapper,
-        storageWrapperType: options.storageWrapper?.constructor?.name || 'unknown',
-        calibDataKeys: Object.keys(calibData)
+
+      calibResult = await producer.produce(frameBitmap, calibData, {
+        resolution:     gridSize,
+        storageWrapper: options.storageWrapper
       });
-
-      const produceStartTime = performance.now();
-      
-      calibResult = await producer.produce(
-        frameBitmap,
-        calibData,
-        { 
-          resolution: gridSize, 
-          storageWrapper: options.storageWrapper
-        }
-      );
-
-      const produceEndTime = performance.now();
-      const produceMs = produceEndTime - produceStartTime;
 
       calibratedField = calibResult.calibratedField;
 
-      // ✅ DIAGNOSTIC: Log producer result
-      console.log('[DEPTH-STAGE1] CalibratedFieldProducer.produce succeeded:', {
-        produceMs: produceMs.toFixed(2),
-        resultResolution: calibResult.resolution,
-        fieldExists: !!calibratedField,
-        fieldType: calibratedField?.constructor?.name || 'unknown',
-        fieldLength: calibratedField?.length,
-        expectedLength: gridSize * gridSize * 4,
-        lengthMatch: calibratedField?.length === gridSize * gridSize * 4,
-        source: calibResult.telemetry?.source,
-        channels: calibResult.channels,
-        encoding: calibResult.encoding,
-        spectralModel: calibResult.spectralModel,
-        telemetrySuccess: calibResult.telemetry?.success,
-        telemetryWarnings: calibResult.telemetry?.warnings?.length || 0,
-        telemetryErrors: calibResult.telemetry?.errors?.length || 0
-      });
-
-      // ✅ DIAGNOSTIC: Log field statistics (sample first few values)
-      if (calibratedField && calibratedField.length > 0) {
-        const sampleSize = Math.min(12, calibratedField.length);
-        const sample = Array.from(calibratedField.slice(0, sampleSize));
-        console.log('[DEPTH-STAGE1] Calibrated field sample (first 12 values):', {
-          values: sample.map(v => v.toFixed(4)),
-          min: Math.min(...sample),
-          max: Math.max(...sample),
-          avg: sample.reduce((a, b) => a + b, 0) / sample.length
-        });
-      }
-
-      // ✅ HARDENED: Validate resolution consistency
-      console.log('[DEPTH-STAGE1] Validating resolution consistency...');
       validateResolution(gridSize, calibResult.resolution, 'CalibratedFieldProducer');
-      console.log('[DEPTH-STAGE1] ✓ Resolution validation passed');
-      
-      // ✅ HARDENED: Validate field dimensions
-      console.log('[DEPTH-STAGE1] Validating field buffer dimensions...');
       validateBuffer(calibratedField, gridSize * gridSize * 4, 'calibratedField');
-      console.log('[DEPTH-STAGE1] ✓ Buffer validation passed');
 
-      telemetry.stages.calibrated_end = performance.now();
-      
-      // ✅ CONDITIONAL: Only persist if debug flag enabled
       if (_flags.persistIntermediates || _flags.calibDebug) {
-        console.log('[DEPTH-STAGE1] Debug mode: persisting calibrated field as intermediate artifact...');
         try {
-          await _persistAndPin(
-            options.storageWrapper,
-            {
-              type: 'calibrated_field',
-              data: { field: calibratedField },
-              meta: {
-                sourceMetaKey: metaKey,
-                cameraId: cameraId,
-                resolution: gridSize,
-                calibrationKey: calibData?.calibratedFrameKey || null,
-                computedAt: Date.now()
-              },
-              createdAt: new Date().toISOString()
-            }, 
-            {
-              owner: 'motion.worker',
-              ttlMs: CALIBRATION_FIELD_TTL_MS,  // 3 minutes
-              pinType: 'hard'
-            }
-          );
-          
-          console.log('[PERSIST] ✓ Calibrated field persisted (debug mode)');
-        } catch (err) {
-          console.warn('[PERSIST] ✗ Calibrated field persistence failed (non-fatal):', err);
+          await _persistAndPin(options.storageWrapper, {
+            type: 'calibrated_field',
+            data: { field: calibratedField },
+            meta: {
+              sourceMetaKey: metaKey, cameraId, resolution: gridSize,
+              calibrationKey: calibData?.calibratedFrameKey || null,
+              computedAt: Date.now()
+            },
+            createdAt: new Date().toISOString()
+          }, { owner: 'motion.worker', ttlMs: CALIBRATION_FIELD_TTL_MS, pinType: 'hard' });
+        } catch (e) {
+          console.warn('[PERSIST] calibrated_field non-fatal:', e.message);
         }
-      } else {
-        console.log('[DEPTH-STAGE1] Skipping calibrated field persistence (debug mode disabled)');
       }
-      
-      telemetry.stages.calibrated_ms = telemetry.stages.calibrated_end - telemetry.stages.calibrated_start;
-      
-      // ✅ NEW: Attach module telemetry
+
+      telemetry.stages.calibrated_ms       = performance.now() - telemetry.stages.calibrated_start;
       telemetry.modules.calibratedProducer = calibResult.telemetry || null;
 
-      // ✅ DIAGNOSTIC: Log Stage 1 completion
-      console.log('[DEPTH-STAGE1] ✅ Stage 1 completed successfully:', {
-        totalMs: telemetry.stages.calibrated_ms.toFixed(2),
-        fieldReady: !!calibratedField,
-        fieldLength: calibratedField?.length,
-        resolution: gridSize,
-        telemetryAttached: !!telemetry.modules.calibratedProducer
-      });
-
     } catch (calibErr) {
-      // ✅ DIAGNOSTIC: Enhanced error logging
-      console.error('[DEPTH-STAGE1] ❌ Calibrated field loading/production failed:', {
-        errorMessage: calibErr.message,
-        errorType: calibErr.constructor.name,
-        errorStack: calibErr.stack,
-        calibratedFrameKey: calibData?.calibratedFrameKey,
-        hasStorageWrapper: !!options.storageWrapper,
-        resolution: gridSize,
-        metaKey: metaKey,
-        cameraId: cameraId
-      });
-      
       const errMsg = `Calibration loading failed: ${calibErr.message}`;
       telemetry.errors.push(errMsg);
       throw new Error(errMsg);
     }
 
-    // STEP 2: Tetrachromacy (Spectral Decomposition)
+    // =========================================================================
+    // STEP 2: Tetrachromacy  (unchanged)
+    // =========================================================================
     telemetry.stages.tetrachromacy_start = performance.now();
 
-    let tetraField = calibratedField;
-    let tetraResult = null;
+    let tetraField   = calibratedField;
+    let tetraResult  = null;
     let chromaticity = null;
 
     if (_flags.enableTetrachromacy !== false) {
@@ -1879,49 +2508,35 @@ async function _computeDepthNormalsFlux(frameBitmap, calibData, options = {}) {
         const tetra = _getTetrachromacy();
         tetraResult = await tetra.process(calibratedField, gridSize, {});
 
-        tetraField = tetraResult.tetraField;
+        tetraField   = tetraResult.tetraField;
         chromaticity = tetraResult.chromaticity;
 
         validateResolution(gridSize, tetraResult.resolution, 'Tetrachromacy');
         validateBuffer(tetraField, gridSize * gridSize * 4, 'tetraField');
 
-        // ============================================================================
-        // ✅ NEW: Persist tetrachromacy output (conditional on flag)
-        // ============================================================================
         if (_flags.persistIntermediates) {
           try {
-            await _persistAndPin(
-              options.storageWrapper,
-              {
+            await _persistAndPin(options.storageWrapper, {
               type: 'tetra_field',
               data: {
-                field: tetraField,
+                field:            tetraField,
                 opponentChannels: tetraResult.opponentChannels || null,
-                chromaticity: tetraResult.chromaticity || null
+                chromaticity:     tetraResult.chromaticity     || null
               },
               meta: {
-                sourceMetaKey: metaKey,
-                cameraId: cameraId,
-                resolution: gridSize,
+                sourceMetaKey: metaKey, cameraId, resolution: gridSize,
                 hasOpponentChannels: !!tetraResult.opponentChannels,
                 computedAt: Date.now()
               },
               createdAt: new Date().toISOString()
-            }, {
-              owner: 'motion.worker',
-              ttlMs: INTERMEDIATE_TTL_MS, // 2 minutes (debug artifact)
-              pinType: 'soft'
-            });
-            
-            console.log('[PERSIST] ✓ Tetrachromacy field persisted (intermediate artifact)');
-          } catch (tetraPersistErr) {
-            console.warn('[PERSIST] ✗ Tetrachromacy persistence failed (non-fatal):', tetraPersistErr);
+            }, { owner: 'motion.worker', ttlMs: INTERMEDIATE_TTL_MS, pinType: 'soft' });
+          } catch (e) {
+            console.warn('[PERSIST] tetra_field non-fatal:', e.message);
           }
         }
 
-        telemetry.stages.tetrachromacy_end = performance.now();
-        telemetry.stages.tetrachromacy_ms = telemetry.stages.tetrachromacy_end - telemetry.stages.tetrachromacy_start;
-        telemetry.modules.tetrachromacy = tetraResult.telemetry || null;
+        telemetry.stages.tetrachromacy_ms = performance.now() - telemetry.stages.tetrachromacy_start;
+        telemetry.modules.tetrachromacy   = tetraResult.telemetry || null;
 
       } catch (tetraErr) {
         telemetry.warnings.push(`Tetrachromacy failed: ${tetraErr.message}, using calibrated field`);
@@ -1930,83 +2545,76 @@ async function _computeDepthNormalsFlux(frameBitmap, calibData, options = {}) {
       }
     }
 
-    // Compute intensity for bump/specular (from tetraResult or compute from tetraField)
+    // Intensity (luminance) from tetra opponent channels or derived inline
     let intensity = null;
     if (tetraResult && tetraResult.opponentChannels && tetraResult.opponentChannels.L) {
       intensity = tetraResult.opponentChannels.L;
     } else {
-      const count = gridSize * gridSize;
-      intensity = new Float32Array(count);
-      for (let i = 0; i < count; i++) {
-        const r = tetraField[i * 4 + 0];
-        const g = tetraField[i * 4 + 1];
-        const b = tetraField[i * 4 + 2];
-        intensity[i] = 0.299 * r + 0.587 * g + 0.114 * b;
+      const cnt = gridSize * gridSize;
+      intensity = new Float32Array(cnt);
+      for (let i = 0; i < cnt; i++) {
+        intensity[i] =
+          0.299 * tetraField[i * 4    ] +
+          0.587 * tetraField[i * 4 + 1] +
+          0.114 * tetraField[i * 4 + 2];
       }
     }
 
-    // STEP 3: DirectionalLifting (Temporal Aggregation)
+    // =========================================================================
+    // STEP 3: DirectionalLifting  (unchanged)
+    // =========================================================================
     telemetry.stages.directional_start = performance.now();
 
     let directionalField = tetraField;
-    let liftResult = null;
+    let liftResult       = null;
+    let coherence        = null;
 
     if (_flags.enableDirectionalLifting !== false) {
       try {
-        // Pass frameRate from the manifest's plenopticContext snapshot.
-        // options.plenopticContext is populated by _handleReconstructMeta
-        // from manifest.data.plenopticContext before calling _computeDepthNormalsFlux.
         const manifestFrameRate = options.plenopticContext?.frameRate ?? null;
         const dirLift = await _getDirectionalLifting(gridSize, manifestFrameRate);
-        
+
         liftResult = await dirLift.process(
-          tetraField,
-          gridSize,
-          Date.now(),
-          { metadata: options }
+          tetraField, gridSize, Date.now(), { metadata: options }
         );
 
         directionalField = liftResult.directionalField;
+        coherence        = liftResult.coherence ?? null;
 
         validateResolution(gridSize, liftResult.resolution, 'DirectionalLifting');
         validateBuffer(directionalField, gridSize * gridSize * 4, 'directionalField');
 
-        // ============================================================================
-        // ✅ NEW: Persist directional lifting output (conditional on flag)
-        // ============================================================================
-        if (_flags.persistIntermediates) {
-          try {
-            await _persistAndPin(
-              options.storageWrapper,
-              {
-              type: 'directional_field',
-              data: {
-                field: directionalField,
-                coherence: liftResult.coherence || null
-              },
-              meta: {
-                sourceMetaKey: metaKey,
-                cameraId: cameraId,
-                resolution: gridSize,
-                coherenceMean: liftResult.coherence?.mean || null,
-                computedAt: Date.now()
-              },
-              createdAt: new Date().toISOString()
-            }, {
-              owner: 'motion.worker',
-              ttlMs: INTERMEDIATE_TTL_MS, // 2 minutes
-              pinType: 'soft'
-            });
-            
-            console.log('[PERSIST] ✓ Directional field persisted (intermediate artifact)');
-          } catch (dirPersistErr) {
-            console.warn('[PERSIST] ✗ DirectionalLifting persistence failed (non-fatal):', dirPersistErr);
-          }
+// Always persist directional_field — topology.worker (Stage 4A) requires it
+        // unconditionally. Derivatives and coherence are packed into the same artifact
+        // so topology.worker needs only one storage key.
+        try {
+          directionalFieldArtResult = await _persistAndPin(options.storageWrapper, {
+            type: 'directional_field',
+            data: {
+              field:       directionalField,
+              coherence:   liftResult.coherence   ?? null,
+              derivatives: liftResult.derivatives
+                ? { field: liftResult.derivatives.field,
+                    dt:    liftResult.derivatives.dt,
+                    meanAbsDerivative: liftResult.derivatives.meanAbsDerivative }
+                : null
+            },
+            meta: {
+              sourceMetaKey:  metaKey,
+              cameraId,
+              resolution:     gridSize,
+              coherenceMean:  liftResult.coherence?.mean ?? null,
+              hasDerivatives: !!(liftResult.derivatives),
+              computedAt:     Date.now()
+            },
+            createdAt: new Date().toISOString()
+          }, { owner: 'motion.worker', ttlMs: INTERMEDIATE_TTL_MS, pinType: 'soft' });
+        } catch (e) {
+          console.warn('[PERSIST] directional_field non-fatal:', e.message);
         }
 
-        telemetry.stages.directional_end = performance.now();
-        telemetry.stages.directional_ms = telemetry.stages.directional_end - telemetry.stages.directional_start;
-        telemetry.coherenceMean = liftResult.coherence?.mean;
+        telemetry.stages.directional_ms      = performance.now() - telemetry.stages.directional_start;
+        telemetry.coherenceMean              = liftResult.coherence?.mean;
         telemetry.modules.directionalLifting = liftResult.telemetry || null;
 
       } catch (liftErr) {
@@ -2016,323 +2624,445 @@ async function _computeDepthNormalsFlux(frameBitmap, calibData, options = {}) {
       }
     }
 
-    // STEP 4: Compute Bump Map
-    telemetry.stages.bump_start = performance.now();
+    // =========================================================================
+    // PARALLEL EXECUTION
+    //
+    // CPU BRANCH (STEPS 4–6 + Stage 1 work):
+    //   bump → normal → specular → DOA/modal → PenumbraAnalyzer → Route B f_map
+    //   All use calibratedField / tetraField / directionalField / coherence.
+    //   No depth, no GPU.
+    //
+    // GPU BRANCH (THREE.js init):
+    //   Load THREE module, create renderer, detect capabilities.
+    //   The triangle preprocessor runs AFTER Promise.all because it needs
+    //   bumpField and normalField from the CPU branch.
+    //
+    // Wall-clock gain: max(CPU branch, GPU branch) instead of their sum.
+    // =========================================================================
 
-    let bumpField = null;
+    telemetry.stages.parallel_start = performance.now();
 
-    if (intensity) {
-      try {
-        bumpField = _computeBumpFromIntensity(intensity, gridSize, {
-          bumpScale: _flags.bumpScale || 1.0,
-          fusionMode: _flags.bumpFusionMode || false
-        });
+    let cpuResult = null;
+    let gpuResult = null;
 
-        validateBuffer(bumpField, gridSize * gridSize * 4, 'bumpField');
+    [cpuResult, gpuResult] = await Promise.all([
 
-        // ============================================================================
-        // ✅ NEW: Persist bump map (conditional on flag)
-        // ============================================================================
-        if (_flags.persistIntermediates && bumpField) {
+      // ── CPU BRANCH ──────────────────────────────────────────────────────────
+      (async () => {
+        const cpuTel = {};
+
+        // STEP 4: Bump Map
+        cpuTel.bump_start = performance.now();
+        let bumpField = null;
+        if (intensity) {
           try {
-            await _persistAndPin(
-              options.storageWrapper,
-              {
-              type: 'bump_map',
-              data: { field: bumpField },
-              meta: {
-                sourceMetaKey: metaKey,
-                cameraId: cameraId,
-                resolution: gridSize,
-                bumpScale: _flags.bumpScale || 1.0,
-                fusionMode: _flags.bumpFusionMode || false,
-                computedAt: Date.now()
-              },
-              createdAt: new Date().toISOString()
-            }, {
-              owner: 'motion.worker',
-              ttlMs: INTERMEDIATE_TTL_MS, // 2 minutes
-              pinType: 'soft'
+            bumpField = _computeBumpFromIntensity(intensity, gridSize, {
+              bumpScale:  _flags.bumpScale     || 1.0,
+              fusionMode: _flags.bumpFusionMode || false
             });
-            
-            console.log('[PERSIST] ✓ Bump map persisted (intermediate artifact)');
-          } catch (bumpPersistErr) {
-            console.warn('[PERSIST] ✗ Bump map persistence failed (non-fatal):', bumpPersistErr);
+            validateBuffer(bumpField, gridSize * gridSize * 4, 'bumpField');
+
+            if (_flags.persistIntermediates) {
+              try {
+                await _persistAndPin(options.storageWrapper, {
+                  type: 'bump_map',
+                  data: { field: bumpField },
+                  meta: {
+                    sourceMetaKey: metaKey, cameraId, resolution: gridSize,
+                    bumpScale:  _flags.bumpScale     || 1.0,
+                    fusionMode: _flags.bumpFusionMode || false,
+                    computedAt: Date.now()
+                  },
+                  createdAt: new Date().toISOString()
+                }, { owner: 'motion.worker', ttlMs: INTERMEDIATE_TTL_MS, pinType: 'soft' });
+              } catch (e) {
+                console.warn('[PERSIST] bump_map non-fatal:', e.message);
+              }
+            }
+          } catch (e) {
+            cpuTel.bumpWarning = `Bump failed: ${e.message}`;
+            console.warn('motion.worker: Bump failed', e);
           }
         }
+        cpuTel.bump_ms = performance.now() - cpuTel.bump_start;
 
-        telemetry.stages.bump_end = performance.now();
-        telemetry.stages.bump_ms = telemetry.stages.bump_end - telemetry.stages.bump_start;
-
-      } catch (bumpErr) {
-        telemetry.warnings.push(`Bump computation failed: ${bumpErr.message}`);
-        console.warn('motion.worker: Bump computation failed', bumpErr);
-      }
-    }
-
-    // ========================================
-    // STAGE 5: Compute Normal Map
-    // ========================================
-    telemetry.stages.normal_start = performance.now();
-
-    let normalField = null;
-
-    if (bumpField) {
-      try {
-        normalField = _computeNormalFromBump(bumpField, gridSize, _flags.normalScale || 1.0);
-        // ✅ HARDENED: Validate output
-        validateBuffer(normalField, gridSize * gridSize * 4, 'normalField');
-        telemetry.stages.normal_end = performance.now();
-        telemetry.stages.normal_ms = telemetry.stages.normal_end - telemetry.stages.normal_start;
-
-      } catch (normalErr) {
-        telemetry.warnings.push(`Normal computation failed: ${normalErr.message}`);
-        console.warn('motion.worker: Normal computation failed', normalErr);
-      }
-    }
-
-    // STEP 6: Compute Specular Mask
-    telemetry.stages.specular_start = performance.now();
-
-    let specularMask = null;
-
-    if (intensity && chromaticity) {
-      try {
-        specularMask = _computeSpecularMask(intensity, chromaticity, gridSize, {
-          hpGain: _flags.specularHpGain || 4.0,
-          alpha: _flags.specularAlpha || 0.5,
-          chromaScale: _flags.specularChromaScale || 3.0,
-          threshold: _flags.specularThreshold || 0.15
-        });
-        
-        validateBuffer(specularMask, gridSize * gridSize * 4, 'specularMask');
-
-        // ============================================================================
-        // ✅ NEW: Persist specular mask (conditional on flag)
-        // ============================================================================
-        if (_flags.persistIntermediates && specularMask) {
+        // STEP 5: Normal Map
+        cpuTel.normal_start = performance.now();
+        let normalField = null;
+        if (bumpField) {
           try {
-            await _persistAndPin(
-              options.storageWrapper,
-              {
-              type: 'specular_mask',
-              data: { field: specularMask },
-              meta: {
-                sourceMetaKey: metaKey,
-                cameraId: cameraId,
-                resolution: gridSize,
-                hpGain: _flags.specularHpGain || 4.0,
-                alpha: _flags.specularAlpha || 0.5,
-                chromaScale: _flags.specularChromaScale || 3.0,
-                threshold: _flags.specularThreshold || 0.15,
-                computedAt: Date.now()
-              },
-              createdAt: new Date().toISOString()
-            }, {
-              owner: 'motion.worker',
-              ttlMs: INTERMEDIATE_TTL_MS, // 2 minutes
-              pinType: 'soft'
-            });
-            
-            console.log('[PERSIST] ✓ Specular mask persisted (intermediate artifact)');
-          } catch (specPersistErr) {
-            console.warn('[PERSIST] ✗ Specular mask persistence failed (non-fatal):', specPersistErr);
+            normalField = _computeNormalFromBump(bumpField, gridSize, _flags.normalScale || 1.0);
+            validateBuffer(normalField, gridSize * gridSize * 4, 'normalField');
+          } catch (e) {
+            cpuTel.normalWarning = `Normal failed: ${e.message}`;
+            console.warn('motion.worker: Normal failed', e);
           }
         }
+        cpuTel.normal_ms = performance.now() - cpuTel.normal_start;
 
-        telemetry.stages.specular_end = performance.now();
-        telemetry.stages.specular_ms = telemetry.stages.specular_end - telemetry.stages.specular_start;
+        // STEP 6: Specular Mask
+        cpuTel.specular_start = performance.now();
+        let specularMask = null;
+        if (intensity && chromaticity) {
+          try {
+            specularMask = _computeSpecularMask(intensity, chromaticity, gridSize, {
+              hpGain:      _flags.specularHpGain      || 4.0,
+              alpha:       _flags.specularAlpha       || 0.5,
+              chromaScale: _flags.specularChromaScale || 3.0,
+              threshold:   _flags.specularThreshold   || 0.15
+            });
+            validateBuffer(specularMask, gridSize * gridSize * 4, 'specularMask');
 
-      } catch (specErr) {
-        telemetry.warnings.push(`Specular computation failed: ${specErr.message}`);
-        console.warn('motion.worker: Specular computation failed', specErr);
-      }
-    }
+            if (_flags.persistIntermediates) {
+              try {
+                await _persistAndPin(options.storageWrapper, {
+                  type: 'specular_mask',
+                  data: { field: specularMask },
+                  meta: {
+                    sourceMetaKey: metaKey, cameraId, resolution: gridSize,
+                    computedAt: Date.now()
+                  },
+                  createdAt: new Date().toISOString()
+                }, { owner: 'motion.worker', ttlMs: INTERMEDIATE_TTL_MS, pinType: 'soft' });
+              } catch (e) {
+                console.warn('[PERSIST] specular_mask non-fatal:', e.message);
+              }
+            }
+          } catch (e) {
+            cpuTel.specularWarning = `Specular failed: ${e.message}`;
+            console.warn('motion.worker: Specular failed', e);
+          }
+        }
+        cpuTel.specular_ms = performance.now() - cpuTel.specular_start;
 
-    // ========================================
-    // STAGE 7: Ensure THREE.js Renderer Ready
-    // ========================================
-    telemetry.stages.init_start = performance.now();
+        // Stage 1A: DOA + Modal decomposition
+        cpuTel.doa_start = performance.now();
+        let _doaResult = null;
+        try {
+          _doaResult = _computeDOAAndModal(
+            directionalField, tetraField, coherence,
+            specularMask, chromaticity, gridSize
+          );
+        } catch (e) {
+          telemetry.warnings.push(`DOA/modal failed: ${e.message}`);
+          console.warn('motion.worker: DOA/modal failed', e);
+        }
+        cpuTel.doa_ms = performance.now() - cpuTel.doa_start;
 
-    let renderer = null;
-    try {
-      renderer = await _initThreeRenderer();
-    } catch (initErr) {
-      console.warn('motion.worker: THREE.js init failed, using CPU fallback', initErr);
-      telemetry.errors.push(`three_init: ${initErr.message || String(initErr)}`);
+        // Stage 1B: PenumbraAnalyzer
+        cpuTel.penumbra_start = performance.now();
+        let _penumbraRes = null;
+        try {
+          _penumbraRes = await _getPenumbraAnalyzer().analyze(
+            calibratedField,
+            directionalField,
+            intensity,
+            gridSize,
+            {
+              derivatives:     liftResult?.derivatives  ?? null,
+              profileWindowPx: _flags.penumbraProfileWindow || 17
+            }
+          );
+        } catch (e) {
+          telemetry.warnings.push(`PenumbraAnalyzer failed: ${e.message}`);
+          console.warn('motion.worker: PenumbraAnalyzer failed', e);
+        }
+        cpuTel.penumbra_ms = performance.now() - cpuTel.penumbra_start;
+
+        // Stage 1C: Route B f_map proxy (immediate, no depth needed)
+        cpuTel.fmapB_start = performance.now();
+        let _fMapB = null;
+        try {
+          _fMapB = _computeFMapRouteB(coherence?.perPixel ?? null, gridSize);
+        } catch (e) {
+          telemetry.warnings.push(`FMap RouteB failed: ${e.message}`);
+          console.warn('motion.worker: FMap RouteB failed', e);
+        }
+        cpuTel.fmapB_ms = performance.now() - cpuTel.fmapB_start;
+
+        return {
+          bumpField, normalField, specularMask,
+          doaModalResult: _doaResult,
+          penumbraResult: _penumbraRes,
+          fMapRouteB:     _fMapB,
+          cpuTel
+        };
+      })(),
+
+      // ── GPU BRANCH ──────────────────────────────────────────────────────────
+      // THREE module load + renderer init run concurrently with the CPU branch.
+      // Texture creation and the triangle preprocessor (STEPS 8–14) follow
+      // AFTER Promise.all so they can use bumpField / normalField.
+      (async () => {
+        const gpuTel = {};
+        gpuTel.init_start = performance.now();
+
+        let renderer = null;
+        let THREE    = null;
+        let gpuCaps  = null;
+
+        try {
+          renderer = await _initThreeRenderer();
+        } catch (e) {
+          console.warn('motion.worker: THREE renderer init failed', e);
+          telemetry.errors.push(`three_init: ${e.message ?? String(e)}`);
+          return { fallback: true, fallbackError: e };
+        }
+
+        try {
+          THREE   = await _loadThreeModule();
+          gpuCaps = await _detectGPUCapabilities();
+        } catch (e) {
+          console.warn('motion.worker: THREE module load failed', e);
+          return { fallback: true, fallbackError: e };
+        }
+
+        gpuTel.init_ms = performance.now() - gpuTel.init_start;
+        return { fallback: false, renderer, THREE, gpuCaps, gpuTel };
+      })()
+
+    ]); // ── end Promise.all ──────────────────────────────────────────────────
+
+    telemetry.stages.parallel_ms = performance.now() - telemetry.stages.parallel_start;
+
+    if (gpuResult.fallback) {
       return await _fallbackDepthEstimation(frameBitmap, resolution);
     }
 
-    telemetry.stages.init_end = performance.now();
-    telemetry.stages.init_ms = telemetry.stages.init_end - telemetry.stages.init_start;
+    // Unpack parallel results
+    const {
+      bumpField, normalField, specularMask,
+      doaModalResult: _doaModal,
+      penumbraResult: _penumbra,
+      fMapRouteB,
+      cpuTel
+    } = cpuResult;
 
-    // ========================================
-    // STAGE 8: Load THREE.js and Create Textures
-    // ========================================
+    const { renderer, THREE, gpuCaps, gpuTel } = gpuResult;
+
+    // Promote Stage 1 outputs to function-scope so the return can include them
+    doaModalResult = _doaModal;
+    penumbraResult = _penumbra;
+
+    Object.assign(telemetry.stages, cpuTel, gpuTel);
+    if (doaModalResult?.telemetry) telemetry.modules.doaModal = doaModalResult.telemetry;
+    if (penumbraResult?.telemetry) telemetry.modules.penumbra = penumbraResult.telemetry;
+
+    // =========================================================================
+    // STEP 7.5: Horn-Schunck optical flow   (Stage 3 prerequisite)
+    // Prerequisites all coexist here — this is the ONLY window where:
+    //   liftResult.derivatives  (temporal signal It)
+    //   intensity               (spatial gradients Ix, Iy via inline Sobel)
+    //   renderer, THREE         (GPU available for ping-pong passes)
+    // are simultaneously in scope.
+    // =========================================================================
+    // flowField declared at function scope above
+    if (_flags.enableOpticalFlow) {
+      try {
+        const hsT0      = performance.now();
+        const hsCount   = gridSize * gridSize;
+        const hsAlpha   = safeNumeric(_flags.opticalFlowAlpha,      1.0, 0.1, 10);
+        const hsIters   = Math.max(10, Math.min(100,
+          Math.floor(_flags.opticalFlowIterations ?? 30)));
+
+        // ── It: temporal derivative — luminance collapse of liftResult.derivatives ──
+        // liftResult.derivatives is Float32Array res²×4 (directional RGBA delta).
+        // If missing (DirectionalLifting failed), It stays zero → H-S outputs zero flow.
+        const It = new Float32Array(hsCount);
+        if (liftResult?.derivatives) {
+          const d = liftResult.derivatives;
+          for (let i = 0; i < hsCount; i++) {
+            It[i] = 0.299 * (d[i*4] || 0) +
+                    0.587 * (d[i*4+1] || 0) +
+                    0.114 * (d[i*4+2] || 0);
+          }
+        }
+
+        // ── Ix, Iy: Sobel spatial derivatives of intensity field ──────────────
+        const Ix = new Float32Array(hsCount);
+        const Iy = new Float32Array(hsCount);
+        if (intensity) {
+          for (let y = 0; y < gridSize; y++) {
+            for (let x = 0; x < gridSize; x++) {
+              const i   = y * gridSize + x;
+              const xl  = Math.max(0, x - 1);
+              const xr  = Math.min(gridSize - 1, x + 1);
+              const yu  = Math.max(0, y - 1);
+              const yd  = Math.min(gridSize - 1, y + 1);
+              const g   = (px, py) => intensity[py * gridSize + px];
+              Ix[i] = (-g(xl,yu) + g(xr,yu) - 2*g(xl,y) + 2*g(xr,y) - g(xl,yd) + g(xr,yd)) / 8;
+              Iy[i] = (-g(xl,yu) - 2*g(x,yu) - g(xr,yu) + g(xl,yd) + 2*g(x,yd) + g(xr,yd)) / 8;
+            }
+          }
+        }
+
+        // ── Guard: float textures required ───────────────────────────────────
+        // WebGL2 supports floats natively; WebGL1 needs OES_texture_float.
+        if (!gpuCaps.isWebGL2 && !gpuCaps.floatTexturesSupported) {
+          throw new Error('float textures not supported — H-S requires FloatType RenderTarget');
+        }
+
+        const hsResult = _runHornSchunck(
+          THREE, renderer,
+          It, Ix, Iy,
+          gridSize, gridSize,
+          hsAlpha, hsIters
+        );
+
+        flowField = {
+          u:      hsResult.u,
+          v:      hsResult.v,
+          width:  gridSize,
+          height: gridSize
+        };
+
+        telemetry.stages.hornSchunck_ms = hsResult.processingMs;
+        console.log(`[H-S] optical flow in ${hsResult.processingMs.toFixed(1)}ms ` +
+          `(α²=${hsAlpha.toFixed(2)}, ${hsIters} passes)`);
+
+      } catch (hsErr) {
+        telemetry.warnings.push(`Horn-Schunck failed: ${hsErr.message}`);
+        console.warn('motion.worker: Horn-Schunck failed (flowField=null)', hsErr);
+        flowField = null;
+      }
+    }
+
+    // =========================================================================
+    // STEP 8: Texture creation
+    // Logic identical to original; bumpField / normalField now come from
+    // cpuResult rather than being computed inline.
+    // =========================================================================
     telemetry.stages.texture_load_start = performance.now();
-
-    const THREE = await _loadThreeModule();
-
-    // Ensure GPU capability info is available
-    const gpuCaps = await _detectGPUCapabilities();
 
     const createTexture = (field, name) => {
       if (!field) return null;
 
-      // Decide whether float textures are supported
-      const useFloat = gpuCaps && gpuCaps.floatTexturesSupported;
-
-      let data = field;
-      let type = useFloat ? THREE.FloatType : THREE.UnsignedByteType;
+      const useFloat  = !!(gpuCaps && gpuCaps.floatTexturesSupported);
       let arrayBuffer = field;
+      let type        = useFloat ? THREE.FloatType : THREE.UnsignedByteType;
 
       if (!useFloat) {
-        // Convert Float32 normalized [0,1] -> Uint8Clamped (0..255)
         const uint8 = new Uint8ClampedArray(field.length);
         for (let i = 0; i < field.length; i++) {
-          // clamp and scale
           let v = Number(field[i]);
           if (!isFinite(v)) v = 0;
-          let s = Math.max(0, Math.min(1, v)) * 255;
-          uint8[i] = Math.round(s);
+          uint8[i] = Math.round(Math.max(0, Math.min(1, v)) * 255);
         }
         arrayBuffer = uint8;
-        type = THREE.UnsignedByteType;
-        console.warn(`motion.worker: GPU float textures not supported — using 8-bit fallback for texture "${name}"`);
+        type        = THREE.UnsignedByteType;
+        console.warn(`motion.worker: 8-bit fallback for texture "${name}"`);
       }
 
       const tex = new THREE.DataTexture(
-        arrayBuffer,
-        gridSize,
-        gridSize,
-        THREE.RGBAFormat,
-        type
+        arrayBuffer, gridSize, gridSize, THREE.RGBAFormat, type
       );
       tex.needsUpdate = true;
-      tex.minFilter = THREE.LinearFilter;
-      tex.magFilter = THREE.LinearFilter;
-      tex.wrapS = THREE.ClampToEdgeWrapping;
-      tex.wrapT = THREE.ClampToEdgeWrapping;
-
+      tex.minFilter   = THREE.LinearFilter;
+      tex.magFilter   = THREE.LinearFilter;
+      tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
       _trackResource(tex, 'textures');
       return tex;
     };
 
     const diffuseTexture = createTexture(directionalField, 'diffuse');
-    const bumpTexture = bumpField ? createTexture(bumpField, 'bump') : diffuseTexture;
-    const normalTexture = normalField ? createTexture(normalField, 'normal') : diffuseTexture;
-    const albedoTexture = createTexture(directionalField, 'albedo');
+    const bumpTexture    = bumpField   ? createTexture(bumpField,   'bump')   : diffuseTexture;
+    const normalTexture  = normalField ? createTexture(normalField, 'normal') : diffuseTexture;
+    const albedoTexture  = createTexture(directionalField, 'albedo');
 
     const textures = {
-      diffuse: diffuseTexture,
-      bump: bumpTexture,
-      normal: normalTexture,
-      albedo: albedoTexture,
-      bumpScale: _flags.bumpScale || 1.0,
+      diffuse:     diffuseTexture,
+      bump:        bumpTexture,
+      normal:      normalTexture,
+      albedo:      albedoTexture,
+      bumpScale:   _flags.bumpScale   || 1.0,
       normalScale: _flags.normalScale || 1.0,
       albedoScale: 1.0
     };
 
-    telemetry.stages.texture_load_end = performance.now();
-    telemetry.stages.texture_load_ms = telemetry.stages.texture_load_end - telemetry.stages.texture_load_start;
+    telemetry.stages.texture_load_ms =
+      performance.now() - telemetry.stages.texture_load_start;
 
-    // ========================================
-    // STAGE 9: Generate UV Grid
-    // ========================================
+    // =========================================================================
+    // STEPS 9–14: unchanged from original
+    // =========================================================================
+
+    // STEP 9: UV Grid
     telemetry.stages.grid_gen_start = performance.now();
 
-    const count = gridSize * gridSize;
+    const count     = gridSize * gridSize;
     const positions = new Float32Array(count * 2);
     const normals2D = new Float32Array(count * 2);
 
     for (let y = 0; y < gridSize; y++) {
       for (let x = 0; x < gridSize; x++) {
         const i = y * gridSize + x;
-        positions[i * 2] = x / (gridSize - 1);
+        positions[i * 2]     = x / (gridSize - 1);
         positions[i * 2 + 1] = y / (gridSize - 1);
-        normals2D[i * 2] = 0;
+        normals2D[i * 2]     = 0;
         normals2D[i * 2 + 1] = 1;
       }
     }
 
-    telemetry.stages.grid_gen_end = performance.now();
-    telemetry.stages.grid_gen_ms = telemetry.stages.grid_gen_end - telemetry.stages.grid_gen_start;
+    telemetry.stages.grid_gen_ms = performance.now() - telemetry.stages.grid_gen_start;
 
-    // STEP 10: Run Triangle Preprocessor
+    // STEP 10: Triangle Preprocessor
     telemetry.stages.triangle_start = performance.now();
 
     let triangleResult = null;
     try {
-      const { createDepthTrianglePreprocessor } = await import('/src/js/core/depthTrianglePreprocessor.js');
+      const { createDepthTrianglePreprocessor } =
+        await import('/src/js/core/depthTrianglePreprocessor.js');
 
       _trianglePreprocessor = createDepthTrianglePreprocessor({
-        THREE: THREE,
-        renderer: renderer,
-        bakeSize: Math.max(256, Math.min(1024, Math.floor(gridSize * 4))),
-        gridSize: gridSize,
-        positions: positions,
-        normals: normals2D,
-        textures: textures,
-        kL: safeNumeric(_flags.depthKL, 1.0, 0, 10),
-        kD: safeNumeric(_flags.depthKD, 0.5, 0, 10),
-        baseDepth: safeNumeric(_flags.depthBase, 0.1, 0, 10),
+        THREE:      THREE,
+        renderer:   renderer,
+        bakeSize:   Math.max(256, Math.min(1024, Math.floor(gridSize * 4))),
+        gridSize,
+        positions,
+        normals:    normals2D,
+        textures,
+        kL:         safeNumeric(_flags.depthKL,    1.0, 0, 10),
+        kD:         safeNumeric(_flags.depthKD,    0.5, 0, 10),
+        baseDepth:  safeNumeric(_flags.depthBase,  0.1, 0, 10),
         depthScale: safeNumeric(_flags.depthScale, 2.0, 0, 100)
       });
 
       const initErr = _trianglePreprocessor.init();
-      if (initErr) {
-        throw new Error(`Triangle preprocessor init failed: ${initErr}`);
-      }
+      if (initErr) throw new Error(`Triangle preprocessor init failed: ${initErr}`);
 
       triangleResult = _trianglePreprocessor.compute();
-
       if (!triangleResult || !triangleResult.depths) {
         throw new Error('Triangle preprocessor returned invalid result');
       }
 
-      validateBuffer(triangleResult.depths, count, 'triangleResult.depths');
-      validateBuffer(triangleResult.tilts, count, 'triangleResult.tilts');
-      validateBuffer(triangleResult.windingNumbers, count, 'triangleResult.windingNumbers');
+      validateBuffer(triangleResult.depths,         count, 'triangleResult.depths');
+      validateBuffer(triangleResult.tilts,           count, 'triangleResult.tilts');
+      validateBuffer(triangleResult.windingNumbers,  count, 'triangleResult.windingNumbers');
 
-      // ============================================================================
-      // ✅ NEW: Persist triangle preprocessor output (conditional on flag)
-      // ============================================================================
       if (_flags.persistIntermediates) {
         try {
-          await _persistAndPin(
-            options.storageWrapper,
-            {
+          await _persistAndPin(options.storageWrapper, {
             type: 'triangle_output',
             data: {
-              depths: triangleResult.depths,
-              tilts: triangleResult.tilts,
+              depths:         triangleResult.depths,
+              tilts:          triangleResult.tilts,
               windingNumbers: triangleResult.windingNumbers
             },
             meta: {
-              sourceMetaKey: metaKey,
-              cameraId: cameraId,
-              resolution: gridSize,
-              bakeSize: triangleResult.stats?.bakeSize || null,
-              sampleCount: triangleResult.depths.length,
-              stats: triangleResult.stats || {},
-              computedAt: Date.now()
+              sourceMetaKey: metaKey, cameraId, resolution: gridSize,
+              sampleCount:   triangleResult.depths.length,
+              stats:         triangleResult.stats || {},
+              computedAt:    Date.now()
             },
             createdAt: new Date().toISOString()
-          }, {
-            owner: 'motion.worker',
-            ttlMs: INTERMEDIATE_TTL_MS, // 2 minutes
-            pinType: 'soft'
-          });
-          
-          console.log('[PERSIST] ✓ Triangle preprocessor output persisted (intermediate artifact)');
-        } catch (triPersistErr) {
-          console.warn('[PERSIST] ✗ Triangle output persistence failed (non-fatal):', triPersistErr);
+          }, { owner: 'motion.worker', ttlMs: INTERMEDIATE_TTL_MS, pinType: 'soft' });
+        } catch (e) {
+          console.warn('[PERSIST] triangle_output non-fatal:', e.message);
         }
       }
 
-      telemetry.stages.triangle_end = performance.now();
-      telemetry.stages.triangle_ms = telemetry.stages.triangle_end - telemetry.stages.triangle_start;
-      telemetry.stages.triangle_samples = triangleResult.depths.length;
+      telemetry.stages.triangle_ms           = performance.now() - telemetry.stages.triangle_start;
+      telemetry.stages.triangle_samples      = triangleResult.depths.length;
       telemetry.modules.trianglePreprocessor = triangleResult.stats || null;
 
     } catch (triangleErr) {
@@ -2342,78 +3072,69 @@ async function _computeDepthNormalsFlux(frameBitmap, calibData, options = {}) {
       throw triangleErr;
     }
 
-    // ========================================
-    // STAGE 11: Convert Triangle Output to 3D Normals
-    // ========================================
+    // STEP 11: Normal conversion
     telemetry.stages.normal_convert_start = performance.now();
 
-    const depths = triangleResult.depths;
-    const tilts = triangleResult.tilts;
+    const depths         = triangleResult.depths;
+    const tilts          = triangleResult.tilts;
     const windingNumbers = triangleResult.windingNumbers;
 
     const normals3D = new Float32Array(count * 3);
     for (let i = 0; i < count; i++) {
       const theta = tilts[i];
-      const nx = Math.cos(theta);
-      const ny = Math.sin(theta);
-      const nz = 0.5;
-
-      const len = Math.sqrt(nx*nx + ny*ny + nz*nz) || 1.0;
-      normals3D[i*3] = nx / len;
+      const nx    = Math.cos(theta);
+      const ny    = Math.sin(theta);
+      const nz    = 0.5;
+      const len   = Math.sqrt(nx*nx + ny*ny + nz*nz) || 1.0;
+      normals3D[i*3]     = nx / len;
       normals3D[i*3 + 1] = ny / len;
       normals3D[i*3 + 2] = nz / len;
     }
 
-    telemetry.stages.normal_convert_end = performance.now();
-    telemetry.stages.normal_convert_ms = telemetry.stages.normal_convert_end - telemetry.stages.normal_convert_start;
+    telemetry.stages.normal_convert_ms =
+      performance.now() - telemetry.stages.normal_convert_start;
 
-    // ========================================
-    // STAGE 12: Run Overhang Preprocessor
-    // ========================================
+    // STEP 12: Overhang Preprocessor
     telemetry.stages.overhang_start = performance.now();
 
-    let overhangResult = null;
+    let overhangResult  = null;
     const enableOverhang = _flags.enableOverhang !== false;
 
     if (enableOverhang) {
       try {
         if (!_overhangPreprocessor) {
           const { createOverhangPreprocessor } = await import('./overhangPreprocessor.js');
-            _overhangPreprocessor = createOverhangPreprocessor({
-            gridW: gridSize,
-            gridH: gridSize,
-            gravity: _flags.gravity || [0, -1, 0],
-            cosineThreshold: safeNumeric(_flags.overhangCosineThresh, 0.7, -1, 1),
-            windingThreshold: safeNumeric(_flags.overhangWindingThresh, 0.25, 0, 10),
-            minGroupSize: Math.max(1, Math.floor(_flags.overhangMinGroupSize || 3))
+          _overhangPreprocessor = createOverhangPreprocessor({
+            gridW:            gridSize,
+            gridH:            gridSize,
+            gravity:          _flags.gravity               || [0, -1, 0],
+            cosineThreshold:  safeNumeric(_flags.overhangCosineThresh,  0.7, -1, 1),
+            windingThreshold: safeNumeric(_flags.overhangWindingThresh, 0.25,  0, 10),
+            minGroupSize:     Math.max(1, Math.floor(_flags.overhangMinGroupSize || 3))
           });
         }
 
         overhangResult = _overhangPreprocessor.run({
-          depths: depths,
-          normals: normals3D,
-          windingNumbers: windingNumbers,
-          positions: positions
+          depths, normals: normals3D, windingNumbers, positions
         });
-        // ✅ HARDENED: Validate overhang output structure
+
         if (!overhangResult.A_coo || !overhangResult.A_csr || !overhangResult.b) {
           throw new Error('Overhang preprocessor returned incomplete constraint system');
         }
-        
-        // ✅ HARDENED: Validate CSR format dimensions
-        const expectedRows = overhangResult.A_csr.shape ? overhangResult.A_csr.shape[0] : overhangResult.b.length;
+
+        const expectedRows = overhangResult.A_csr.shape
+          ? overhangResult.A_csr.shape[0]
+          : overhangResult.b.length;
         if (overhangResult.A_csr.indptr.length !== expectedRows + 1) {
           telemetry.warnings.push(
-            `Overhang CSR indptr length mismatch: expected ${expectedRows + 1}, got ${overhangResult.A_csr.indptr.length}`
+            `Overhang CSR indptr length mismatch: expected ${expectedRows + 1}, ` +
+            `got ${overhangResult.A_csr.indptr.length}`
           );
         }
 
-        telemetry.stages.overhang_end = performance.now();
-        telemetry.stages.overhang_ms = telemetry.stages.overhang_end - telemetry.stages.overhang_start;
-        telemetry.stages.overhang_constraints = overhangResult.diagnostics.constraintCount;
-        telemetry.stages.overhang_socs = overhangResult.diagnostics.socCount;
-
-        // ✅ Attach module telemetry
+        telemetry.stages.overhang_ms           = performance.now() - telemetry.stages.overhang_start;
+        telemetry.stages.overhang_constraints  = overhangResult.diagnostics.constraintCount;
+        telemetry.stages.overhang_socs         = overhangResult.diagnostics.socCount;
         telemetry.modules.overhangPreprocessor = overhangResult.diagnostics || null;
 
       } catch (overhangErr) {
@@ -2424,31 +3145,27 @@ async function _computeDepthNormalsFlux(frameBitmap, calibData, options = {}) {
       }
     }
 
-    // ========================================
-    // STAGE 13: Build selector (BSS seed)
-    // ========================================
+    // STEP 13: Selector (BSS seed)
     try {
       if (_flags.bssPersistSelector) {
         const selector = new Float32Array(count);
         for (let i = 0; i < count; i++) {
-          const w = Math.abs(windingNumbers[i] || 0);
-          let score = w;
-          score += Math.abs(triangleResult.tilts[i] || 0) * 0.1;
+          let score = Math.abs(windingNumbers[i] || 0);
+          score    += Math.abs(triangleResult.tilts[i] || 0) * 0.1;
           selector[i] = score;
         }
-        
         let maxS = 0;
         for (let i = 0; i < count; i++) if (selector[i] > maxS) maxS = selector[i];
-        if (maxS > 0) for (let i = 0; i < count; i++) selector[i] = selector[i] / maxS;
+        if (maxS > 0) for (let i = 0; i < count; i++) selector[i] /= maxS;
 
         selectorArtifact = {
           pointsCount: count,
-          selector: Array.from(selector),
+          selector:    Array.from(selector),
           gateParams: {
-            eta_pull: safeNumeric(_flags.bssPullEta, 0.1, 0, 1),
+            eta_pull: safeNumeric(_flags.bssPullEta, 0.1,  0, 1),
             eta_push: safeNumeric(_flags.bssPushEta, 0.05, 0, 1),
-            gamma: safeNumeric(_flags.bssGamma, 1.02, 1, 2),
-            iters: Math.max(1, Math.floor(_flags.bssIters || 8))
+            gamma:    safeNumeric(_flags.bssGamma,   1.02, 1, 2),
+            iters:    Math.max(1, Math.floor(_flags.bssIters || 8))
           }
         };
       }
@@ -2459,110 +3176,148 @@ async function _computeDepthNormalsFlux(frameBitmap, calibData, options = {}) {
       selectorArtifact = null;
     }
 
-    // ========================================
-    // STAGE 14: Package Results
-    // ========================================
-
+    // STEP 14: Package results
     const depthStats = typedMinMax(depths);
 
     depthMap = {
       resolution: gridSize,
-      data: depths,
-      min: depthStats.min,
-      max: depthStats.max,
-      encoding: 'float32',
-      stats: triangleResult.stats || {}
+      data:       depths,
+      min:        depthStats.min,
+      max:        depthStats.max,
+      encoding:   'float32',
+      stats:      triangleResult.stats || {}
     };
 
     normalMap = {
       resolution: gridSize,
-      data: normals3D,
-      encoding: 'xyz-float32'
+      data:       normals3D,
+      encoding:   'xyz-float32'
     };
 
     fluxData = overhangResult ? {
       A_coo: overhangResult.A_coo,
       A_csr: {
-        indptr: Array.from(overhangResult.A_csr.indptr),
+        indptr:  Array.from(overhangResult.A_csr.indptr),
         indices: Array.from(overhangResult.A_csr.indices),
-        data: Array.from(overhangResult.A_csr.data),
-        shape: overhangResult.A_csr.shape
+        data:    Array.from(overhangResult.A_csr.data),
+        shape:   overhangResult.A_csr.shape
       },
-      b: Array.from(overhangResult.b),
-      SOCs: overhangResult.SOCs,
-      groups: overhangResult.groups,
-      supports: overhangResult.supports,
-      init_h: Array.from(overhangResult.init_h),
-      diagnostics: overhangResult.diagnostics,
-      solverReady: true,
+      b:            Array.from(overhangResult.b),
+      SOCs:         overhangResult.SOCs,
+      groups:       overhangResult.groups,
+      supports:     overhangResult.supports,
+      init_h:       Array.from(overhangResult.init_h),
+      diagnostics:  overhangResult.diagnostics,
+      solverReady:  true,
       sampleSummary: overhangResult.sampleSummary || null
     } : null;
 
+    // =========================================================================
+    // STEP 14.5: Route A f_map — depth now available (Stage 1)
+    // Default to Route B; upgrade when depth is present and flag allows.
+    // =========================================================================
+    telemetry.stages.fmapA_start = performance.now();
+
+    fMapFinal = fMapRouteB;   // always have a Route B fallback
+
+    if (depthMap && _flags.enableFMapRouteA !== false) {
+      try {
+        fMapFinal = _computeFMapRouteA(
+          depthMap,
+          calibratedField,
+          gridSize,
+          penumbraResult?.lightTrack ?? [],
+          options.fresnelDensityMap  ?? null,
+          _buildSamplingContext(options.manifest ?? null, gridSize),
+          { N_samples: _flags.fMapNSamples ?? 128 }
+        );
+      } catch (e) {
+        telemetry.warnings.push(`FMap RouteA failed: ${e.message} — keeping Route B`);
+        console.warn('motion.worker: FMap RouteA failed, retaining Route B', e);
+      }
+    }
+
+    telemetry.stages.fmapA_ms = performance.now() - telemetry.stages.fmapA_start;
+
+    // Finalise pipeline telemetry
     telemetry.calibratedPipeline = {
-      producer: calibResult?.telemetry,
-      tetrachromacy: tetraResult?.telemetry,
+      producer:           calibResult?.telemetry,
+      tetrachromacy:      tetraResult?.telemetry,
       directionalLifting: liftResult?.telemetry,
-      hasBump: !!bumpField,
-      hasNormal: !!normalField,
-      hasSpecular: !!specularMask
+      hasBump:            !!bumpField,
+      hasNormal:          !!normalField,
+      hasSpecular:        !!specularMask
     };
 
-    telemetry.success = true;
+    telemetry.success              = true;
     telemetry.estimatedMemoryBytes = estimatedBytes;
-    telemetry.selector = selectorArtifact ? { pointsCount: selectorArtifact.pointsCount } : null;
+    telemetry.selector             = selectorArtifact
+      ? { pointsCount: selectorArtifact.pointsCount }
+      : null;
 
   } catch (err) {
     const se = safeErrSummary(err);
     console.error('motion.worker: computeDepthNormalsFlux failed', err);
 
     telemetry.success = false;
-    telemetry.error = String(se.message);
-    telemetry.stack = se.stack;
-    telemetry.errors = Array.isArray(telemetry.errors) ? telemetry.errors : [];
+    telemetry.error   = String(se.message);
+    telemetry.stack   = se.stack;
     telemetry.errors.push(`fatal: ${se.message}`);
 
     try {
-      return await _fallbackDepthEstimation(frameBitmap, options.resolution || DEFAULTS.defaultResolutions.normal);
+      return await _fallbackDepthEstimation(
+        frameBitmap,
+        options.resolution || DEFAULTS.defaultResolutions.normal
+      );
     } catch (fallbackErr) {
       const fallbackSe = safeErrSummary(fallbackErr);
       console.warn('motion.worker: fallbackDepthEstimation also failed', fallbackSe.message);
 
-      const res = options.resolution || DEFAULTS.defaultResolutions.normal;
-      const fallbackDepths = new Float32Array(res * res).fill(1.0);
+      const res             = options.resolution || DEFAULTS.defaultResolutions.normal;
+      const fallbackDepths  = new Float32Array(res * res).fill(1.0);
       const fallbackNormals = new Float32Array(res * res * 3);
-      for (let i = 0; i < fallbackNormals.length; i++) fallbackNormals[i] = (i % 3 === 2) ? 1.0 : 0.0;
+      for (let i = 0; i < fallbackNormals.length; i++) {
+        fallbackNormals[i] = (i % 3 === 2) ? 1.0 : 0.0;
+      }
 
       depthMap = {
-        resolution: res,
-        data: fallbackDepths,
-        min: 1.0,
-        max: 1.0,
-        encoding: 'float32',
-        fallback: true,
-        error: se.message
+        resolution: res, data: fallbackDepths,
+        min: 1.0, max: 1.0, encoding: 'float32',
+        fallback: true, error: se.message
       };
-
       normalMap = {
-        resolution: res,
-        data: fallbackNormals,
-        encoding: 'xyz-float32',
-        fallback: true
+        resolution: res, data: fallbackNormals,
+        encoding: 'xyz-float32', fallback: true
       };
-
       fluxData = null;
     }
   } finally {
     telemetry.stages.cleanup_start = performance.now();
     _cleanupAfterReconstruction();
-    telemetry.stages.cleanup_end = performance.now();
-    telemetry.stages.cleanup_ms = telemetry.stages.cleanup_end - telemetry.stages.cleanup_start;
+    telemetry.stages.cleanup_ms =
+      performance.now() - telemetry.stages.cleanup_start;
   }
 
-  const endTime = performance.now();
-  telemetry.total_ms = endTime - startTime;
-  return { depthMap, normalMap, fluxData, telemetry, selectorArtifact: (selectorArtifact || null) };
-}
+  telemetry.total_ms = performance.now() - startTime;
 
+  // Stage 1 outputs travel with the return so _handleReconstructMeta can
+  // persist them alongside the existing depth/normal/flux artifacts.
+  return {
+    depthMap,
+    normalMap,
+    fluxData,
+    telemetry,
+    selectorArtifact: selectorArtifact || null,
+    // Stage 1
+    fMapFinal,
+    doaModalResult,
+    penumbraResult,
+    // Stage 3 prerequisite
+    flowField,
+    // Stage 4A prerequisite
+    directionalFieldArtResult
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Helper: wait for artifact visibility across IndexedDB connections
@@ -2703,7 +3458,28 @@ async function _handleReconstructMeta({ jobId, metaKey, options = {} }) {
     // ========================================
     if (storageWrapper.markReconRunning) {
       const takeoverMs = Number(options.takeoverMs) || Number(_flags.reconTakeoverMs) || DEFAULTS.takeoverMsDefault;
+
+      console.log('[RECON] calling markReconRunning:', {
+        metaKey,
+        jobId,
+        takeoverMs,
+        expectedDeadline: new Date(Date.now() + takeoverMs).toISOString()
+      });
+
       const markResult = await storageWrapper.markReconRunning(metaKey, jobId, takeoverMs);
+
+      console.log('[RECON] markReconRunning result:', markResult);
+
+      if (storageWrapper.getReconStatus) {
+        const storedStatus = await storageWrapper.getReconStatus(metaKey);
+        console.log('[RECON] Stored reconStatus after markReconRunning:', {
+          state:         storedStatus?.state,
+          reqId:         storedStatus?.reqId,
+          deadline:      storedStatus?.deadline,
+          deadlineISO:   storedStatus?.deadline ? new Date(storedStatus.deadline).toISOString() : null,
+          deadlineInPast: storedStatus?.deadline ? storedStatus.deadline < Date.now() : null
+        });
+      }
 
       if (!markResult || !markResult.ok) {
         self.postMessage({
@@ -2867,6 +3643,50 @@ console.log('[STAGE4] Final calibData state before depth computation:', {
   willPassGuardCheck: !!(calibData && calibData.calibratedFrameKey)
 });
 
+    // ── STAGE 4.5: Load Fresnel density map ────────────────────────────────
+    // HFH MotionDetection persists this before motion.worker runs.
+    // Loading here (alongside calibration) makes it available to Route A with
+    // zero additional latency — no extra round-trip at compute time.
+    //
+    // Key lookup order:
+    //   1. manifest.data.fresnelKey         (canonical)
+    //   2. manifest.data.fresnel_key        (underscore variant)
+    //   3. manifest.data.fresnelArtifactKey (legacy)
+    //
+    // Graceful fallback: null → Route A uses uniform importance sampling.
+    let fresnelDensityMap = null;
+
+    const fresnelKey =
+      manifest.data.fresnelKey        ??
+      manifest.data.fresnel_key        ??
+      manifest.data.fresnelArtifactKey ??
+      null;
+
+    if (fresnelKey) {
+      try {
+        console.log('[STAGE4.5] Loading Fresnel density map:', { fresnelKey });
+        const fresnelArtifact = await storageWrapper.getArtifact(
+          fresnelKey, { denormalize: true }
+        );
+        if (fresnelArtifact?.data?.densityMap) {
+          fresnelDensityMap = fresnelArtifact.data.densityMap;
+          console.log('[STAGE4.5] ✓ Fresnel density map loaded:',
+            { length: fresnelDensityMap.length, fresnelKey });
+        } else {
+          console.warn('[STAGE4.5] Fresnel artifact has no densityMap:', {
+            fresnelKey,
+            dataKeys: fresnelArtifact?.data ? Object.keys(fresnelArtifact.data) : []
+          });
+        }
+      } catch (e) {
+        // Non-fatal
+        console.warn('[STAGE4.5] Fresnel load failed (uniform sampling fallback):',
+          { fresnelKey, error: e.message });
+      }
+    } else {
+      console.log('[STAGE4.5] No fresnelKey in manifest — Route A using uniform sampling');
+    }
+
     // ========================================
     // STAGE 5: Load Frame Bitmap
     // ========================================
@@ -2906,23 +3726,68 @@ console.log('[STAGE4] Final calibData state before depth computation:', {
       frameBitmap,
       calibData,
       {
-        resolution: options.resolution || chosenRes,
-        quality: options.priority > 50 ? 'high' : 'medium',
-        priority: options.priority,
-        storageWrapper: storageWrapper,
-        // Pass plenopticContext from manifest so _getDirectionalLifting
-        // receives the actual camera frameRate without depending on _flags.
-        plenopticContext: manifest.data.plenopticContext ?? null
+        resolution:        options.resolution || chosenRes,
+        quality:           options.priority > 50 ? 'high' : 'medium',
+        priority:          options.priority,
+        storageWrapper:    storageWrapper,
+        plenopticContext:  manifest.data.plenopticContext ?? null,
+        // Stage 1 additions
+        fresnelDensityMap: fresnelDensityMap,
+        manifest:          manifest,           // used by _buildSamplingContext inside
+        // Scope fix: pass identifiers so intermediate persist calls inside the
+        // function have correct sourceMetaKey / cameraId in their meta blocks.
+        metaKey:           metaKey,
+        cameraId:          cameraId
       }
     );
 
-    const { depthMap, normalMap, fluxData, telemetry, selectorArtifact } = computeResult;
+    const {
+      depthMap, normalMap, fluxData, telemetry, selectorArtifact,
+      // Stage 1
+      fMapFinal, doaModalResult, penumbraResult,
+      // Stage 3 prerequisite
+      flowField,
+      // Stage 4A prerequisite
+      directionalFieldArtResult
+    } = computeResult;
+
+    // Normalise telemetry — _fallbackDepthEstimation returns a minimal stub
+    // { method, total_ms } without errors/warnings/stages/modules arrays.
+    // Any downstream .push() or Object.assign() call will crash without this.
+    telemetry.errors   = telemetry.errors   || [];
+    telemetry.warnings = telemetry.warnings || [];
+    telemetry.stages   = telemetry.stages   || {};
+    telemetry.modules  = telemetry.modules  || {};
 
     console.log('motion.worker: depth/normal/flux telemetry', telemetry);
+    console.log('[CHECKPOINT] Stage 7 starting — persisting depth_map');
 
     // ========================================
     // STAGE 7: Persist Derived Artifacts
     // ========================================
+
+    // Build plenopticContext stub for worker-produced artifacts.
+    // _enhanceMetadata (FrameEvictionHook) only runs on live-camera paths and
+    // never sees artifacts produced directly by the worker.  We build an
+    // equivalent stub here so every depth_map / normal_map artifact carries a
+    // non-null plenopticContext regardless of whether a live camera was present.
+    //
+    // Priority rules:
+    //   - Prefer values already stamped in the manifest by _enhanceMetadata
+    //     (live-camera path will have these; synthetic/file paths will not)
+    //   - Fill gaps from what the worker computed:
+    //       effectiveWindowMs  → available after _getDirectionalLifting() runs
+    //       temporalEpochUTC   → startTime captures when this reconstruction began
+    const _manifestCtx = manifest.data.plenopticContext ?? {};
+    const plenopticStub = Object.freeze({
+      spectralModel:          _manifestCtx.spectralModel          ?? 'rgb',
+      frameRate:              _manifestCtx.frameRate              ?? null,
+      effectiveWindowMs:      _manifestCtx.effectiveWindowMs      ?? _effectiveWindowMs,
+      temporalEpochUTC:       _manifestCtx.temporalEpochUTC       ?? startTime,
+      tetrachromaticExpanded: _manifestCtx.tetrachromaticExpanded ?? false,
+      angularApertureSr:      _manifestCtx.angularApertureSr      ?? null
+    });
+
     self.postMessage({
       event: 'progress',
       msgId: generateMsgId(),
@@ -2938,6 +3803,7 @@ console.log('[STAGE4] Final calibData state before depth computation:', {
       meta: {
         sourceMetaKey: metaKey,
         cameraId: cameraId,
+        plenopticContext: plenopticStub,
         resolution: depthMap.resolution,
         min: depthMap.min,
         max: depthMap.max,
@@ -2957,7 +3823,7 @@ console.log('[STAGE4] Final calibData state before depth computation:', {
     if (!depthResult?.metaKey) {
       throw new Error('Depth persistence failed');
     }
-
+    console.log('[CHECKPOINT] persisting normal_map');
     const normalResult = await _persistAndPin(
       storageWrapper, 
       {
@@ -2966,6 +3832,7 @@ console.log('[STAGE4] Final calibData state before depth computation:', {
         meta: {
           sourceMetaKey: metaKey,
           cameraId: cameraId,
+          plenopticContext: plenopticStub,
           resolution: normalMap.resolution,
           encoding: normalMap.encoding,
           fallback: normalMap.fallback || false,
@@ -2983,30 +3850,369 @@ console.log('[STAGE4] Final calibData state before depth computation:', {
     if (!normalResult?.metaKey) {
       throw new Error('Normal persistence failed');
     }
-
+    console.log('[CHECKPOINT] persisting flux_field');
     let fluxResult = null;
     if (fluxData) {
       try {
+        // Only persist what minimizer.worker actually reads — A_coo for SOC
+        // normal extraction in extractSOCs(). All other fields (A_csr, b,
+        // init_h, supports, groups, SOCs) are either unused by downstream
+        // consumers or cause catastrophic IDB serialization hangs:
+        //   - init_h:  Array.from(Float32Array[1M]) → 1M plain-array floats
+        //   - A_csr:   large sparse matrix arrays
+        //   - SOCs:    1M objects → cosThetaSoc defaults to 0° (90° contact)
+        // A_coo.row/col/data are TypedArrays with only constraintCount entries
+        // (e.g. 42) so they serialize instantly via the parts mechanism.
+        const fluxDataToStore = {
+          A_coo: fluxData.A_coo
+            ? {
+                row:  fluxData.A_coo.row,
+                col:  fluxData.A_coo.col,
+                data: fluxData.A_coo.data
+              }
+            : null
+        };
+
         fluxResult = await _persistAndPin(
           storageWrapper,
           {
-          type: 'flux_field',
-          data: fluxData, // Includes A_coo, A_csr, b, SOCs, groups (storage.js handles parts)
-          meta: {
-            sourceMetaKey: metaKey,
-            computedAt: Date.now(),
-            solverReady: true
+            type: 'flux_field',
+            data: fluxDataToStore,
+            meta: {
+              sourceMetaKey: metaKey,
+              cameraId:      cameraId,
+              computedAt:    Date.now(),
+              solverReady:   true
+            },
+            createdAt: new Date().toISOString()
           },
-          createdAt: new Date().toISOString()
-        }, {
-          owner: 'motion.worker',
-          ttlMs: ARTIFACT_PIN_TTL_MS, // 5 minutes
-          pinType: 'soft'
-        });
+          {
+            owner:   'motion.worker',
+            ttlMs:   ARTIFACT_PIN_TTL_MS,
+            pinType: 'soft'
+          }
+        );
       } catch (fluxErr) {
         console.warn('motion.worker: Flux persistence failed', fluxErr);
       }
     }
+
+    // ── Stage 1 artifact persistence ────────────────────────────────────────
+    const stage1SamplingContext = _buildSamplingContext(manifest, chosenRes);
+    console.log('[CHECKPOINT] persisting Stage 1 artifacts');
+    let directnessResult  = null;
+    let modalResult       = null;
+    let penumbraArtResult = null;
+
+    if (fMapFinal) {
+      try {
+        directnessResult = await _persistAndPin(
+          storageWrapper,
+          {
+            type: 'directness_field',
+            data: {
+              fMap:        fMapFinal.fMap,
+              directness:  fMapFinal.directness,
+              modalLabels: fMapFinal.modalLabels
+            },
+            meta: {
+              sourceMetaKey:   metaKey,
+              cameraId,
+              resolution:      chosenRes,
+              route:           fMapFinal.route,
+              N_samples:       fMapFinal.N_samples,
+              samplingContext: stage1SamplingContext,
+              thresholds: {
+                direct:       _flags.fMapDirectThresh ?? 0.9,
+                penumbra_low: _flags.fMapUmbraThresh  ?? 0.1
+              },
+              computedAt: Date.now()
+            },
+            createdAt: new Date().toISOString()
+          },
+          { owner: 'motion.worker', ttlMs: ARTIFACT_PIN_TTL_MS, pinType: 'soft' }
+        );
+        console.log('[PERSIST] ✓ directness_field:', directnessResult?.metaKey?.slice(0, 32));
+      } catch (e) {
+        console.warn('[PERSIST] ✗ directness_field (non-fatal):', e.message);
+      }
+    }
+
+    if (doaModalResult) {
+      try {
+        modalResult = await _persistAndPin(
+          storageWrapper,
+          {
+            type: 'modal_decomposition',
+            data: {
+              kappa:       doaModalResult.kappa,
+              meanDir:     doaModalResult.meanDir,
+              direct:      doaModalResult.direct,
+              diffuse:     doaModalResult.diffuse,
+              specular:    doaModalResult.specular,
+              multiBounce: doaModalResult.multiBounce
+            },
+            meta: {
+              sourceMetaKey:   metaKey,
+              cameraId,
+              resolution:      chosenRes,
+              kappaThreshold:  _flags.doaKappaThreshold ?? 3.0,
+              samplingContext: stage1SamplingContext,
+              computedAt:      Date.now()
+            },
+            createdAt: new Date().toISOString()
+          },
+          { owner: 'motion.worker', ttlMs: ARTIFACT_PIN_TTL_MS, pinType: 'soft' }
+        );
+        console.log('[PERSIST] ✓ modal_decomposition:', modalResult?.metaKey?.slice(0, 32));
+      } catch (e) {
+        console.warn('[PERSIST] ✗ modal_decomposition (non-fatal):', e.message);
+      }
+    }
+
+    if (penumbraResult) {
+      try {
+        penumbraArtResult = await _persistAndPin(
+          storageWrapper,
+          {
+            type: 'penumbra_field',
+            data: {
+              widthMap:   penumbraResult.widthMap,
+              edgeMask:   penumbraResult.edgeMask,
+              lightTrack: penumbraResult.lightTrack
+            },
+            meta: {
+              sourceMetaKey:    metaKey,
+              cameraId,
+              resolution:       chosenRes,
+              edgeCount:        penumbraResult.telemetry?.edgeCount       ?? 0,
+              lightCount:       penumbraResult.telemetry?.lightCount      ?? 0,
+              meanWidth:        penumbraResult.telemetry?.meanWidth       ?? 0,
+              profileFitMeanR2: penumbraResult.telemetry?.profileFitMeanR2 ?? 0,
+              samplingContext:  stage1SamplingContext,
+              computedAt:       Date.now()
+            },
+            createdAt: new Date().toISOString()
+          },
+          { owner: 'motion.worker', ttlMs: ARTIFACT_PIN_TTL_MS, pinType: 'soft' }
+        );
+        console.log('[PERSIST] ✓ penumbra_field:', penumbraArtResult?.metaKey?.slice(0, 32));
+      } catch (e) {
+        console.warn('[PERSIST] ✗ penumbra_field (non-fatal):', e.message);
+      }
+    }
+
+    // ── STAGE 2: PackingSDF ──────────────────────────────────────────────────
+    // All inputs are in scope at this point:
+    //   depthMap.data        Float32Array  res²          (triangle preprocessor depths)
+    //   normalMap.data       Float32Array  res²×3        (xyz-float32 normals)
+    //   fMapFinal            Object        {fMap, directness, modalLabels, ...}
+    //   penumbraResult       Object        {widthMap, edgeMask, lightTrack, ...}
+    //   fresnelDensityMap    Float32Array|null  res²     (loaded at STAGE 4.5)
+    //   stage1SamplingContext Object       (built just above this block)
+    //
+    // Artifacts persisted:
+    //   sdf_field        signedSdf + narrowBandMask + densityMap + surfaceMask
+    //   disk_seeds       compact binary (PackingSDF.serialize) consumed by Stage 4B
+    //   sdf_diagnostics  medStressMap + scaleneVariance (only when packingDebug=true)
+
+    let sdfResult         = null;   // raw PackingSDF.compute() output
+    let sdfFieldArtResult = null;   // persisted sdf_field artifact handle
+    let diskSeedsResult   = null;   // persisted disk_seeds artifact handle
+    let sdfDiagsResult    = null;   // persisted sdf_diagnostics handle (debug only)
+
+    if (_flags.enablePackingSDF !== false && depthMap && normalMap) {
+      const stage2Start = performance.now();
+      console.log('[CHECKPOINT] Stage 2 — entering PackingSDF block');
+      try {
+        const directnessField =
+          fMapFinal?.directness    instanceof Float32Array ? fMapFinal.directness    : null;
+        const penumbraField   =
+          penumbraResult?.widthMap instanceof Float32Array ? penumbraResult.widthMap : null;
+
+        console.log('[STAGE2-SDF] starting PackingSDF.compute()', {
+          resolution:    chosenRes,
+          hasDirectness: !!directnessField,
+          hasPenumbra:   !!penumbraField,
+          umbraPolicy:   _flags.packingUmbraPolicy ?? 'half-weight'
+        });
+
+        sdfResult = await _getPackingSDF().compute(
+          depthMap.data,
+          normalMap.data,
+          directnessField,
+          penumbraField,
+          {
+            width:  chosenRes,
+            height: chosenRes,
+            // Modal labels from Stage 1 DOA — drive per-partition seed placement.
+            modalLabels: fMapFinal?.modalLabels instanceof Uint8Array
+              ? fMapFinal.modalLabels
+              : null,
+            // Fresnel density: biases seed concentration toward penumbra edges.
+            fresnelDensity: fresnelDensityMap instanceof Float32Array
+              ? fresnelDensityMap
+              : null,
+            metaKey,
+            cameraId
+          }
+        );
+
+        console.log('[STAGE2-SDF] compute() done in',
+          (performance.now() - stage2Start).toFixed(1), 'ms', {
+            seedCount:        sdfResult.diskSeeds?.length ?? 0,
+            narrowBandPixels: sdfResult.meta?.narrowBandPixels ?? 'n/a',
+            sdfRange:         sdfResult.meta?.sdfRange         ?? 'n/a'
+          });
+
+      } catch (sdfErr) {
+        console.warn('[STAGE2-SDF] compute() failed (non-fatal):', sdfErr.message);
+        telemetry.warnings.push(`packingSDF: ${sdfErr.message}`);
+        sdfResult = null;
+      }
+
+      if (sdfResult) {
+
+        // ── Persist sdf_field ──────────────────────────────────────────────
+        try {
+          sdfFieldArtResult = await _persistAndPin(
+            storageWrapper,
+            {
+              type: 'sdf_field',
+              data: {
+                signedSdf:      sdfResult.signedSdf,
+                narrowBandMask: sdfResult.narrowBandMask,
+                densityMap:     sdfResult.densityMap,
+                surfaceMask:    sdfResult.surfaceMask
+              },
+              meta: {
+                sourceMetaKey:   metaKey,
+                cameraId,
+                resolution:      chosenRes,
+                sdfRange:        sdfResult.meta?.sdfRange         ?? null,
+                narrowBandPx:    sdfResult.meta?.narrowBandPixels ?? null,
+                umbraPolicy:     _flags.packingUmbraPolicy         ?? 'half-weight',
+                bandBase:        _flags.packingBandBase             ?? 0.03,
+                bandScale:       _flags.packingBandScale            ?? 3.0,
+                samplingContext: stage1SamplingContext,
+                computedAt:      Date.now()
+              },
+              createdAt: new Date().toISOString()
+            },
+            { owner: 'motion.worker', ttlMs: ARTIFACT_PIN_TTL_MS, pinType: 'soft' }
+          );
+          console.log('[PERSIST] sdf_field:', sdfFieldArtResult?.metaKey?.slice(0, 32));
+        } catch (e) {
+          console.warn('[PERSIST] sdf_field failed (non-fatal):', e.message);
+        }
+
+        // ── Persist disk_seeds ─────────────────────────────────────────────
+        // Serialised via PackingSDF.serialize() for compact binary transfer.
+        // Stage 4B (ConstrainedMinimizer) reads this via PackingSDF.deserialize().
+        try {
+          const { header: seedHeader, payload: seedPayload } =
+            _getPackingSDF().serialize(sdfResult, { includeMetStress: false });
+
+          diskSeedsResult = await _persistAndPin(
+            storageWrapper,
+            {
+              type: 'disk_seeds',
+              data: {
+                header:  seedHeader,
+                payload: seedPayload   // ArrayBuffer — compact binary
+              },
+              meta: {
+                sourceMetaKey:   metaKey,
+                cameraId,
+                resolution:      chosenRes,
+                seedCount:       sdfResult.diskSeeds?.length   ?? 0,
+                modalBreakdown:  sdfResult.meta?.modalBreakdown ?? null,
+                samplerSeed:     _flags.packingSamplerSeed       ?? 0xF1E2D3C4,
+                samplingContext: stage1SamplingContext,
+                computedAt:      Date.now()
+              },
+              createdAt: new Date().toISOString()
+            },
+            { owner: 'motion.worker', ttlMs: ARTIFACT_PIN_TTL_MS, pinType: 'soft' }
+          );
+          console.log('[PERSIST] disk_seeds:', diskSeedsResult?.metaKey?.slice(0, 32),
+            '(', sdfResult.diskSeeds?.length ?? 0, 'seeds)');
+        } catch (e) {
+          console.warn('[PERSIST] disk_seeds failed (non-fatal):', e.message);
+        }
+
+        // ── Persist sdf_diagnostics (packingDebug only) ────────────────────
+        if (_flags.packingDebug && sdfResult.medStressMap) {
+          try {
+            sdfDiagsResult = await _persistAndPin(
+              storageWrapper,
+              {
+                type: 'sdf_diagnostics',
+                data: {
+                  medStressMap:    sdfResult.medStressMap,
+                  scaleneVariance: sdfResult.scaleneVariance
+                },
+                meta: {
+                  sourceMetaKey: metaKey,
+                  cameraId,
+                  resolution:    chosenRes,
+                  computedAt:    Date.now()
+                },
+                createdAt: new Date().toISOString()
+              },
+              { owner: 'motion.worker', ttlMs: INTERMEDIATE_TTL_MS, pinType: 'soft' }
+            );
+            console.log('[PERSIST] sdf_diagnostics:', sdfDiagsResult?.metaKey?.slice(0, 32));
+          } catch (e) {
+            console.warn('[PERSIST] sdf_diagnostics failed (non-fatal):', e.message);
+          }
+        }
+
+      } // end if (sdfResult)
+
+    } else if (_flags.enablePackingSDF === false) {
+      console.log('[STAGE2-SDF] skipped (enablePackingSDF=false)');
+    } else {
+      console.warn('[STAGE2-SDF] skipped — depthMap or normalMap unavailable');
+    }
+    // ── END STAGE 2 ──────────────────────────────────────────────────────────
+
+    // ── STAGE 3 PREREQUISITE: persist flow_field ─────────────────────────────
+    // Produced by Horn-Schunck in _computeDepthNormalsFlux.
+    // null when enableOpticalFlow=false OR when H-S failed.
+    // DifferentialGeometry reads this key and computes flow_divergence / flow_curl.
+    let flowFieldResult = null;
+    if (flowField) {
+      try {
+        flowFieldResult = await _persistAndPin(
+          storageWrapper,
+          {
+            type: 'flow_field',
+            data: {
+              u:      flowField.u,
+              v:      flowField.v,
+              width:  flowField.width,
+              height: flowField.height
+            },
+            meta: {
+              sourceMetaKey:   metaKey,
+              cameraId,
+              resolution:      chosenRes,
+              alpha:           _flags.opticalFlowAlpha      ?? 1.0,
+              iterations:      _flags.opticalFlowIterations ?? 30,
+              method:          'horn_schunck',
+              samplingContext: stage1SamplingContext,
+              computedAt:      Date.now()
+            },
+            createdAt: new Date().toISOString()
+          },
+          { owner: 'motion.worker', ttlMs: ARTIFACT_PIN_TTL_MS, pinType: 'soft' }
+        );
+        console.log('[PERSIST] flow_field:', flowFieldResult?.metaKey?.slice(0, 32));
+      } catch (e) {
+        console.warn('[PERSIST] flow_field failed (non-fatal):', e.message);
+      }
+    }    
 
     let selectorResult = null;
     if (selectorArtifact && _flags.bssPersistSelector) {
@@ -3026,11 +4232,82 @@ console.log('[STAGE4] Final calibData state before depth computation:', {
       }
     }
 
-    const derivedKeys = [
-      depthResult && depthResult.metaKey,
-      normalResult && normalResult.metaKey,
-      fluxResult && fluxResult.metaKey,
-      selectorResult && selectorResult.metaKey
+    // ── STAGE 4: DifferentialGeometry ────────────────────────────────────────
+    let diffGeoResult = null;
+
+    if (sdfFieldArtResult?.metaKey && normalResult?.metaKey) {
+      console.log('[CHECKPOINT] Stage 4 — starting DifferentialGeometry.compute()');
+      try {
+      const dg = _getDifferentialGeometry();           // no storageWrapper — singleton holds only flags
+      diffGeoResult = await dg.compute({
+        storageWrapper,                                // ← fresh per-job, no stale reference
+        sdfFieldKey:  sdfFieldArtResult.metaKey,
+        diskSeedsKey: diskSeedsResult?.metaKey ?? null,
+        normalMapKey: normalResult.metaKey,
+        flowFieldKey: flowFieldResult?.metaKey ?? null,
+        fluxFieldKey: fluxResult?.metaKey      ?? null,
+        sourceMetaKey: metaKey,
+        cameraId,
+        resolution:   chosenRes,
+        samplingContext: stage1SamplingContext
+      });
+
+        // Broadcast DIFFGEO_DONE on BroadcastChannel
+        _bcPost({
+          event:     'DIFFGEO_DONE',
+          msgId:     generateMsgId(),
+          metaKey,
+          stage4: {
+            curvatureKey:       diffGeoResult.curvatureKey,
+            principalFrameKey:  diffGeoResult.principalFrameKey,
+            sdfDivKey:          diffGeoResult.sdfDivKey,
+            sdfCurlKey:         diffGeoResult.sdfCurlKey,
+            normalCurlKey:      diffGeoResult.normalCurlKey,
+            flowDivKey:         diffGeoResult.flowDivKey    ?? null,
+            flowCurlKey:        diffGeoResult.flowCurlKey   ?? null,
+            overhangCurlKey:    diffGeoResult.overhangCurlKey ?? null
+          },
+          processingMs: diffGeoResult.telemetry?.processingMs ?? null,
+          producer: 'motion.worker',
+          source:   'motion.worker',
+          timestamp: Date.now()
+        });
+
+        console.log('[STAGE4-DG] DifferentialGeometry complete in',
+          diffGeoResult.telemetry?.processingMs?.toFixed(1), 'ms');
+      } catch (dgErr) {
+        console.warn('[STAGE4-DG] DifferentialGeometry failed (non-fatal):', dgErr.message);
+        diffGeoResult = null;
+      }
+    } else {
+      console.log('[STAGE4-DG] skipped — sdfFieldKey or normalMapKey unavailable');
+    }
+    console.log('[CHECKPOINT] assembling derivedKeys');
+      const derivedKeys = [
+      depthResult       && depthResult.metaKey,
+      directionalFieldArtResult && directionalFieldArtResult.metaKey,
+      normalResult      && normalResult.metaKey,
+      fluxResult        && fluxResult.metaKey,
+      selectorResult    && selectorResult.metaKey,
+      // Stage 1
+      directnessResult  && directnessResult.metaKey,
+      modalResult       && modalResult.metaKey,
+      penumbraArtResult && penumbraArtResult.metaKey,
+      // Stage 2
+      sdfFieldArtResult && sdfFieldArtResult.metaKey,
+      diskSeedsResult   && diskSeedsResult.metaKey,
+      sdfDiagsResult    && sdfDiagsResult.metaKey,
+      // Stage 3 prerequisite
+      flowFieldResult   && flowFieldResult.metaKey,
+      // Stage 4
+      diffGeoResult?.curvatureKey,
+      diffGeoResult?.principalFrameKey,
+      diffGeoResult?.sdfDivKey,
+      diffGeoResult?.sdfCurlKey,
+      diffGeoResult?.normalCurlKey,
+      diffGeoResult?.flowDivKey,
+      diffGeoResult?.flowCurlKey,
+      diffGeoResult?.overhangCurlKey
     ].filter(Boolean);
 
     // --------------------------------------------------------------------
@@ -3039,28 +4316,12 @@ console.log('[STAGE4] Final calibData state before depth computation:', {
     // (main thread / test harness) cannot immediately read the artifact.
     // We keep this short so worker doesn't stall forever.
     // --------------------------------------------------------------------
-    try {
-      const visibleKeys = [];
-      for (const k of derivedKeys) {
-        if (!k) continue;
-        // Wait up to 5s per artifact (adjust timeoutMs for debugging)
-        const ok = await _waitForArtifactVisibility(storageWrapper, k, { timeoutMs: 5000, pollMs: 120 });
-        if (!ok) {
-          // record a warning but continue — don't fail the job
-          console.warn('motion.worker: artifact did not become visible in time', k);
-          telemetry.warnings = telemetry.warnings || [];
-          telemetry.warnings.push(`artifact_visibility_timeout:${k}`);
-        } else {
-          visibleKeys.push(k);
-        }
-      }
-      telemetry.derivedVisible = visibleKeys;
-    } catch (waitErr) {
-      console.warn('motion.worker: waiting for derived artifacts visibility failed', waitErr);
-      // fall through — don't let wait failure kill reconstruction
-      telemetry.warnings = telemetry.warnings || [];
-      telemetry.warnings.push(`derived_visibility_check_failed:${String(waitErr?.message || waitErr)}`);
-    }
+    // Visibility wait removed — artifacts are committed to IDB before this
+    // point and the BC broadcast provides sufficient ordering guarantee.
+    // The previous per-artifact polling loop (5s × N keys) was causing
+    // multi-minute stalls under quota pressure where the evictor was
+    // immediately removing artifacts after write.
+    telemetry.derivedVisible = derivedKeys;
 
     // ========================================
     // STAGE 8: compute processingMs, update _metrics
@@ -3077,30 +4338,77 @@ console.log('[STAGE4] Final calibData state before depth computation:', {
     // ========================================
     // STAGE 9: Persist telemetry artifact
     // ========================================
+    console.log('[CHECKPOINT] Stage 9 — persisting telemetry');
     try {
       const telemetryPayload = {
         jobId,
         metaKey,
-        cameraId: cameraId,
+        cameraId:        cameraId,
         cameraContainer: cameraContainer || undefined,
-        priority: options.priority || 50,
-        resolution: options.resolution,
-        // --- Stage 0: sampling context fields ---
-        // Mirror of the RECON_DONE broadcast fields so the persisted record
-        // matches what main.js receives and writes into the container.
+        priority:        options.priority || 50,
+        resolution:      options.resolution,
+
+        // Stage 0
         reconstructionResolution: depthMap ? depthMap.resolution : (options.resolution || null),
-        effectiveWindowMs: _effectiveWindowMs,
-        // --- End Stage 0 ---
-        stages: telemetry.stages,
-        modules: telemetry.modules, // Include per-module telemetry
-        processingMs: processingMs,
+        effectiveWindowMs:        _effectiveWindowMs,
+
+        // Stage 1
+        stage1: {
+          directnessKey:   directnessResult?.metaKey    ?? null,
+          modalKey:        modalResult?.metaKey          ?? null,
+          penumbraKey:     penumbraArtResult?.metaKey    ?? null,
+          fMapRoute:       fMapFinal?.route              ?? null,
+          fMapNSamples:    fMapFinal?.N_samples          ?? 0,
+          lightCount:      penumbraResult?.telemetry?.lightCount  ?? 0,
+          edgeCount:       penumbraResult?.telemetry?.edgeCount   ?? 0,
+          meanWidth:       penumbraResult?.telemetry?.meanWidth   ?? null,
+          meanKappa:       doaModalResult?.telemetry?.meanKappa   ?? null,
+          samplingContext: stage1SamplingContext
+        },
+
+        // Stage 2
+        stage2: {
+          sdfFieldKey:    sdfFieldArtResult?.metaKey  ?? null,
+          diskSeedsKey:   diskSeedsResult?.metaKey    ?? null,
+          sdfDiagsKey:    sdfDiagsResult?.metaKey     ?? null,
+          seedCount:      sdfResult?.diskSeeds?.length ?? 0,
+          narrowBandPx:   sdfResult?.meta?.narrowBandPixels ?? null,
+          sdfRange:       sdfResult?.meta?.sdfRange         ?? null,
+          modalBreakdown: sdfResult?.meta?.modalBreakdown   ?? null,
+          umbraPolicy:    _flags.packingUmbraPolicy          ?? 'half-weight',
+          timings:        sdfResult?.meta?.timings           ?? null
+        },
+
+        // Stage 3 prerequisite
+        stage3: {
+          flowFieldKey:   flowFieldResult?.metaKey   ?? null,
+          method:         'horn_schunck',
+          alpha:          _flags.opticalFlowAlpha      ?? 1.0,
+          iterations:     _flags.opticalFlowIterations ?? 30
+        },
+
+        // Stage 4
+        stage4: {
+          curvatureKey:      diffGeoResult?.curvatureKey      ?? null,
+          principalFrameKey: diffGeoResult?.principalFrameKey ?? null,
+          sdfDivKey:         diffGeoResult?.sdfDivKey         ?? null,
+          sdfCurlKey:        diffGeoResult?.sdfCurlKey        ?? null,
+          normalCurlKey:     diffGeoResult?.normalCurlKey     ?? null,
+          flowDivKey:        diffGeoResult?.flowDivKey        ?? null,
+          flowCurlKey:       diffGeoResult?.flowCurlKey       ?? null,
+          overhangCurlKey:   diffGeoResult?.overhangCurlKey   ?? null
+        },        
+
+        stages:               telemetry.stages,
+        modules:              telemetry.modules,
+        processingMs:         processingMs,
         estimatedMemoryBytes: telemetry.estimatedMemoryBytes || null,
-        depthStats: depthMap ? { min: depthMap.min, max: depthMap.max } : null,
-        depthFallback: !!(depthMap && depthMap.fallback),
-        fluxPoints: fluxData ? (fluxData.sampleSummary?.points || null) : null,
-        flags: _flags,
-        errors: telemetry.errors || [],
-        warnings: telemetry.warnings || [] // ✅ Include warnings
+        depthStats:           depthMap ? { min: depthMap.min, max: depthMap.max } : null,
+        depthFallback:        !!(depthMap && depthMap.fallback),
+        fluxPoints:           fluxData ? (fluxData.sampleSummary?.points || null) : null,
+        flags:                _flags,
+        errors:               telemetry.errors   || [],
+        warnings:             telemetry.warnings || []
       };
 
       const telemetryRes = await _persistArtifact(storageWrapper, null, telemetryPayload, {
@@ -3131,6 +4439,7 @@ console.log('[STAGE4] Final calibData state before depth computation:', {
       stage: 'verifying_ownership'
     });
 
+    console.log('[CHECKPOINT] Stage 10 — calling markReconDone');
     if (storageWrapper.getReconStatus && storageWrapper.markReconDone) {
       try {
         const finalStatus = await storageWrapper.getReconStatus(metaKey);
@@ -3172,53 +4481,90 @@ console.log('[STAGE4] Final calibData state before depth computation:', {
     // ========================================
     // STAGE 12: Reply & Broadcast RECON_DONE
     // ========================================
-const replyPayload = {
-      event: 'RECON_DONE',
-      msgId: generateMsgId(),
+    const replyPayload = {
+      event:    'RECON_DONE',
+      msgId:    generateMsgId(),
       jobId,
       metaKey,
       derivedKeys,
-      cached: false,
+      cached:   false,
 
-      // --- Stage 0: container writeback fields ---
-      // cameraId: used by main.js _updateCameraContainer handler to match
-      //   against this.cameraContainer.cameraId before applying update.
-      cameraId: cameraId || null,
-      // reconstructionResolution: first concrete resolution used in a
-      //   completed reconstruction — written into
-      //   differentialGeometry.reconstructionResolution. Represents the
-      //   grid size at which the mathematical pipeline operated, not the
-      //   input frame size.
+      // Stage 0 container writeback (unchanged)
+      cameraId:                 cameraId || null,
       reconstructionResolution: depthMap ? depthMap.resolution : (options.resolution || null),
-      // effectiveWindowMs: temporal integration window of DirectionalLifting
-      //   in wall-clock milliseconds. null until first DirectionalLifting
-      //   instantiation completes. Written into
-      //   plenopticSampling.effectiveWindowMs.
-      effectiveWindowMs: _effectiveWindowMs,
-      // --- End Stage 0 fields ---
+      effectiveWindowMs:        _effectiveWindowMs,
+
+      // Stage 1 keys + summary
+      stage1: {
+        directnessKey: directnessResult?.metaKey    ?? null,
+        modalKey:      modalResult?.metaKey          ?? null,
+        penumbraKey:   penumbraArtResult?.metaKey    ?? null,
+        fMapRoute:     fMapFinal?.route              ?? null,
+        lightCount:    penumbraResult?.telemetry?.lightCount ?? 0,
+        edgeCount:     penumbraResult?.telemetry?.edgeCount  ?? 0,
+        meanWidth:     penumbraResult?.telemetry?.meanWidth  ?? null
+      },
+
+      // Stage 2 keys + summary.
+      // main.js RECON_DONE handler should write sdfFieldKey and diskSeedsKey
+      // onto cameraContainer so Stage 3 (DifferentialGeometry) and Stage 4B
+      // (ConstrainedMinimizer) can look up their inputs without a storage query.
+      stage2: {
+        sdfFieldKey:  sdfFieldArtResult?.metaKey ?? null,
+        diskSeedsKey: diskSeedsResult?.metaKey   ?? null,
+        seedCount:    sdfResult?.diskSeeds?.length ?? 0,
+        sdfRange:     sdfResult?.meta?.sdfRange   ?? null
+      },
+
+      // Stage 3 prerequisite
+      stage3: {
+        flowFieldKey:         flowFieldResult?.metaKey            ?? null,
+        directionalFieldKey:  directionalFieldArtResult?.metaKey  ?? null
+      },
+
+      // Stage 4 — consumers write these to cameraContainer.differentialGeometry
+      stage4: {
+        curvatureKey:      diffGeoResult?.curvatureKey      ?? null,
+        principalFrameKey: diffGeoResult?.principalFrameKey ?? null,
+        sdfDivKey:         diffGeoResult?.sdfDivKey         ?? null,
+        sdfCurlKey:        diffGeoResult?.sdfCurlKey        ?? null,
+        normalCurlKey:     diffGeoResult?.normalCurlKey     ?? null,
+        flowDivKey:        diffGeoResult?.flowDivKey        ?? null,
+        flowCurlKey:       diffGeoResult?.flowCurlKey       ?? null,
+        overhangCurlKey:   diffGeoResult?.overhangCurlKey   ?? null
+      },
+
+      // Flux field key — hoisted to top-level so main.js can write it onto
+      // cameraContainer directly. minimizer.worker (Stage 4B) and ambi.worker
+      // (Stage 5) both read cc.fluxFieldKey for SOC extraction.
+      fluxFieldKey: fluxResult?.metaKey ?? null,
 
       telemetry: {
         processingMs,
-        depthResolution: depthMap ? depthMap.resolution : null,
+        depthResolution:  depthMap  ? depthMap.resolution  : null,
         normalResolution: normalMap ? normalMap.resolution : null,
-        hasFlux: !!fluxData,
-        fallback: depthMap ? depthMap.fallback || false : true,
-        stages: telemetry.stages,
-        modules: telemetry.modules,
-        errors: telemetry.errors,
-        warnings: telemetry.warnings
+        hasFlux:          !!fluxData,
+        hasSdf:           !!sdfResult,
+        seedCount:        sdfResult?.diskSeeds?.length ?? 0,
+        fallback:         depthMap  ? depthMap.fallback || false : true,
+        stages:           telemetry.stages,
+        modules:          telemetry.modules,
+        errors:           telemetry.errors,
+        warnings:         telemetry.warnings
       }
     };
 
+    console.log('[CHECKPOINT] Stage 12 — broadcasting RECON_DONE');
     self.postMessage(replyPayload);
 
     _bcPost({
-      event: 'RECON_DONE',
-      msgId: generateMsgId(),
+      event:        'RECON_DONE',
+      msgId:        generateMsgId(),
       metaKey,
       derivedKeys,
-      producer: 'motion.worker',
-      timestamp: Date.now()
+      fluxFieldKey: fluxResult?.metaKey ?? null,
+      producer:     'motion.worker',
+      timestamp:    Date.now()
     });
 
   } catch (err) {
@@ -3347,13 +4693,21 @@ async function _computeFluxFromCalibration(metaKey, options = {}) {
   try {
     fluxResult = await _persistAndPin(
       storageWrapper,
-      null,
       {
-        manifest: sampleResult,
-        config: samplerConfig,
-        summary: fluxMeta.sampleManifestSummary
+        type:      fluxMeta.type,          // 'flux-manifest'
+        data: {
+          manifest: sampleResult,
+          config:   samplerConfig,
+          summary:  fluxMeta.sampleManifestSummary
+        },
+        meta:      fluxMeta,
+        createdAt: new Date().toISOString()
       },
-      fluxMeta
+      {
+        owner:   'motion.worker',
+        ttlMs:   ARTIFACT_PIN_TTL_MS,
+        pinType: 'soft'
+      }
     );
     
     const fluxKey = fluxResult.metaKey;
@@ -3435,13 +4789,30 @@ function _shutdownCalibratedPipeline() {
     _tetrachromacy = null;
   }
 
-  if (_directionalLifting) {
+if (_directionalLifting) {
     try { _directionalLifting.dispose(); } catch (e) {}
     _directionalLifting = null;
   }
-  
+
+  // --- Stage 1 ---
+  if (_penumbraAnalyzer) {
+    try { _penumbraAnalyzer.dispose(); } catch (e) {}
+    _penumbraAnalyzer = null;
+  }
+  // --- Stage 2 ---
+  if (_packingSDF) {
+    try { _packingSDF.dispose?.(); } catch (e) {}
+    _packingSDF = null;
+  }
+  // --- End Stage 2 ---
+  // --- Stage 3/4 ---
+  if (_diffGeo) {
+    try { _diffGeo.dispose?.(); } catch (e) {}
+    _diffGeo = null;
+  }
+
   _gpuCapabilities = null;
-  
+
   console.log('motion.worker: Calibrated pipeline modules disposed');
 }
 
@@ -3497,7 +4868,26 @@ self.onmessage = async (ev) => {
     }
     
     if (op === 'RECONSTRUCT_META') {
-      await _handleReconstructMeta(data);
+      const inFlightKey = data.metaKey;
+      if (_inFlightMetaKeys.has(inFlightKey)) {
+        // A reconstruction for this manifest is already running in this worker.
+        // Reject the duplicate — two concurrent async jobs interleave at every
+        // await and race on the reconStatus record, causing the first job's
+        // markReconFailed (from an error in the second) to corrupt the first's
+        // state before its first heartbeat fires.
+        self.postMessage({
+          event:  'RECON_IN_PROGRESS',
+          msgId:  generateMsgId(),
+          jobId:  data.jobId || data.reqId || 'dup',
+          metaKey: inFlightKey,
+          reason: 'duplicate_in_flight'
+        });
+        return;
+      }
+      _inFlightMetaKeys.add(inFlightKey);
+      _handleReconstructMeta(data).finally(() => {
+        _inFlightMetaKeys.delete(inFlightKey);
+      });
       return;
     }
     

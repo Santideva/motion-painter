@@ -43,9 +43,16 @@ class MotionPainter {
     this.evictionHook = null;
     
     // MotionWorker (wrapper instance) - created on demand when calibration is requested
-    this.motionWorker = null;
+    this.motionWorker        = null;
+    this._topologyWorker     = null;   // Stage 4A worker — wired when topology pipeline is ready
+    this._minimizerWorker    = null;   // Stage 4B worker — wired alongside topology worker
+    this._ambiWorker           = null;   // Stage 5 worker — wired alongside Stage 4 workers
+    this._kemWorker            = null;   // Stage 6 worker — wired after motionWorker is ready
+    this._correspondenceWorker = null;   // Stage 7 worker — wired after motionWorker is ready
+    this._stage678State        = null;   // { metaKey, kemDone, correspondenceDone, ambiRefined }
+    this._currentFlags         = {};     // Flags snapshot kept current for worker dispatch
     this._heavyPathRequested = false;
-    this.cameraContainer = null;
+    this.cameraContainer     = null;
     // BroadcastChannel used for cross-worker signaling (listen for release_request etc.)
     this._bc = null;
 
@@ -150,9 +157,9 @@ class MotionPainter {
       // ========================================================================
       try {
         await storageAPI.initStorage({ 
-          quota: 500 * 1024 * 1024,  // 500MB
-          startEvictor: true 
-        });
+        quota: 2 * 1024 * 1024 * 1024,  // 2GB
+        startEvictor: true 
+      });
         
         // Start periodic reaper for stale reconstruction jobs
         this._reaperInterval = setInterval(async () => {
@@ -262,6 +269,8 @@ class MotionPainter {
           fluxQuant: featureFlags.getFlag('fluxQuantization')
         };
         const unsubFluxConfig = featureFlags.subscribe((payload) => {
+          // Keep topology.worker dispatch flags current
+          this._currentFlags = featureFlags.getFlags();
           // refresh config snapshot (cheap)
           this._fluxConfig = {
             fluxMode: featureFlags.getFlag('fluxMode'),
@@ -492,6 +501,15 @@ class MotionPainter {
       // Set up event handlers
       this.setupEventHandlers();
 
+      // Snapshot current flags for topology.worker dispatch.
+      // Kept live via the featureFlags.subscribe callback below.
+      try {
+        this._currentFlags = featureFlags.getFlags();
+      } catch (e) {
+        console.warn('main.js: failed to snapshot initial feature flags', e);
+        this._currentFlags = {};
+      }
+
       // Initialize BroadcastChannel for cross-worker coordination (release requests, etc.)
       try {
         // Use the same channel name as the preprocessor.worker to keep events consistent
@@ -554,8 +572,479 @@ class MotionPainter {
                 console.warn('[Stage0] main.js: _updateCameraContainer failed on RECON_DONE', e);
               }
             }
+
+            // ── Stage 2: SDF and disk seed keys ────────────────────────────
+            // Hoisted to cameraContainer top-level so Stage 4B
+            // (ConstrainedMinimizer) can resolve inputs without a storage query.
+            if (msg.stage2) {
+              try {
+                this._updateCameraContainer({
+                  passThrough: {
+                    stage2: {
+                      sdfFieldKey:    msg.stage2.sdfFieldKey    ?? null,
+                      diskSeedsKey:   msg.stage2.diskSeedsKey   ?? null,
+                      seedCount:      msg.stage2.seedCount      ?? 0,
+                      sdfRange:       msg.stage2.sdfRange       ?? null
+                    },
+                    // Hoist the two most-consumed keys to top level so legacy
+                    // consumers that predate the stage2 sub-object don't need
+                    // updating.
+                    sdfFieldKey:  msg.stage2.sdfFieldKey  ?? null,
+                    diskSeedsKey: msg.stage2.diskSeedsKey ?? null
+                  }
+                });
+                console.log('[Stage2] main.js: sdfFieldKey/diskSeedsKey written to cameraContainer', {
+                  sdfFieldKey:  msg.stage2.sdfFieldKey,
+                  diskSeedsKey: msg.stage2.diskSeedsKey,
+                  seedCount:    msg.stage2.seedCount
+                });
+              } catch (e) {
+                console.warn('[Stage2] main.js: stage2 writeback failed', e);
+              }
+            }
+
+            // ── Stage 3 prerequisite: optical flow key + directional field ──
+            if (msg.stage3) {
+              try {
+                this._updateCameraContainer({
+                  passThrough: {
+                    stage3: {
+                      flowFieldKey:        msg.stage3.flowFieldKey        ?? null,
+                      directionalFieldKey: msg.stage3.directionalFieldKey ?? null
+                    }
+                  }
+                });
+                // Hoist directionalFieldKey to top-level for topology.worker lookup
+                if (msg.stage3.directionalFieldKey) {
+                  this._updateCameraContainer({
+                    passThrough: {
+                      directionalFieldKey: msg.stage3.directionalFieldKey
+                    }
+                  });
+                }
+                console.log('[Stage3] main.js: flowFieldKey + directionalFieldKey written to cameraContainer', {
+                  flowFieldKey:        msg.stage3.flowFieldKey,
+                  directionalFieldKey: msg.stage3.directionalFieldKey
+                });
+              } catch (e) {
+                console.warn('[Stage3] main.js: stage3 writeback failed', e);
+              }
+            }
+            // Hoist fluxFieldKey to top-level (needed by minimizer.worker, Stage 4B)
+            if (msg.fluxFieldKey) {
+              try {
+                this._updateCameraContainer({
+                  passThrough: { fluxFieldKey: msg.fluxFieldKey }
+                });
+                console.log('[Stage3] main.js: fluxFieldKey hoisted to top-level', {
+                  fluxFieldKey: msg.fluxFieldKey
+                });
+              } catch (e) {
+                console.warn('[Stage3] main.js: fluxFieldKey hoist failed', e);
+              }
+            }
+
+            // ── Stage 4: DifferentialGeometry keys ─────────────────────────
+            // Written into cameraContainer.differentialGeometry so Stage 5+
+            // can resolve any DG artifact key without a storage query.
+            // All values may be null when the relevant input was unavailable.
+            if (msg.stage4) {
+              try {
+                this._updateCameraContainer({
+                  differentialGeometry: {
+                    curvatureKey:      msg.stage4.curvatureKey      ?? null,
+                    principalFrameKey: msg.stage4.principalFrameKey ?? null,
+                    sdfDivKey:         msg.stage4.sdfDivKey         ?? null,
+                    sdfCurlKey:        msg.stage4.sdfCurlKey        ?? null,
+                    normalCurlKey:     msg.stage4.normalCurlKey     ?? null,
+                    flowDivKey:        msg.stage4.flowDivKey        ?? null,
+                    flowCurlKey:       msg.stage4.flowCurlKey       ?? null,
+                    overhangCurlKey:   msg.stage4.overhangCurlKey   ?? null,
+                    dgComputedAt:      Date.now()
+                  }
+                });
+                console.log('[Stage4] main.js: DifferentialGeometry keys written to cameraContainer.differentialGeometry', {
+                  curvatureKey:      msg.stage4.curvatureKey,
+                  principalFrameKey: msg.stage4.principalFrameKey,
+                  sdfDivKey:         msg.stage4.sdfDivKey,
+                  flowDivKey:        msg.stage4.flowDivKey        ?? null,
+                  overhangCurlKey:   msg.stage4.overhangCurlKey   ?? null
+                });
+              } catch (e) {
+                console.warn('[Stage4] main.js: stage4 writeback failed', e);
+              }
+            }
+            // ── Stage 4A: fire topology.worker ──────────────────────────────
+            // All inputs are now in cameraContainer after Stage 2–4 writes.
+            // topology.worker broadcasts TOPOLOGY_DONE when complete.
+            if (this._topologyWorker && msg.metaKey) {
+              const cc = this.cameraContainer;
+              try {
+                this._topologyWorker.postMessage({
+                  op:      'TOPOLOGY_ANALYZE',
+                  jobId:   `topo:${msg.metaKey}:${Date.now()}`,
+                  metaKey: msg.metaKey,
+                  flags:   this._currentFlags ?? {},
+                  artifactKeys: {
+                    directionalFieldKey: cc.directionalFieldKey                        ?? null,
+                    sdfFieldKey:         cc.stage2?.sdfFieldKey                        ?? null,
+                    diskSeedsKey:        cc.stage2?.diskSeedsKey                       ?? null,
+                    curvatureKey:        cc.differentialGeometry?.curvatureKey         ?? null,
+                    principalFrameKey:   cc.differentialGeometry?.principalFrameKey    ?? null,
+                    sdfDivKey:           cc.differentialGeometry?.sdfDivKey            ?? null,
+                    flowFieldKey:        cc.stage3?.flowFieldKey                       ?? null,
+                    flowCurlKey:         cc.differentialGeometry?.flowCurlKey          ?? null,
+                    flowDivKey:          cc.differentialGeometry?.flowDivKey           ?? null,
+                    directnessFieldKey:  cc.stage1?.directnessKey                      ?? null,
+                    normalCurlKey:       cc.differentialGeometry?.normalCurlKey        ?? null,
+                    penumbraFieldKey:    cc.stage1?.penumbraKey                        ?? null,
+                    normalMapKey:        cc.normalMapKey                               ?? null,
+                    resolution:          cc.reconstructionResolution                   ?? 512
+                  }
+                });
+                console.log('[Stage4A] main.js: topology.worker dispatched', { metaKey: msg.metaKey });
+              } catch (topoErr) {
+                console.warn('[Stage4A] main.js: topology.worker dispatch failed', topoErr);
+              }
+            }
+
+            // ── Stage 4B: fire minimizer.worker ─────────────────────────────
+            // Runs in parallel with topology.worker (Phase A).
+            // Phase B executes after minimizer.worker receives TOPOLOGY_DONE on BC.
+            if (this._minimizerWorker && msg.metaKey) {
+              const cc = this.cameraContainer;
+              try {
+                this._minimizerWorker.postMessage({
+                  op:      'MINIMIZE',
+                  jobId:   `mini:${msg.metaKey}:${Date.now()}`,
+                  metaKey: msg.metaKey,
+                  flags:   this._currentFlags ?? {},
+                  artifactKeys: {
+                    sdfFieldKey:      cc.stage2?.sdfFieldKey                    ?? null,
+                    diskSeedsKey:     cc.stage2?.diskSeedsKey                   ?? null,
+                    fluxFieldKey:     cc.fluxFieldKey                           ?? null,
+                    curvatureKey:     cc.differentialGeometry?.curvatureKey     ?? null,
+                    normalMapKey:     cc.normalMapKey                           ?? null,
+                    resolution:       cc.reconstructionResolution               ?? 512
+                  }
+                });
+                console.log('[Stage4B] main.js: minimizer.worker dispatched', { metaKey: msg.metaKey });
+              } catch (miniErr) {
+                console.warn('[Stage4B] main.js: minimizer.worker dispatch failed', miniErr);
+              }
+            }
           }
-          // --- End Stage 0 RECON_DONE handler ---
+                    // ── artifact:ready → MotionDetector dispatch wiring ───────────────────
+          // REQUIRED: forwards preprocessor manifest completion to MotionDetector
+          // so intents get their metaKey and reconstruction is dispatched.
+          if (msg && msg.event === 'artifact:ready' && msg.metaKey && msg.jobId) {
+            if (this.motionDetector?.onArtifactReady) {
+              try {
+                this.motionDetector.onArtifactReady({
+                  metaKey: msg.metaKey,
+                  jobId:   msg.jobId,
+                  meta:    msg.meta ?? {}
+                });
+              } catch(e) {
+                console.warn('[Dispatch] motionDetector.onArtifactReady error:', e);
+              }
+            }
+          }
+          // --- End Stage 0–4 RECON_DONE handler ---
+          // ── TOPOLOGY_DONE handler ──────────────────────────────────────────
+          if (msg && msg.event === 'TOPOLOGY_DONE') {
+            const topoMetaKey = msg.metaKey;
+            if (!topoMetaKey) return;
+            // In the current single-camera model, validate against active container
+            if (this.cameraContainer) {
+              try {
+                this._updateCameraContainer({
+                  passThrough: {
+                    stage4a: {
+                      primeEndsKey:       msg.primeEndsKey       ?? null,
+                      topologyMapKey:     msg.topologyMapKey     ?? null,
+                      homologySummaryKey: msg.homologySummaryKey ?? null,
+                      boundaryParamKey:   msg.boundaryParamKey   ?? null,
+                      lipschitzEndsKey:   msg.lipschitzEndsKey   ?? null,
+                      quaternionFieldKey: msg.quaternionFieldKey ?? null,
+                      motionMapsKey:      msg.motionMapsKey      ?? null,
+                      componentMapKey:    msg.componentMapKey    ?? null,
+                      betti:              msg.betti              ?? null,
+                      endCount:           msg.endCount           ?? null,
+                      completedAt:        Date.now()
+                    }
+                  }
+                });
+                this._checkStage4Complete(topoMetaKey);
+                console.log('[Stage4A] main.js: TOPOLOGY_DONE written to cameraContainer', {
+                  topoMetaKey,
+                  endCount: msg.endCount,
+                  betti:    msg.betti
+                });
+              } catch (e) {
+                console.warn('[Stage4A] main.js: TOPOLOGY_DONE writeback failed', e);
+              }
+            }
+            return;
+          }
+
+          // ── MINIMIZER_DONE handler ──────────────────────────────────────
+          if (msg && msg.event === 'MINIMIZER_DONE') {
+            const miniMetaKey = msg.metaKey;
+            if (!miniMetaKey) return;
+            if (this.cameraContainer) {
+              try {
+                this._updateCameraContainer({
+                  passThrough: {
+                    stage4b: {
+                      constrainedMinimizerKey: msg.constrainedMinimizerKey ?? null,
+                      phiMinKey:               msg.phiMinKey               ?? null,
+                      zeroCurveKey:            msg.zeroCurveKey            ?? null,
+                      telemetryKey:            msg.telemetryKey            ?? null,
+                      converged:               msg.converged               ?? false,
+                      stopReason:              msg.stopReason              ?? null,
+                      targetArea:              msg.targetArea              ?? null,
+                      finalArea:               msg.finalArea               ?? null,
+                      topologyConsistent:      msg.topologyConsistent      ?? false,
+                      completedAt:             Date.now()
+                    }
+                  }
+                });
+                this._checkStage4Complete(miniMetaKey);
+                console.log('[Stage4B] main.js: MINIMIZER_DONE written to cameraContainer', {
+                  miniMetaKey,
+                  converged:          msg.converged,
+                  topologyConsistent: msg.topologyConsistent,
+                  stopReason:         msg.stopReason
+                });
+              } catch (e) {
+                console.warn('[Stage4B] main.js: MINIMIZER_DONE writeback failed', e);
+              }
+            }
+            return;
+          }
+
+          // ── AMBI_DONE handler (Stage 5) ────────────────────────────────
+          if (msg && msg.event === 'AMBI_DONE') {
+            const ambiMetaKey = msg.metaKey;
+            if (!ambiMetaKey || !this.cameraContainer) return;
+            try {
+              // Write stage5 artifact keys + proxy motion values via passThrough.
+              // meanMotionMagnitude and meanLQESpeed are stored here so
+              // KEM_ANALYZE can pass them to kem.worker for AMBI_REFINE residuals.
+              this._updateCameraContainer({
+                passThrough: {
+                  stage5: {
+                    worldFrameMapKey:      msg.worldFrameMapKey      ?? null,
+                    warpFieldKey:          msg.warpFieldKey          ?? null,
+                    integrationWeightsKey: msg.integrationWeightsKey ?? null,
+                    surfaceParamKey:       msg.surfaceParamKey       ?? null,
+                    degradedMode:          msg.degradedMode          ?? false,
+                    isKeyframe:            msg.isKeyframe            ?? false,
+                    meanMotionMagnitude:   msg.meanMotionMagnitude   ?? null,
+                    meanLQESpeed:          msg.meanLQESpeed          ?? null,
+                    completedAt:           Date.now()
+                  }
+                }
+              });
+              if (msg.containerUpdate?.ambiFrame) {
+                this._updateCameraContainer({
+                  ambiFrame: msg.containerUpdate.ambiFrame
+                });
+              }
+
+              // ── Reset stage 678 state and dispatch Stages 6 + 7 ──────────
+              const cc = this.cameraContainer;
+              this._stage678State = {
+                metaKey:            ambiMetaKey,
+                kemDone:            false,
+                correspondenceDone: false,
+                ambiRefined:        false
+              };
+
+              // Stage 6 — KEM
+              if (this._kemWorker) {
+                try {
+                  this._kemWorker.postMessage({
+                    op:      'KEM_ANALYZE',
+                    jobId:   `kem:${ambiMetaKey}:${Date.now()}`,
+                    metaKey: ambiMetaKey,
+                    cameraId: cc.cameraId ?? 'default',
+                    flags:   this._currentFlags ?? {},
+                    meanMotionMagnitude: cc.stage5?.meanMotionMagnitude ?? null,
+                    meanLQESpeed:        cc.stage5?.meanLQESpeed        ?? null,
+                    artifactKeys: {
+                      principalFrameKey:   cc.differentialGeometry?.principalFrameKey ?? null,
+                      flowFieldKey:        cc.stage3?.flowFieldKey                    ?? null,
+                      directionalFieldKey: cc.directionalFieldKey                     ?? null,
+                      motionMapsKey:       cc.stage4a?.motionMapsKey                  ?? null,
+                      narrowBandKey:       cc.stage4b?.phiMinKey                      ?? null,
+                      surfaceParamKey:     cc.stage5?.surfaceParamKey                 ?? null,
+                      resolution:          cc.differentialGeometry?.reconstructionResolution
+                                           ?? cc.reconstructionResolution
+                                           ?? 512,
+                      cameraId:            cc.cameraId ?? 'default'
+                    }
+                  });
+                  console.log('[Stage6] main.js: KEM_ANALYZE dispatched', { metaKey: ambiMetaKey });
+                } catch (kemErr) {
+                  console.warn('[Stage6] main.js: kem.worker dispatch failed', kemErr);
+                }
+              }
+
+              // Stage 7 — Correspondence (parallel with Stage 6)
+              if (this._correspondenceWorker) {
+                try {
+                  this._correspondenceWorker.postMessage({
+                    op:      'CORRESPONDENCE_ANALYZE',
+                    jobId:   `corr:${ambiMetaKey}:${Date.now()}`,
+                    metaKey: ambiMetaKey,
+                    cameraId: cc.cameraId ?? 'default',
+                    flags:   this._currentFlags ?? {},
+                    artifactKeys: {
+                      warpFieldKey:      cc.stage5?.warpFieldKey      ?? null,
+                      worldFrameMapKey:  cc.stage5?.worldFrameMapKey  ?? null,
+                      surfaceParamKey:   cc.stage5?.surfaceParamKey   ?? null,
+                      primeEndsKey:      cc.stage4a?.primeEndsKey     ?? null,
+                      topologyMapKey:    cc.stage4a?.topologyMapKey   ?? null,
+                      phiMinKey:         cc.stage4b?.phiMinKey        ?? null,
+                      resolution:        cc.differentialGeometry?.reconstructionResolution
+                                         ?? cc.reconstructionResolution
+                                         ?? 512,
+                      cameraId:          cc.cameraId ?? 'default'
+                    }
+                  });
+                  console.log('[Stage7] main.js: CORRESPONDENCE_ANALYZE dispatched', { metaKey: ambiMetaKey });
+                } catch (corrErr) {
+                  console.warn('[Stage7] main.js: correspondence.worker dispatch failed', corrErr);
+                }
+              }
+
+              // STAGE5_DONE broadcast for any other BC consumers
+              if (this._bc) {
+                try {
+                  this._bc.postMessage({
+                    event:     'STAGE5_DONE',
+                    metaKey:   ambiMetaKey,
+                    stage5:    this.cameraContainer.stage5,
+                    ambiFrame: this.cameraContainer.ambiFrame,
+                    timestamp: Date.now()
+                  });
+                } catch (e) {
+                  console.warn('[Stage5] main.js: STAGE5_DONE broadcast failed', e);
+                }
+              }
+              console.log('[Stage5] main.js: AMBI_DONE processed — Stages 6+7 dispatched', {
+                ambiMetaKey,
+                degradedMode:    msg.degradedMode,
+                isKeyframe:      msg.isKeyframe,
+                legibilityScore: msg.containerUpdate?.ambiFrame?.legibilityScore
+              });
+            } catch (e) {
+              console.warn('[Stage5] main.js: AMBI_DONE handler failed', e);
+            }
+            return;
+          }
+
+          // ── AMBI_REFINED handler (Stage 5 — post Stage 6 refinement) ──
+          if (msg && msg.event === 'AMBI_REFINED') {
+            if (!this.cameraContainer) return;
+            try {
+              if (msg.componentId) {
+                this._updateCameraContainer({
+                  ambiFrame: {
+                    viewManifoldComponent: msg.componentId,
+                    positionInManifold:    msg.positionInManifold ?? this.cameraContainer.ambiFrame?.positionInManifold
+                  }
+                });
+              }
+              console.log('[Stage5] main.js: AMBI_REFINED — view manifold refined', {
+                cameraId:          msg.cameraId,
+                componentId:       msg.componentId,
+                motionMagResidual: msg.residuals?.motionMagResidual,
+                lqeSpeedResidual:  msg.residuals?.lqeSpeedResidual
+              });
+            } catch (e) {
+              console.warn('[Stage5] main.js: AMBI_REFINED writeback failed', e);
+            }
+            if (this._stage678State) {
+              this._stage678State.ambiRefined = true;
+              this._checkStage678Complete();
+            }
+            return;
+          }
+          
+
+          // ── KEM_DONE handler (Stage 6) ─────────────────────────────────
+          if (msg && msg.event === 'KEM_DONE') {
+            const kemMetaKey = msg.metaKey;
+            if (!kemMetaKey || !this.cameraContainer) return;
+            try {
+              this._updateCameraContainer({
+                passThrough: {
+                  stage6: {
+                    kemMapKey:           msg.kemMapKey           ?? null,
+                    cladeMapKey:         msg.cladeMapKey         ?? null,
+                    tensionFieldKey:     msg.tensionFieldKey     ?? null,
+                    velocityManifoldKey: msg.velocityManifoldKey ?? null,
+                    kemSummaryKey:       msg.kemSummaryKey       ?? null,
+                    meanKEM:             msg.meanKEM             ?? null,
+                    cladeCount:          msg.cladeCount          ?? 0,
+                    completedAt:         Date.now()
+                  }
+                }
+              });
+              console.log('[Stage6] main.js: KEM_DONE written', {
+                kemMetaKey,
+                meanKEM:    msg.meanKEM,
+                cladeCount: msg.cladeCount
+              });
+            } catch (e) {
+              console.warn('[Stage6] main.js: KEM_DONE writeback failed', e);
+            }
+            if (this._stage678State) {
+              this._stage678State.kemDone = true;
+              this._checkStage678Complete();
+            }
+            return;
+          }
+
+          // ── CORRESPONDENCE_DONE handler (Stage 7) ──────────────────────
+          if (msg && msg.event === 'CORRESPONDENCE_DONE') {
+            const corrMetaKey = msg.metaKey;
+            if (!corrMetaKey || !this.cameraContainer) return;
+            try {
+              this._updateCameraContainer({
+                passThrough: {
+                  stage7: {
+                    correspondenceMapKey:       msg.correspondenceMapKey       ?? null,
+                    confidenceMapKey:           msg.confidenceMapKey           ?? null,
+                    bilateralConsistencyMapKey: msg.bilateralConsistencyMapKey ?? null,
+                    correspondenceSummaryKey:   msg.correspondenceSummaryKey   ?? null,
+                    symmetryMismatchScore:      msg.symmetryMismatchScore      ?? null,
+                    geometricAsymmetry:         msg.geometricAsymmetry         ?? null,
+                    reconstructionConsistency:  msg.reconstructionConsistency  ?? null,
+                    symmetryAxisAngle:          msg.symmetryAxisAngle          ?? null,
+                    unmatchedFraction:          msg.unmatchedFraction          ?? null,
+                    unreliableScore:            msg.unreliableScore            ?? false,
+                    completedAt:                Date.now()
+                  }
+                }
+              });
+              console.log('[Stage7] main.js: CORRESPONDENCE_DONE written', {
+                corrMetaKey,
+                symmetryMismatchScore: msg.symmetryMismatchScore,
+                unmatchedFraction:     msg.unmatchedFraction
+              });
+            } catch (e) {
+              console.warn('[Stage7] main.js: CORRESPONDENCE_DONE writeback failed', e);
+            }
+            if (this._stage678State) {
+              this._stage678State.correspondenceDone = true;
+              this._checkStage678Complete();
+            }
+            return;
+          }
         });
       } catch (e) {
         console.warn('Main: failed to create BroadcastChannel for orchestration', e);
@@ -1281,7 +1770,7 @@ displayHardwareLimitations() {
    *   plenopticSampling?: Partial<plenopticSampling>
    *   ambiFrame?: Partial<ambiFrame>
    */
-  _updateCameraContainer(updates = {}) {
+    _updateCameraContainer(updates = {}) {
     if (!this.cameraContainer) {
       console.warn('[Stage0] _updateCameraContainer: no cameraContainer to update');
       return;
@@ -1289,27 +1778,36 @@ displayHardwareLimitations() {
 
     const current = this.cameraContainer;
 
+    // passThrough: arbitrary top-level keys that are spread directly onto the
+    // container without any deep-merge treatment. Used for stage2/stage3/stage4
+    // keys written back from RECON_DONE payloads.
+    const { differentialGeometry, plenopticSampling, ambiFrame,
+            passThrough = {}, ...rest } = updates;
+
     const merged = Object.freeze({
       ...current,
+      // Spread any pass-through top-level keys first so the three
+      // controlled sub-object merges below can still override them.
+      ...passThrough,
 
-      differentialGeometry: updates.differentialGeometry
+      differentialGeometry: differentialGeometry
         ? Object.freeze({
             ...current.differentialGeometry,
-            ...updates.differentialGeometry
+            ...differentialGeometry
           })
         : current.differentialGeometry,
 
-      plenopticSampling: updates.plenopticSampling
+      plenopticSampling: plenopticSampling
         ? Object.freeze({
             ...current.plenopticSampling,
-            ...updates.plenopticSampling
+            ...plenopticSampling
           })
         : current.plenopticSampling,
 
-      ambiFrame: updates.ambiFrame
+      ambiFrame: ambiFrame
         ? Object.freeze({
             ...current.ambiFrame,
-            ...updates.ambiFrame
+            ...ambiFrame
           })
         : current.ambiFrame
     });
@@ -1491,7 +1989,7 @@ _ensureMotionWorker() {
     // Ready Callback (Non-blocking)
     // ===================================================================
     try {
-      this.motionWorker.onReady(() => {
+    this.motionWorker.onReady(() => {
         try {
           console.log('✅ MotionPainter: MotionWorkerWrapper is ready');
           
@@ -1501,7 +1999,37 @@ _ensureMotionWorker() {
           } else {
             console.warn('⚠️ MotionPainter: Dispatcher connection verification failed!');
           }
-          
+
+          // Instantiate topology.worker, minimizer.worker, and ambi.worker now
+          // that motion.worker is confirmed ready. All Stage 4/5 workers consume
+          // artifacts produced by motion.worker, so this ordering guarantees they
+          // are live before the first RECON_DONE fires.
+          try {
+            this._ensureTopologyWorker();
+          } catch (e) {
+            console.warn('[Stage4A] MotionPainter: _ensureTopologyWorker failed in onReady', e);
+          }
+          try {
+            this._ensureMinimizerWorker();
+          } catch (e) {
+            console.warn('[Stage4B] MotionPainter: _ensureMinimizerWorker failed in onReady', e);
+          }
+          try {
+            this._ensureAmbiWorker();
+          } catch (e) {
+            console.warn('[Stage5] MotionPainter: _ensureAmbiWorker failed in onReady', e);
+          }
+          try {
+            this._ensureKEMWorker();
+          } catch (e) {
+            console.warn('[Stage6] MotionPainter: _ensureKEMWorker failed in onReady', e);
+          }
+          try {
+            this._ensureCorrespondenceWorker();
+          } catch (e) {
+            console.warn('[Stage7] MotionPainter: _ensureCorrespondenceWorker failed in onReady', e);
+          }
+
           // Request initial metrics to warm the worker
           try {
             this.motionWorker.requestMetrics().then(metrics => {
@@ -1567,6 +2095,281 @@ _ensureMotionWorker() {
     throw err;
   }
 }
+
+
+/**
+   * _ensureAmbiWorker()
+   *
+   * Instantiates ambi.worker.js as a module worker on first call.
+   * No-op if the worker already exists.
+   *
+   * Called alongside _ensureTopologyWorker() and _ensureMinimizerWorker()
+   * from motionWorker.onReady() so all Stage 4/5 workers are live before
+   * the first RECON_DONE arrives.
+   *
+   * { type: 'module' } is required — ambi.worker.js uses ES module
+   * import statements and will throw SyntaxError as a classic worker.
+   *
+   * ambi.worker maintains persistent session state (_sessionState and
+   * _manifold) across calls — it must NOT be restarted between frames.
+   * The onerror handler sets the reference to null so that the next
+   * STAGE4_DONE will attempt to re-instantiate, resetting session state.
+   */
+  _ensureKEMWorker() {
+    if (this._kemWorker) return;
+    try {
+      this._kemWorker = new Worker(
+        new URL('./core/kem.worker.js', import.meta.url),
+        { type: 'module' }
+      );
+      try {
+        this._kemWorker.postMessage({
+          op:    'init',
+          flags: this._currentFlags ?? {}
+        });
+      } catch (e) {
+        console.warn('[Stage6] main.js: kem.worker init message failed', e);
+      }
+      this._kemWorker.onerror = (err) => {
+        console.error('[Stage6] main.js: kem.worker runtime error:', err);
+        this._kemWorker = null;
+      };
+      console.log('[Stage6] main.js: kem.worker instantiated (module worker)');
+    } catch (err) {
+      console.error('[Stage6] main.js: failed to instantiate kem.worker:', err);
+      this._kemWorker = null;
+    }
+  }
+
+  _ensureCorrespondenceWorker() {
+    if (this._correspondenceWorker) return;
+    try {
+      this._correspondenceWorker = new Worker(
+        new URL('./core/correspondence.worker.js', import.meta.url),
+        { type: 'module' }
+      );
+      try {
+        this._correspondenceWorker.postMessage({
+          op:    'init',
+          flags: this._currentFlags ?? {}
+        });
+      } catch (e) {
+        console.warn('[Stage7] main.js: correspondence.worker init message failed', e);
+      }
+      this._correspondenceWorker.onerror = (err) => {
+        console.error('[Stage7] main.js: correspondence.worker runtime error:', err);
+        this._correspondenceWorker = null;
+      };
+      console.log('[Stage7] main.js: correspondence.worker instantiated (module worker)');
+    } catch (err) {
+      console.error('[Stage7] main.js: failed to instantiate correspondence.worker:', err);
+      this._correspondenceWorker = null;
+    }
+  }
+
+  _ensureAmbiWorker() {
+    if (this._ambiWorker) return;
+
+    try {
+      this._ambiWorker = new Worker(
+        new URL('./core/ambi.worker.js', import.meta.url),
+        { type: 'module' }
+      );
+
+      // Send initial flags snapshot so _flags is populated before
+      // the first AMBI_ANALYZE message arrives.
+      try {
+        this._ambiWorker.postMessage({
+          op:    'init',
+          flags: this._currentFlags ?? {}
+        });
+      } catch (e) {
+        console.warn('[Stage5] main.js: ambi.worker init message failed', e);
+      }
+
+      this._ambiWorker.onerror = (err) => {
+        console.error('[Stage5] main.js: ambi.worker runtime error:', err);
+        // Null the reference — next STAGE4_DONE re-instantiates,
+        // which resets session state (new keyframe on restart).
+        this._ambiWorker = null;
+      };
+
+      console.log('[Stage5] main.js: ambi.worker instantiated (module worker)');
+    } catch (err) {
+      console.error('[Stage5] main.js: failed to instantiate ambi.worker:', err);
+      this._ambiWorker = null;
+    }
+  }
+
+  _ensureMinimizerWorker() {
+    if (this._minimizerWorker) return;
+
+    try {
+      this._minimizerWorker = new Worker(
+        new URL('./core/minimizer.worker.js', import.meta.url),
+        { type: 'module' }
+      );
+
+      // Send initial flags snapshot
+      try {
+        this._minimizerWorker.postMessage({
+          op:    'init',
+          flags: this._currentFlags ?? {}
+        });
+      } catch (e) {
+        console.warn('[Stage4B] main.js: minimizer.worker init message failed', e);
+      }
+
+      this._minimizerWorker.onerror = (err) => {
+        console.error('[Stage4B] main.js: minimizer.worker runtime error:', err);
+        this._minimizerWorker = null;
+      };
+
+      console.log('[Stage4B] main.js: minimizer.worker instantiated (module worker)');
+    } catch (err) {
+      console.error('[Stage4B] main.js: failed to instantiate minimizer.worker:', err);
+      this._minimizerWorker = null;
+    }
+  }
+
+  _ensureTopologyWorker() {
+    if (this._topologyWorker) return;
+
+    try {
+      this._topologyWorker = new Worker(
+        new URL('./core/topology.worker.js', import.meta.url),
+        { type: 'module' }
+      );
+
+      // Send initial flags snapshot so the worker's _flags are populated
+      // before the first TOPOLOGY_ANALYZE message arrives.
+      try {
+        this._topologyWorker.postMessage({
+          op:    'init',
+          flags: this._currentFlags ?? {}
+        });
+      } catch (e) {
+        console.warn('[Stage4A] main.js: topology.worker init message failed', e);
+      }
+
+      // Worker-level error handler — clears the reference so the next
+      // RECON_DONE will attempt to re-instantiate.
+      this._topologyWorker.onerror = (err) => {
+        console.error('[Stage4A] main.js: topology.worker runtime error:', err);
+        this._topologyWorker = null;
+      };
+
+      console.log('[Stage4A] main.js: topology.worker instantiated (module worker)');
+    } catch (err) {
+      console.error('[Stage4A] main.js: failed to instantiate topology.worker:', err);
+      this._topologyWorker = null;
+    }
+  }
+
+  /**
+   * _checkStage678Complete
+   *
+   * Called after any of: KEM_DONE, CORRESPONDENCE_DONE, AMBI_REFINED.
+   * Broadcasts STAGE678_DONE when all three have arrived for the current metaKey.
+   * _stage678State is reset on each AMBI_DONE so a stale flag from a prior
+   * frame cannot prematurely trigger Stage 8.
+   */
+  _checkStage678Complete() {
+    const s = this._stage678State;
+    if (!s) return;
+    if (s.kemDone && s.correspondenceDone && s.ambiRefined) {
+      if (this._bc) {
+        try {
+          this._bc.postMessage({
+            event:     'STAGE678_DONE',
+            metaKey:   s.metaKey,
+            stage6:    this.cameraContainer?.stage6  ?? null,
+            stage7:    this.cameraContainer?.stage7  ?? null,
+            ambiFrame: this.cameraContainer?.ambiFrame ?? null,
+            timestamp: Date.now()
+          });
+          console.log('[Stage678] main.js: STAGE678_DONE broadcast', { metaKey: s.metaKey });
+        } catch (e) {
+          console.warn('[Stage678] main.js: STAGE678_DONE broadcast failed', e);
+        }
+      }
+      this._stage678State = null;
+    }
+  }
+
+  _checkStage4Complete(metaKey) {
+    const cc = this.cameraContainer;
+    if (!cc) return;
+    // Stage 5 (AmbiAnamorph) requires both 4A and 4B.
+    if (cc.stage4a && cc.stage4b) {
+      // Broadcast STAGE4_DONE on BC for any other BC consumers (Stage 6/7 stubs).
+      // Note: BroadcastChannel does not deliver to the sender, so main.js will not
+      // receive this event in its own BC listener. ambi.worker is dispatched below
+      // via direct postMessage, not via BC.
+      if (this._bc) {
+        try {
+          this._bc.postMessage({
+            event:     'STAGE4_DONE',
+            metaKey,
+            stage4a:   cc.stage4a,
+            stage4b:   cc.stage4b,
+            timestamp: Date.now()
+          });
+          console.log('[Stage4] main.js: STAGE4_DONE broadcast (both 4A and 4B complete)', { metaKey });
+        } catch (e) {
+          console.warn('[Stage4] main.js: STAGE4_DONE broadcast failed', e);
+        }
+      }
+
+      // ── Stage 5: dispatch ambi.worker directly ───────────────────────
+      // ambi.worker receives AMBI_ANALYZE via direct postMessage (not BC).
+      // All artifact keys are read from cameraContainer which is fully
+      // populated at this point — Stage 2/3/4 writes all occur in the
+      // RECON_DONE handler before _checkStage4Complete is called.
+      if (this._ambiWorker) {
+        try {
+          this._ambiWorker.postMessage({
+            op:      'AMBI_ANALYZE',
+            jobId:   `ambi:${metaKey}:${Date.now()}`,
+            metaKey,
+            cameraId: cc.cameraId ?? 'default',
+            flags:   this._currentFlags ?? {},
+            stage4a: cc.stage4a,
+            stage4b: cc.stage4b,
+            artifactKeys: {
+              // Stage 4B
+              phiMinKey:               cc.stage4b.phiMinKey               ?? null,
+              zeroCurveKey:            cc.stage4b.zeroCurveKey            ?? null,
+              constrainedMinimizerKey: cc.stage4b.constrainedMinimizerKey ?? null,
+              // Stage 4A
+              primeEndsKey:            cc.stage4a.primeEndsKey            ?? null,
+              topologyMapKey:          cc.stage4a.topologyMapKey          ?? null,
+              componentMapKey:         cc.stage4a.componentMapKey         ?? null,
+              lipschitzEndsKey:        cc.stage4a.lipschitzEndsKey        ?? null,
+              motionMapsKey:           cc.stage4a.motionMapsKey           ?? null,
+              // Stage 3 / DifferentialGeometry
+              principalFrameKey:       cc.differentialGeometry?.principalFrameKey ?? null,
+              curvatureKey:            cc.differentialGeometry?.curvatureKey      ?? null,
+              directionalFieldKey:     cc.directionalFieldKey                     ?? null,
+              // Stage 1
+              directnessKey:           cc.stage1?.directnessKey                   ?? null,
+              penumbraKey:             cc.stage1?.penumbraKey                     ?? null,
+              // Meta
+              resolution:              cc.differentialGeometry?.reconstructionResolution
+                                       ?? cc.reconstructionResolution
+                                       ?? 512,
+              cameraId:                cc.cameraId ?? 'default'
+            }
+          });
+          console.log('[Stage5] main.js: ambi.worker dispatched (AMBI_ANALYZE)', { metaKey });
+        } catch (ambiErr) {
+          console.warn('[Stage5] main.js: ambi.worker dispatch failed', ambiErr);
+        }
+      } else {
+        console.warn('[Stage5] main.js: _ambiWorker not ready — AMBI_ANALYZE skipped for', metaKey);
+      }
+    }
+  }
 
 /**
  * Teardown MotionWorker if present (called during destroy)
@@ -1993,6 +2796,66 @@ verifyDispatcherConnection() {
       this._teardownMotionWorker();
     } catch (e) {
       console.warn('Failed to teardown MotionWorker', e);
+    }
+
+    // Teardown topology worker (Stage 4A)
+    if (this._topologyWorker) {
+      try {
+        this._topologyWorker.postMessage({ op: 'shutdown' });
+      } catch (e) { /* ignore — worker may already be dead */ }
+      try {
+        this._topologyWorker.terminate();
+      } catch (e) { /* ignore */ }
+      this._topologyWorker = null;
+      console.log('[Stage4A] main.js: topology.worker terminated');
+    }
+
+    // Teardown minimizer worker (Stage 4B)
+    if (this._minimizerWorker) {
+      try {
+        this._minimizerWorker.postMessage({ op: 'shutdown' });
+      } catch (e) { /* ignore — worker may already be dead */ }
+      try {
+        this._minimizerWorker.terminate();
+      } catch (e) { /* ignore */ }
+      this._minimizerWorker = null;
+      console.log('[Stage4B] main.js: minimizer.worker terminated');
+    }
+
+    // Teardown ambi worker (Stage 5)
+    if (this._ambiWorker) {
+      try {
+        this._ambiWorker.postMessage({ op: 'shutdown' });
+      } catch (e) { /* ignore — worker may already be dead */ }
+      try {
+        this._ambiWorker.terminate();
+      } catch (e) { /* ignore */ }
+      this._ambiWorker = null;
+      console.log('[Stage5] main.js: ambi.worker terminated');
+    }
+
+    // Teardown kem worker (Stage 6)
+    if (this._kemWorker) {
+      try {
+        this._kemWorker.postMessage({ op: 'shutdown' });
+      } catch (e) { /* ignore — worker may already be dead */ }
+      try {
+        this._kemWorker.terminate();
+      } catch (e) { /* ignore */ }
+      this._kemWorker = null;
+      console.log('[Stage6] main.js: kem.worker terminated');
+    }
+
+    // Teardown correspondence worker (Stage 7)
+    if (this._correspondenceWorker) {
+      try {
+        this._correspondenceWorker.postMessage({ op: 'shutdown' });
+      } catch (e) { /* ignore — worker may already be dead */ }
+      try {
+        this._correspondenceWorker.terminate();
+      } catch (e) { /* ignore */ }
+      this._correspondenceWorker = null;
+      console.log('[Stage7] main.js: correspondence.worker terminated');
     }
 
     try {

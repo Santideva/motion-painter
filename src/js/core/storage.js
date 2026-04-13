@@ -2945,10 +2945,22 @@ const markReconHeartbeat = async (reqId) => {
         }
         
         if (rec.state !== 'running') {
-          console.warn(`markReconHeartbeat: job ${reqId} not running (state: ${rec.state})`);
-          resolve(null);
+        if (rec.state === 'failed') {
+          // Restore to running — this record was reaped while the worker was
+          // still computing. The reaper fired after 10+ minutes of accumulated
+          // runtime. The worker is alive and should continue.
+          console.warn(`markReconHeartbeat: restoring reaped-but-alive job ${reqId} to running`);
+          rec.state = 'running';
+          rec.lastHeartbeat = Date.now();
+          const putReq = store.put(rec);
+          putReq.onsuccess = () => resolve(rec);
+          putReq.onerror = () => reject(putReq.error);
           return;
         }
+        console.warn(`markReconHeartbeat: job ${reqId} not running (state: ${rec.state})`);
+        resolve(null);
+        return;
+      }
         
         // Update heartbeat timestamp
         rec.lastHeartbeat = Date.now();
@@ -3036,6 +3048,12 @@ const markReconDone = async (reqId, derivedKeys = []) => {
  * @returns {Promise<Object>} Updated status
  */
 const markReconFailed = async (reqId, error, backoffMs = 300000) => {
+  console.warn('[markReconFailed] called:', {
+    reqId,
+    error,
+    backoffMs,
+    stack: new Error().stack
+  });
   const db = await openDB();
   
   return new Promise((resolve, reject) => {

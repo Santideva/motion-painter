@@ -9,35 +9,23 @@ module.exports = {
     path: path.resolve(__dirname, 'dist'),
     filename: 'bundle.[contenthash].js',
     clean: true,
-    // Important: Enable proper module worker support
+    // Required for webpack 5 module worker chunks to reference themselves
+    // correctly at runtime via import.meta.url
     globalObject: 'self'
   },
   module: {
     rules: [
-      // IMPORTANT: Worker files must be processed BEFORE the general JS rule
-      // This prevents Babel from transpiling workers
-      {
-        test: /\.worker\.js$/,
-        use: {
-          loader: 'worker-loader',
-          options: {
-            // Use ES modules (not classic workers)
-            esModule: true,
-            // Keep worker files as separate chunks
-            filename: '[name].[contenthash].worker.js',
-            // Important: use module worker type
-            worker: {
-              type: 'module'
-            }
-          }
-        }
-      },
-      // General JS files (but NOT workers due to the rule above)
+      // General JS files — Babel transpilation.
+      // Worker files are intentionally excluded: webpack 5 detects the
+      // `new Worker(new URL('./x.worker.js', import.meta.url))` pattern
+      // statically and bundles each worker and all its transitive imports
+      // into a separate self-contained chunk at build time. Running those
+      // chunks through Babel would break ES module semantics inside workers.
       {
         test: /\.js$/,
         exclude: [
           /node_modules/,
-          /\.worker\.js$/ // CRITICAL: Exclude worker files from Babel
+          /\.worker\.js$/   // keep workers as native ES modules
         ],
         use: {
           loader: 'babel-loader',
@@ -75,21 +63,35 @@ module.exports = {
   devServer: {
     static: [
       './dist',
-      // Serve src directory for worker files during development
-      { directory: path.join(__dirname, 'src'), publicPath: '/src' }
+      // Serve the src directory so that workers instantiated via raw URL
+      // strings (e.g. during console-level testing before the webpack pattern
+      // is fully adopted) are reachable at /src/...
+      { directory: path.join(__dirname, 'src'), publicPath: '/src' },
+      // Serve node_modules so that any worker which falls back to an absolute
+      // /node_modules/... import path can resolve it during development.
+      // Under COEP require-corp, CDN imports are blocked, so this avoids
+      // the THREE.js import failure that produces the opaque [object Event]
+      // worker error.
+      { directory: path.join(__dirname, 'node_modules'), publicPath: '/node_modules' }
     ],
     hot: true,
     server: 'https',
     headers: {
-      // Critical headers for SharedArrayBuffer and module workers
+      // Required for SharedArrayBuffer and native module workers.
+      // COEP require-corp blocks cross-origin fetches without CORP headers,
+      // which is why CDN imports inside workers fail — all worker dependencies
+      // must be bundled or served locally.
       'Cross-Origin-Embedder-Policy': 'require-corp',
       'Cross-Origin-Opener-Policy': 'same-origin',
-      // Add this to ensure proper MIME types for workers
       'Service-Worker-Allowed': '/'
     }
   },
-  // Add experiments flag for module workers
   experiments: {
-    topLevelAwait: true // Needed for top-level await in workers
-  }
+    // Required for top-level await inside workers (used by motion.worker.js
+    // and the storage import chain).
+    topLevelAwait: true
+  },
+    ignoreWarnings: [
+    /Critical dependency: the request of a dependency is an expression/
+  ]
 };

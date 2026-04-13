@@ -17,7 +17,15 @@ export class MotionWorkerWrapper {
   constructor(workerPath = '/src/js/core/motion.worker.js', opts = {}) {
     this.workerPath = workerPath || '/src/js/core/motion.worker.js';
     this.readyTimeoutMs = typeof opts.readyTimeoutMs === 'number' ? opts.readyTimeoutMs : 10000;
+
+    // Default job timeout remains reasonable for smaller jobs like computeFlux
     this.defaultJobTimeoutMs = typeof opts.defaultJobTimeoutMs === 'number' ? opts.defaultJobTimeoutMs : 120000;
+
+    // RECONSTRUCT_META is much heavier: GPU compute + large persistence + visibility waits
+    this.reconstructJobTimeoutMs = typeof opts.reconstructJobTimeoutMs === 'number'
+      ? opts.reconstructJobTimeoutMs
+      : 300000; // 5 minutes
+
     this.config = Object.assign({}, opts);
     this._debug = !!opts.debug;
 
@@ -51,10 +59,20 @@ export class MotionWorkerWrapper {
     // Feature flag subscription cleanup
     this._flagUnsub = null;
 
-    // Create worker
+    // Create worker.
+    // Webpack 5 detects `new Worker(new URL('./...', import.meta.url))` and
+    // bundles the worker plus all its transitive imports (THREE.js, storage,
+    // pipeline modules) into a self-contained hashed chunk at build time.
+    // This eliminates the bare-specifier and COEP failures that occur when
+    // the worker is loaded as a raw source file via a string URL.
+    //
+    // workerPath is retained in the constructor signature for call-site
+    // compatibility but is no longer used to create the Worker instance.
     try {
-      const url = new URL(this.workerPath, window.location.origin);
-      this.worker = new Worker(url, { type: 'module' });
+      this.worker = new Worker(
+        new URL('./motion.worker.js', import.meta.url),
+        { type: 'module' }
+      );
 
       // Attach message handlers
       this.worker.onmessage = (ev) => this._handleWorkerMessage(ev);
@@ -292,6 +310,20 @@ export class MotionWorkerWrapper {
    * @private
    */
   _handleWorkerError(ev) {
+      // Extract detailed error information
+  const errorMsg = ev && (ev.message || ev.error?.message || String(ev));
+  const filename = ev && ev.filename;
+  const lineno = ev && ev.lineno;
+  const colno = ev && ev.colno;
+  const errorStack = ev && ev.error?.stack;
+
+  console.error('MotionWorkerWrapper: worker error', {
+    message: errorMsg,
+    filename,
+    lineno,
+    colno,
+    stack: errorStack
+  });
     const msg = ev && (ev.message || String(ev)) || 'worker_error';
     console.error('MotionWorkerWrapper: worker error', msg);
     this.metrics.lastError = msg;
@@ -508,7 +540,11 @@ export class MotionWorkerWrapper {
       );
     }
     
-    return this._submitJob('RECONSTRUCT_META', { metaKey, options }, timeoutMs);
+    return this._submitJob(
+    'RECONSTRUCT_META',
+    { metaKey, options },
+    typeof timeoutMs === 'number' ? timeoutMs : this.reconstructJobTimeoutMs
+  );
   }
 
   /**
@@ -661,7 +697,9 @@ export class MotionWorkerWrapper {
 
     // Generate unique jobId
     const jobId = `${op}-${Date.now()}-${(this.jobCounter++).toString(36)}`;
-    const jobTimeout = typeof timeoutMs === 'number' ? timeoutMs : this.defaultJobTimeoutMs;
+    const jobTimeout = typeof timeoutMs === 'number'
+  ? timeoutMs
+  : this.defaultJobTimeoutMs;
 
     this.metrics.jobsRequested++;
 

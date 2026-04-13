@@ -104,6 +104,130 @@ const DEFAULTS = {
   specularChromaScale: 3.0,           // Chroma deviation amplification
   specularThreshold: 0.15,            // Minimum specular mask threshold (0..1)
 
+  // Stage 1: f_map (visible-fraction field)
+  enableFMapRouteA: true,             // true  → Route A (depth MC) runs after GPU branch
+                                      // false → always use Route B (temporal proxy)
+  fMapDebug: false,                   // log Route A source position + timing per frame
+  fMapDirectThresh: 0.9,              // f >= this  →  DIRECT   modal label (2)
+  fMapUmbraThresh: 0.1,               // f <= this  →  UMBRA    modal label (0)
+                                      // in between →  PENUMBRA modal label (1)
+  fMapNSamples: 128,                  // Monte Carlo source samples (Route A only)
+  fMapOcclusionBias: 0.04,            // depth tolerance preventing self-occlusion
+                                      // from quantisation noise; normalised [0,1]
+  fMapMarchSteps: 8,                  // intermediate depth-march steps per ray
+
+  // Stage 1: DOA + modal decomposition
+  doaKappaThreshold: 3.0,             // angular concentration (kappa) above which a
+                                      // pixel is classified as point-like / direct;
+                                      // empirical: 3.0 suits most indoor scenes
+
+  // Stage 1: PenumbraAnalyzer
+  penumbraProfileWindow: 17,          // crossing-strip width in pixels (forced odd, >= 5)
+  penumbraBrightnessThresh: 0.75,     // fraction of frame-max brightness above which a
+                                      // region is treated as a light-source blob
+  penumbraMinEdgeGrad: 0.05,          // Sobel gradient magnitude required for an edge
+                                      // pixel to be treated as a shadow boundary
+  penumbraMinEdgeLength: 8,           // minimum connected-component length (pixels);
+                                      // shorter components are rejected as texture noise
+  penumbraMaxLights: 8,               // cap on tracked light-source blobs per frame
+  penumbraMinFitR2: 0.6,              // minimum R² for logistic profile fit;
+                                      // fits below this are discarded as noisy edges
+  penumbraStabilityWeight: 0.6,       // blend weight: temporal stability vs brightness
+                                      // when scoring light-source candidates (0..1)
+  penumbraDebug: false,               // verbose PenumbraAnalyzer console logging
+
+  // Stage 2: PackingSDF
+  // All flags are also valid runtime overrides via flagsChanged BroadcastChannel event.
+  enablePackingSDF:     true,           // set false to skip Stage 2 entirely
+  packingUmbraPolicy:   'half-weight',  // 'half-weight' | 'include' | 'exclude'
+                                        //   half-weight: SDF × 0.5 in UMBRA regions
+                                        //   include:     no change
+                                        //   exclude:     SDF → NaN (downstream skips)
+  packingBandBase:      0.03,           // minimum narrow band width as fraction of
+                                        // sdfRange (GPT latent heat lower bound)
+  packingBandScale:     3.0,            // penumbraWidth × this = extra band width
+  packingFalloffExp:    2.0,            // smooth fall-off exponent for narrow band mask
+  packingSeedRMin:      0.01,           // minimum disk seed radius (normalised coords)
+  packingSeedRMax:      0.08,           // maximum disk seed radius (normalised coords)
+  packingMaxSeeds:      2048,           // MultiSampler ceiling across all modal partitions
+  packingDensitySmooth: 4,              // box-blur radius for density map smoothing
+  packingSamplerSeed:   0xF1E2D3C4,     // deterministic RNG seed (uint32 hex literal)
+  packingDebug:         false,          // when true, persist medStressMap +
+                                        // scaleneVariance as sdf_diagnostics artifact
+
+    // ── Stage 3: Horn-Schunck optical flow ───────────────────────────────────
+    enableOpticalFlow:     false,    // gate entire H-S pass (adds ~5–15ms GPU cost)
+    opticalFlowAlpha:      1.0,      // smoothness weight α² [0.1, 10]
+    opticalFlowIterations: 30,       // ping-pong passes    [10, 100]                                        
+
+    // ── Stage 4A: topology analysis ──────────────────────────────────────────
+    enablePrimeEnds:         true,
+    enableLQE:               true,
+    // PixelGraph gradient fusion weights (must sum to 1.0)
+    topoGradWeightDir:       0.6,    // directional field weight
+    topoGradWeightKH:        0.3,    // |kH| curvature weight
+    topoGradWeightCurl:      0.1,    // normal curl weight
+    // Edge weight lambda
+    topoLambda:              5.0,    // w = 1 + λ·gradMag
+    // Cross-cut sampling budget
+    topoBudgetS0:            30,     // base budget
+    topoBudgetAlpha:         3.0,    // b1 multiplier
+    topoBudgetBeta:          0.5,    // curvature peak multiplier
+    topoBudgetSMax:          120,    // absolute cap
+    // Topology thresholds
+    topoNestThresh:          0.9,    // area ratio for nesting test
+    topoAreaThresh:          0.2,    // max enclosed fraction (valid cut)
+    topoVertexBiasGamma:     3.0,    // sampling weight boost near peaks
+    topoCurvPeakSigmaFactor: 2.0,    // peak = mean + σ * factor
+    topoMinEndAreaFrac:      0.005,  // min end area (fraction of narrow band)
+    topoChainIoUThresh:      0.7,    // equivalence clustering IoU threshold
+    // LQE parameters
+    lqeQuantizationScale:    0.2,
+    lqeNormThreshMin:        0.5,
+    lqeNormThreshMax:        6.0,
+    lqeMinSeedSize:          16,     // px
+    lqeHysteresisMargin:     0.1,    // fraction of scale
+    lqeMaxAspectRatio:       10.0,   // elongation filter
+    lqeMaxEccentricity:      0.97,   // eccentricity filter
+    lqeTrimmedMeanFrac:      0.05,   // per-end descriptor trimming
+
+    // ── Stage 6: KEM ──────────────────────────────────────────────────────
+  kemSplitThreshold:               2.0,   // KEM ratio above end-mean to split a clade
+  kemEdgeAlignmentThresh:          0.3,   // dot-product threshold for leading/trailing
+  viewManifoldKEMScale:          400.0,   // feature vector normalisation for meanKEM
+
+  // ── Stage 7: Correspondence ───────────────────────────────────────────
+  symmetryAxisFallbackVertical:    true,  // vertical axis when covariance is degenerate
+  correspondenceConfidenceSigma:   0.1,   // sigma for nearest-valid confidence decay
+  correspondenceMinConfidence:     0.1,   // pixels below this are marked unmatched
+  symmetryMismatchAlpha:           0.5,   // weight of geometricAsymmetry in combined score
+  symmetryMismatchBeta:            0.5,   // weight of (1-reconstructionConsistency)
+
+  // ── Stage 5: AmbiAnamorph ─────────────────────────────────────────────
+  // Surface parameterisation
+  ambiRBins:                       64,     // radial quantisation bins for worldFrameId hash
+  ambiThetaBins:                   128,    // angular quantisation bins for worldFrameId hash
+  ambiSeamBlend:                   true,   // blend θ at end-boundary seams in SurfaceParam
+
+  // WorldFrameId session lock
+  structureIdLockThreshold:        5,      // consecutive mismatches before accepting new structureId
+  ambiFrameRate:                   30,     // fps for LQE speed → pixel displacement conversion
+
+  // View manifold
+  viewManifoldCompatibilityThresh: 0.85,   // cosine similarity threshold for edge creation
+
+  // Integration weight exponents (must sum to 1.0)
+  ambiCoherenceExponent:           0.4,    // α — temporal stability weight
+  ambiFMapExponent:                0.3,    // β — illumination directness weight
+  ambiGeomConfExponent:            0.2,    // γ — geometric convergence weight
+  ambiTopoStabExponent:            0.1,    // δ — topological stability weight
+
+  // Legibility score
+  ambiLegibilityWeightThresh:      0.1,    // minimum weight for coverage fraction count
+
+  // Debug
+  ambiDebug:                       false,  // emit ambi_anamorph_telemetry artifact
+
   // Pipeline phase control (NEW)
   // enablePreprocessAnnotate: allow preprocessors to annotate manifests / metadata
   // enablePreprocessQuantize: allow preprocessors to emit quantized/solver-ready artifacts (SOC/A,b)
@@ -568,6 +692,358 @@ function _coerceOrWarn(key, value) {
       if (value === 'true' || value === true) return true;
       if (value === 'false' || value === false) return false;
       return DEFAULTS[key];
+    }
+
+    // ── Stage 1: f_map ────────────────────────────────────────────────────────
+
+    // Boolean toggles
+    if (['enableFMapRouteA', 'fMapDebug'].includes(key)) {
+      if (value === 'true'  || value === true)  return true;
+      if (value === 'false' || value === false) return false;
+      return DEFAULTS[key];
+    }
+
+    // Threshold pair: both clamped to [0, 1].
+    // Keeping direct > umbra is the caller's responsibility.
+    if (key === 'fMapDirectThresh' || key === 'fMapUmbraThresh') {
+      const n = Number(value);
+      if (Number.isFinite(n)) return clamp(n, 0.0, 1.0);
+      return DEFAULTS[key];
+    }
+
+    // Positive integer: Monte Carlo sample count, clamped [8, 512]
+    if (key === 'fMapNSamples') {
+      const n = Number(value);
+      if (Number.isFinite(n) && n > 0) return Math.max(8, Math.min(512, Math.floor(n)));
+      return DEFAULTS.fMapNSamples;
+    }
+
+    // Small positive float: depth-march occlusion bias, clamped [0, 0.5]
+    if (key === 'fMapOcclusionBias') {
+      const n = Number(value);
+      if (Number.isFinite(n)) return clamp(n, 0.0, 0.5);
+      return DEFAULTS.fMapOcclusionBias;
+    }
+
+    // Positive integer: depth-march step count, clamped [2, 64]
+    if (key === 'fMapMarchSteps') {
+      const n = Number(value);
+      if (Number.isFinite(n) && n > 0) return Math.max(2, Math.min(64, Math.floor(n)));
+      return DEFAULTS.fMapMarchSteps;
+    }
+
+    // ── Stage 1: DOA ──────────────────────────────────────────────────────────
+
+    // Positive float: kappa separation threshold; typical range 1–10, no upper bound
+    if (key === 'doaKappaThreshold') {
+      const n = Number(value);
+      if (Number.isFinite(n) && n > 0) return n;
+      return DEFAULTS.doaKappaThreshold;
+    }
+
+    // ── Stage 1: PenumbraAnalyzer ─────────────────────────────────────────────
+
+    // Boolean debug toggle
+    if (key === 'penumbraDebug') {
+      if (value === 'true'  || value === true)  return true;
+      if (value === 'false' || value === false) return false;
+      return DEFAULTS.penumbraDebug;
+    }
+
+    // Odd positive integer >= 5: profile crossing-strip width (forced odd)
+    if (key === 'penumbraProfileWindow') {
+      const n = Math.floor(Number(value));
+      if (Number.isFinite(n) && n >= 5) return (n % 2 === 0) ? n + 1 : n;
+      return DEFAULTS.penumbraProfileWindow;
+    }
+
+    // [0, 1] floats
+    if (['penumbraBrightnessThresh', 'penumbraMinEdgeGrad',
+         'penumbraMinFitR2', 'penumbraStabilityWeight'].includes(key)) {
+      const n = Number(value);
+      if (Number.isFinite(n)) return clamp(n, 0.0, 1.0);
+      return DEFAULTS[key];
+    }
+
+    // Positive integer: minimum edge component length (>= 2)
+    if (key === 'penumbraMinEdgeLength') {
+      const n = Math.floor(Number(value));
+      if (Number.isFinite(n) && n >= 2) return n;
+      return DEFAULTS.penumbraMinEdgeLength;
+    }
+
+    // Positive integer: max tracked light blobs, clamped [1, 32]
+    if (key === 'penumbraMaxLights') {
+      const n = Math.floor(Number(value));
+      if (Number.isFinite(n) && n > 0) return Math.max(1, Math.min(32, n));
+      return DEFAULTS.penumbraMaxLights;
+    }
+
+    // ── Stage 2: PackingSDF ───────────────────────────────────────────────────
+
+    // Boolean toggle: skip Stage 2 entirely
+    if (key === 'enablePackingSDF') {
+      if (value === 'true'  || value === true)  return true;
+      if (value === 'false' || value === false) return false;
+      return DEFAULTS.enablePackingSDF;
+    }
+
+    // Enum: umbra handling policy — only three legal values
+    if (key === 'packingUmbraPolicy') {
+      if (typeof value === 'string') {
+        const v = value.toLowerCase();
+        if (v === 'half-weight' || v === 'include' || v === 'exclude') return v;
+      }
+      console.warn(`[featureFlags] invalid packingUmbraPolicy "${value}", falling back to "${DEFAULTS.packingUmbraPolicy}"`);
+      return DEFAULTS.packingUmbraPolicy;
+    }
+
+    // Small positive float: narrow band base width, fraction of sdfRange, [0.001, 0.5]
+    if (key === 'packingBandBase') {
+      const n = Number(value);
+      if (Number.isFinite(n)) return clamp(n, 0.001, 0.5);
+      return DEFAULTS.packingBandBase;
+    }
+
+    // Positive float: penumbra width multiplier, [0.1, 20]
+    if (key === 'packingBandScale') {
+      const n = Number(value);
+      if (Number.isFinite(n)) return clamp(n, 0.1, 20);
+      return DEFAULTS.packingBandScale;
+    }
+
+    // Positive float: fall-off exponent, [0.5, 6]
+    if (key === 'packingFalloffExp') {
+      const n = Number(value);
+      if (Number.isFinite(n)) return clamp(n, 0.5, 6);
+      return DEFAULTS.packingFalloffExp;
+    }
+
+    // Small positive float: minimum seed radius (normalised), [0.001, 0.5]
+    if (key === 'packingSeedRMin') {
+      const n = Number(value);
+      if (Number.isFinite(n)) return clamp(n, 0.001, 0.5);
+      return DEFAULTS.packingSeedRMin;
+    }
+
+    // Small positive float: maximum seed radius (normalised), [0.01, 1.0]
+    // Also enforce rMax >= rMin silently (rMin is read at compute time, not here,
+    // so we just keep within the absolute range and let PackingSDF warn if inverted).
+    if (key === 'packingSeedRMax') {
+      const n = Number(value);
+      if (Number.isFinite(n)) return clamp(n, 0.01, 1.0);
+      return DEFAULTS.packingSeedRMax;
+    }
+
+    // Positive integer: MultiSampler ceiling, [64, 8192]
+    if (key === 'packingMaxSeeds') {
+      const n = Math.floor(Number(value));
+      if (Number.isFinite(n) && n > 0) return Math.max(64, Math.min(8192, n));
+      return DEFAULTS.packingMaxSeeds;
+    }
+
+    // Positive integer: box-blur radius, [1, 32]
+    if (key === 'packingDensitySmooth') {
+      const n = Math.floor(Number(value));
+      if (Number.isFinite(n) && n > 0) return Math.max(1, Math.min(32, n));
+      return DEFAULTS.packingDensitySmooth;
+    }
+
+    // Unsigned 32-bit integer: deterministic RNG seed
+    // Accepts numeric literal or hex string e.g. '0xF1E2D3C4'
+    if (key === 'packingSamplerSeed') {
+      const n = typeof value === 'string' ? parseInt(value, 16) || Number(value) : Number(value);
+      if (Number.isFinite(n) && n >= 0) return (n >>> 0); // coerce to uint32
+      return DEFAULTS.packingSamplerSeed;
+    }
+
+    // Boolean toggle: persist diagnostic artifacts
+    if (key === 'packingDebug') {
+      if (value === 'true'  || value === true)  return true;
+      if (value === 'false' || value === false) return false;
+      return DEFAULTS.packingDebug;
+    }
+
+    // ── Stage 3: Horn-Schunck optical flow ───────────────────────────────────
+
+    // Boolean toggle: gate entire H-S pass
+    if (key === 'enableOpticalFlow') {
+      if (value === 'true'  || value === true)  return true;
+      if (value === 'false' || value === false) return false;
+      return DEFAULTS.enableOpticalFlow;
+    }
+
+    // Positive float: smoothness weight α², clamped [0.1, 10]
+    if (key === 'opticalFlowAlpha') {
+      const n = parseFloat(value);
+      if (!Number.isFinite(n)) {
+        console.warn(`[featureFlags] opticalFlowAlpha invalid (${value}), using default 1.0`);
+        return DEFAULTS.opticalFlowAlpha;
+      }
+      return clamp(n, 0.1, 10);
+    }
+
+    // Positive integer: ping-pong pass count, clamped [10, 100]
+    if (key === 'opticalFlowIterations') {
+      const n = Math.floor(Number(value));
+      if (!Number.isFinite(n)) {
+        console.warn(`[featureFlags] opticalFlowIterations invalid (${value}), using default 30`);
+        return DEFAULTS.opticalFlowIterations;
+      }
+      return Math.max(10, Math.min(100, n));
+    }
+
+    // ── Stage 4A ──────────────────────────────────────────────────────────────
+    if (key === 'enablePrimeEnds' || key === 'enableLQE') {
+      return typeof value === 'string' ? value === 'true' : !!value;
+    }
+
+    if ([
+      'topoLambda',
+      'topoGradWeightDir',
+      'topoGradWeightKH',
+      'topoGradWeightCurl',
+      'topoNestThresh',
+      'topoAreaThresh',
+      'topoVertexBiasGamma',
+      'topoCurvPeakSigmaFactor',
+      'topoMinEndAreaFrac',
+      'topoChainIoUThresh',
+      'lqeQuantizationScale',
+      'lqeNormThreshMin',
+      'lqeNormThreshMax',
+      'lqeHysteresisMargin',
+      'lqeMaxAspectRatio',
+      'lqeMaxEccentricity',
+      'lqeTrimmedMeanFrac'
+    ].includes(key)) {
+      const n = parseFloat(value);
+      if (!Number.isFinite(n)) {
+        console.warn(`[featureFlags] ${key} invalid (${value}), using default`);
+        return DEFAULTS[key];
+      }
+      return n;
+    }
+
+    if (key === 'topoBudgetS0' || key === 'topoBudgetSMax' || key === 'lqeMinSeedSize') {
+      const n = Math.floor(Number(value));
+      if (!Number.isFinite(n) || n < 1) {
+        console.warn(`[featureFlags] ${key} invalid (${value}), using default`);
+        return DEFAULTS[key];
+      }
+      return n;
+    }
+
+    if (key === 'topoBudgetAlpha' || key === 'topoBudgetBeta') {
+      const n = parseFloat(value);
+      return Number.isFinite(n) ? Math.max(0, n) : DEFAULTS[key];
+    }
+
+    // ── Stage 6: KEM ──────────────────────────────────────────────────────
+
+    if (key === 'kemSplitThreshold') {
+      const n = Number(value);
+      if (Number.isFinite(n) && n > 0) return clamp(n, 1.0, 10.0);
+      return DEFAULTS.kemSplitThreshold;
+    }
+
+    if (key === 'kemEdgeAlignmentThresh') {
+      const n = Number(value);
+      if (Number.isFinite(n)) return clamp(n, 0.0, 1.0);
+      return DEFAULTS.kemEdgeAlignmentThresh;
+    }
+
+    if (key === 'viewManifoldKEMScale') {
+      const n = Number(value);
+      if (Number.isFinite(n) && n > 0) return clamp(n, 1, 10000);
+      return DEFAULTS.viewManifoldKEMScale;
+    }
+
+    // ── Stage 7: Correspondence ───────────────────────────────────────────
+
+    if (key === 'symmetryAxisFallbackVertical') {
+      if (value === 'true'  || value === true)  return true;
+      if (value === 'false' || value === false) return false;
+      return DEFAULTS.symmetryAxisFallbackVertical;
+    }
+
+    if (key === 'correspondenceConfidenceSigma') {
+      const n = Number(value);
+      if (Number.isFinite(n) && n > 0) return clamp(n, 0.01, 1.0);
+      return DEFAULTS.correspondenceConfidenceSigma;
+    }
+
+    if (key === 'correspondenceMinConfidence') {
+      const n = Number(value);
+      if (Number.isFinite(n)) return clamp(n, 0.0, 1.0);
+      return DEFAULTS.correspondenceMinConfidence;
+    }
+
+    if (key === 'symmetryMismatchAlpha' || key === 'symmetryMismatchBeta') {
+      const n = Number(value);
+      if (Number.isFinite(n)) return clamp(n, 0.0, 1.0);
+      return DEFAULTS[key];
+    }
+
+    // ── Stage 5: AmbiAnamorph ─────────────────────────────────────────────
+
+    // Positive integer bins
+    if (key === 'ambiRBins') {
+      const n = Math.floor(Number(value));
+      if (Number.isFinite(n) && n >= 4) return Math.min(512, n);
+      return DEFAULTS.ambiRBins;
+    }
+    if (key === 'ambiThetaBins') {
+      const n = Math.floor(Number(value));
+      if (Number.isFinite(n) && n >= 8) return Math.min(1024, n);
+      return DEFAULTS.ambiThetaBins;
+    }
+
+    // Boolean toggles
+    if (key === 'ambiSeamBlend' || key === 'ambiDebug') {
+      if (value === 'true'  || value === true)  return true;
+      if (value === 'false' || value === false) return false;
+      return DEFAULTS[key];
+    }
+
+    // Positive integer: session lock threshold [1, 30]
+    if (key === 'structureIdLockThreshold') {
+      const n = Math.floor(Number(value));
+      if (Number.isFinite(n) && n >= 1) return Math.min(30, n);
+      return DEFAULTS.structureIdLockThreshold;
+    }
+
+    // Positive number: frame rate [1, 240]
+    if (key === 'ambiFrameRate') {
+      const n = Number(value);
+      if (Number.isFinite(n) && n > 0) return clamp(n, 1, 240);
+      return DEFAULTS.ambiFrameRate;
+    }
+
+    // [0,1] threshold: view manifold compatibility
+    if (key === 'viewManifoldCompatibilityThresh') {
+      const n = Number(value);
+      if (Number.isFinite(n)) return clamp(n, 0.0, 1.0);
+      return DEFAULTS.viewManifoldCompatibilityThresh;
+    }
+
+    // [0,1] exponents: integration weight formula
+    if ([
+      'ambiCoherenceExponent',
+      'ambiFMapExponent',
+      'ambiGeomConfExponent',
+      'ambiTopoStabExponent'
+    ].includes(key)) {
+      const n = Number(value);
+      if (Number.isFinite(n)) return clamp(n, 0.0, 1.0);
+      return DEFAULTS[key];
+    }
+
+    // [0,1] threshold: legibility weight floor
+    if (key === 'ambiLegibilityWeightThresh') {
+      const n = Number(value);
+      if (Number.isFinite(n)) return clamp(n, 0.0, 1.0);
+      return DEFAULTS.ambiLegibilityWeightThresh;
     }
 
     // boolean-ish values that might arrive as strings
