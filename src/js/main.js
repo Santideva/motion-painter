@@ -542,6 +542,17 @@ class MotionPainter {
           // once it has completed its first reconstruction pass and instantiated DirectionalLifting.
           // We re-freeze the container with these values so all subsequent artifact snapshots
           // carry the fully calibrated sampling context.
+          if (msg && msg.event === 'RECON_DONE') {
+            console.log('[RECON_DONE] main.js: guard evaluation:', {
+              hasMsg:           !!msg,
+              hasCameraContainer: !!this.cameraContainer,
+              msgCameraId:      msg.cameraId       ?? '(absent)',
+              ccCameraId:       this.cameraContainer?.cameraId ?? '(absent)',
+              cameraIdMatch:    msg.cameraId === this.cameraContainer?.cameraId,
+              willEnterHandler: !!(msg && this.cameraContainer && msg.cameraId === this.cameraContainer?.cameraId)
+            });
+          }
+
           if (msg && msg.event === 'RECON_DONE' &&
               this.cameraContainer &&
               msg.cameraId === this.cameraContainer.cameraId) {
@@ -570,6 +581,98 @@ class MotionPainter {
                 });
               } catch (e) {
                 console.warn('[Stage0] main.js: _updateCameraContainer failed on RECON_DONE', e);
+              }
+            }
+
+
+            // ── Stage 1 inline data — store on cameraContainer for forwarding ──
+            // directness_field, modal_decomposition, penumbra_field are no longer
+            // persisted to IDB. They travel inline in RECON_DONE and are forwarded
+            // directly to consumer workers via postMessage.
+            if (msg.stage1Inline) {
+              try {
+                this._updateCameraContainer({
+                  passThrough: { stage1Inline: msg.stage1Inline }
+                });
+              } catch (e) {
+                console.warn('[Stage1] main.js: stage1Inline writeback failed', e);
+              }
+            }
+
+            // ── fluxInline: store on cameraContainer for minimizer forwarding ──
+            // A_coo and solver data travel inline — fluxFieldKey is null.
+            // minimizer.worker reads from msg.fluxInline instead of getArtifact.
+            if (msg.fluxInline) {
+              try {
+                this._updateCameraContainer({
+                  passThrough: { fluxInline: msg.fluxInline }
+                });
+                console.log('[Stage3] main.js: fluxInline stored on cameraContainer (full flux_field):', {
+                  hasACoo:      !!msg.fluxInline.A_coo,
+                  hasAcsr:      !!msg.fluxInline.A_csr,
+                  hasB:         !!msg.fluxInline.b,
+                  hasSOCs:      !!msg.fluxInline.SOCs,
+                  hasInitH:     !!msg.fluxInline.init_h,
+                  acoRowLength: msg.fluxInline.A_coo?.row?.length ?? 0,
+                  solverReady:  msg.fluxInline.solverReady         ?? false
+                });
+              } catch (e) {
+                console.warn('[Stage3] main.js: fluxInline writeback failed', e);
+              }
+            } else {
+              console.warn('[Stage3] main.js: fluxInline absent in RECON_DONE — minimizer will have no SOC data');
+            }
+
+            // ── sdfInline: store on cameraContainer for worker forwarding ──────
+            // signedSdf, narrowBandMask, densityMap, surfaceMask are not in IDB.
+            // They travel in msg.sdfInline and must be stored here so the
+            // topology and minimizer dispatch blocks below can include them.
+            // cc.sdfInline is also available to any future consumer stage.
+            if (msg.sdfInline) {
+              try {
+                this._updateCameraContainer({
+                  passThrough: { sdfInline: msg.sdfInline }
+                });
+                console.log('[Stage2] main.js: sdfInline stored on cameraContainer:', {
+                  signedSdfLength:      msg.sdfInline.signedSdf?.length      ?? 0,
+                  narrowBandMaskLength: msg.sdfInline.narrowBandMask?.length ?? 0,
+                  densityMapLength:     msg.sdfInline.densityMap?.length     ?? 0,
+                  surfaceMaskLength:    msg.sdfInline.surfaceMask?.length    ?? 0
+                });
+              } catch (e) {
+                console.warn('[Stage2] main.js: sdfInline writeback failed', e);
+              }
+} else {
+              console.warn('[Stage2] main.js: sdfInline absent in RECON_DONE — topology and minimizer will lack SDF arrays');
+            }
+
+            // ── normalInline: store on cameraContainer for topology forwarding ─
+            if (msg.normalInline) {
+              try {
+                this._updateCameraContainer({
+                  passThrough: { normalInline: msg.normalInline }
+                });
+                console.log('[Stage2] main.js: normalInline stored on cameraContainer:', {
+                  fieldLength: msg.normalInline.field?.length ?? 0,
+                  resolution:  msg.normalInline.resolution
+                });
+              } catch (e) {
+                console.warn('[Stage2] main.js: normalInline writeback failed', e);
+              }
+            }
+            // ── diskSeedsForMinimizer: store for minimizer.worker dispatch ─────
+            // Tiny payload (<1KB). Eliminates minimizer.worker's IDB open for
+            // disk_seeds artifact.
+            if (msg.diskSeedsForMinimizer) {
+              try {
+                this._updateCameraContainer({
+                  passThrough: { diskSeedsForMinimizer: msg.diskSeedsForMinimizer }
+                });
+                console.log('[Stage2] main.js: diskSeedsForMinimizer stored on cameraContainer:', {
+                  seedCount: msg.diskSeedsForMinimizer.length
+                });
+              } catch (e) {
+                console.warn('[Stage2] main.js: diskSeedsForMinimizer writeback failed', e);
               }
             }
 
@@ -644,6 +747,29 @@ class MotionPainter {
               }
             }
 
+            // ── dgInline: DG computed arrays — direct assignment ───────────
+            // _updateCameraContainer handles known keys only.
+            // dgInline is stored directly on cc so topology, minimizer and
+            // ambi workers can receive it without an IDB lookup.
+            if (msg.dgInline) {
+              try {
+                this._updateCameraContainer({
+                  passThrough: { dgInline: msg.dgInline }
+                });
+                console.log('[Stage4] main.js: dgInline stored on cameraContainer:', {
+                  hasKH:          !!msg.dgInline.kH,
+                  hasPrincipalE1: !!msg.dgInline.principalE1,
+                  hasNormalCurl:  !!msg.dgInline.normalCurl,
+                  hasFlowCurl:    !!msg.dgInline.flowCurl,
+                  hasFlowDiv:     !!msg.dgInline.flowDiv
+                });
+              } catch (e) {
+                console.warn('[Stage4] main.js: dgInline writeback failed', e);
+              }
+            } else {
+              console.warn('[Stage4] main.js: dgInline absent — consumers will have null kH');
+            }
+            
             // ── Stage 4: DifferentialGeometry keys ─────────────────────────
             // Written into cameraContainer.differentialGeometry so Stage 5+
             // can resolve any DG artifact key without a storage query.
@@ -685,30 +811,60 @@ class MotionPainter {
                   jobId:   `topo:${msg.metaKey}:${Date.now()}`,
                   metaKey: msg.metaKey,
                   flags:   this._currentFlags ?? {},
+                  stage1Inline: cc.stage1Inline ?? null,
+                  sdfInline:    cc.sdfInline     ?? null,
+                  normalInline: null,    // topology never uses normalInline.field
+                  // principalE2 excluded — topology.worker does not use it.
+                  // Saves 8MB from this structured clone.
+                  dgInline: cc.dgInline ? {
+                    kH:         cc.dgInline.kH          ?? null,
+                    principalE1: cc.dgInline.principalE1 ?? null,
+                    normalCurl: cc.dgInline.normalCurl  ?? null,
+                    flowCurl:   cc.dgInline.flowCurl    ?? null,
+                    flowDiv:    cc.dgInline.flowDiv     ?? null
+                  } : null,
                   artifactKeys: {
                     directionalFieldKey: cc.directionalFieldKey                        ?? null,
-                    sdfFieldKey:         cc.stage2?.sdfFieldKey                        ?? null,
+                    sdfFieldKey:         null,
                     diskSeedsKey:        cc.stage2?.diskSeedsKey                       ?? null,
-                    curvatureKey:        cc.differentialGeometry?.curvatureKey         ?? null,
-                    principalFrameKey:   cc.differentialGeometry?.principalFrameKey    ?? null,
+                    curvatureKey:        null,  // kH in dgInline
+                    principalFrameKey:   null,  // unused by topology
                     sdfDivKey:           cc.differentialGeometry?.sdfDivKey            ?? null,
                     flowFieldKey:        cc.stage3?.flowFieldKey                       ?? null,
-                    flowCurlKey:         cc.differentialGeometry?.flowCurlKey          ?? null,
-                    flowDivKey:          cc.differentialGeometry?.flowDivKey           ?? null,
-                    directnessFieldKey:  cc.stage1?.directnessKey                      ?? null,
-                    normalCurlKey:       cc.differentialGeometry?.normalCurlKey        ?? null,
-                    penumbraFieldKey:    cc.stage1?.penumbraKey                        ?? null,
-                    normalMapKey:        cc.normalMapKey                               ?? null,
+                    flowCurlKey:         null,  // in dgInline
+                    flowDivKey:          null,  // in dgInline
+                    directnessFieldKey:  null,
+                    normalCurlKey:       null,  // in dgInline
+                    penumbraFieldKey:    null,
+                    normalMapKey:        null,
                     resolution:          cc.reconstructionResolution                   ?? 512
                   }
                 });
-                console.log('[Stage4A] main.js: topology.worker dispatched', { metaKey: msg.metaKey });
+                console.log('[Stage4A] main.js: topology.worker dispatched', {
+                  metaKey:              msg.metaKey,
+                  hasSdfInline:         !!cc.sdfInline,
+                  hasStage1Inline:      !!cc.stage1Inline,
+                  diskSeedsKey:         cc.stage2?.diskSeedsKey ?? null
+                });
               } catch (topoErr) {
                 console.warn('[Stage4A] main.js: topology.worker dispatch failed', topoErr);
               }
-            }
 
-            // ── Stage 4B: fire minimizer.worker ─────────────────────────────
+              // ── Worker crash diagnostic ────────────────────────────────────
+              // If a worker throws an unhandled error it fires onerror.
+              // These handlers let us distinguish a worker crash from OOM.
+              if (this._topologyWorker) {
+                this._topologyWorker.onerror = (e) => {
+                  console.error('[topology.worker] WORKER CRASH:', {
+                    message:  e.message,
+                    filename: e.filename,
+                    lineno:   e.lineno,
+                    colno:    e.colno
+                  });
+                };
+              }
+            }
+            // ── Stage 4B: fire minimizer.worker ─────────────────────────────────────
             // Runs in parallel with topology.worker (Phase A).
             // Phase B executes after minimizer.worker receives TOPOLOGY_DONE on BC.
             if (this._minimizerWorker && msg.metaKey) {
@@ -719,22 +875,61 @@ class MotionPainter {
                   jobId:   `mini:${msg.metaKey}:${Date.now()}`,
                   metaKey: msg.metaKey,
                   flags:   this._currentFlags ?? {},
+                  sdfInline:  cc.sdfInline  ?? null,
+                  fluxInline: cc.fluxInline ?? null,
+                  // minimizer only uses kH — strip principalE1/E2, normalCurl,
+                  // flowCurl, flowDiv. Saves 24MB from this structured clone.
+                  dgInline: cc.dgInline?.kH ? { kH: cc.dgInline.kH } : null,
+                  diskSeedsInline: cc.diskSeedsForMinimizer     ?? null,
                   artifactKeys: {
-                    sdfFieldKey:      cc.stage2?.sdfFieldKey                    ?? null,
-                    diskSeedsKey:     cc.stage2?.diskSeedsKey                   ?? null,
-                    fluxFieldKey:     cc.fluxFieldKey                           ?? null,
-                    curvatureKey:     cc.differentialGeometry?.curvatureKey     ?? null,
-                    normalMapKey:     cc.normalMapKey                           ?? null,
-                    resolution:       cc.reconstructionResolution               ?? 512
+                    sdfFieldKey:   null,
+                    diskSeedsKey:  cc.stage2?.diskSeedsKey               ?? null,
+                    fluxFieldKey:  null,
+                    curvatureKey:  null,   // kH in dgInline
+                    normalMapKey:  null,   // unused by minimizer
+                    resolution:    cc.reconstructionResolution           ?? 512
                   }
                 });
-                console.log('[Stage4B] main.js: minimizer.worker dispatched', { metaKey: msg.metaKey });
-              } catch (miniErr) {
+                console.log('[Stage4B] main.js: minimizer.worker dispatched', {
+                  metaKey:        msg.metaKey,
+                  hasSdfInline:   !!cc.sdfInline,
+                  hasFluxInline:  !!cc.fluxInline,
+                  acoRowLength:   cc.fluxInline?.A_coo?.row?.length ?? 0,
+                  diskSeedsKey:   cc.stage2?.diskSeedsKey ?? null
+                });  } catch (miniErr) {
                 console.warn('[Stage4B] main.js: minimizer.worker dispatch failed', miniErr);
               }
+
+              if (this._minimizerWorker) {
+                this._minimizerWorker.onerror = (e) => {
+                  console.error('[minimizer.worker] WORKER CRASH:', {
+                    message:  e.message,
+                    filename: e.filename,
+                    lineno:   e.lineno,
+                    colno:    e.colno
+                  });
+                };
+              }
+            }
+
+            // ── Release large inline arrays now that Stage 4 workers have been dispatched.
+            // postMessage structured-clones the payloads; originals on cameraContainer
+            // are no longer needed and would otherwise survive indefinitely under the
+            // frozen object chain, holding ~2–4 MB of dead Float32Arrays.
+            // dgInline is intentionally kept — ambi.worker reads it in _checkStage4Complete.
+            // fluxInline is intentionally kept — ambi.worker may use overhang data.
+            try {
+              this._updateCameraContainer({
+                passThrough: {
+                  sdfInline:    null,
+                  normalInline: null
+                }
+              });
+            } catch (e) {
+              console.warn('[Stage4] main.js: failed to release sdfInline/normalInline from cameraContainer', e);
             }
           }
-                    // ── artifact:ready → MotionDetector dispatch wiring ───────────────────
+          // ── artifact:ready → MotionDetector dispatch wiring ───────────────────
           // REQUIRED: forwards preprocessor manifest completion to MotionDetector
           // so intents get their metaKey and reconstruction is dispatched.
           if (msg && msg.event === 'artifact:ready' && msg.metaKey && msg.jobId) {
@@ -2336,30 +2531,35 @@ _ensureMotionWorker() {
             flags:   this._currentFlags ?? {},
             stage4a: cc.stage4a,
             stage4b: cc.stage4b,
-            artifactKeys: {
-              // Stage 4B
-              phiMinKey:               cc.stage4b.phiMinKey               ?? null,
-              zeroCurveKey:            cc.stage4b.zeroCurveKey            ?? null,
-              constrainedMinimizerKey: cc.stage4b.constrainedMinimizerKey ?? null,
-              // Stage 4A
-              primeEndsKey:            cc.stage4a.primeEndsKey            ?? null,
-              topologyMapKey:          cc.stage4a.topologyMapKey          ?? null,
-              componentMapKey:         cc.stage4a.componentMapKey         ?? null,
-              lipschitzEndsKey:        cc.stage4a.lipschitzEndsKey        ?? null,
-              motionMapsKey:           cc.stage4a.motionMapsKey           ?? null,
-              // Stage 3 / DifferentialGeometry
-              principalFrameKey:       cc.differentialGeometry?.principalFrameKey ?? null,
-              curvatureKey:            cc.differentialGeometry?.curvatureKey      ?? null,
-              directionalFieldKey:     cc.directionalFieldKey                     ?? null,
-              // Stage 1
-              directnessKey:           cc.stage1?.directnessKey                   ?? null,
-              penumbraKey:             cc.stage1?.penumbraKey                     ?? null,
-              // Meta
-              resolution:              cc.differentialGeometry?.reconstructionResolution
-                                       ?? cc.reconstructionResolution
-                                       ?? 512,
-              cameraId:                cc.cameraId ?? 'default'
-            }
+            // Stage 1 inline — directness/modal/penumbra transferred directly,
+            // not loaded from IDB. ambi.worker reads from msg.stage1Inline.
+            stage1Inline: cc.stage1Inline ?? null,
+            // dgInline: kH and principalE1/E2 forwarded directly
+                  dgInline: cc.dgInline ?? null,
+                  artifactKeys: {
+                    // Stage 4B
+                    phiMinKey:               cc.stage4b.phiMinKey               ?? null,
+                    zeroCurveKey:            cc.stage4b.zeroCurveKey            ?? null,
+                    constrainedMinimizerKey: cc.stage4b.constrainedMinimizerKey ?? null,
+                    // Stage 4A
+                    primeEndsKey:            cc.stage4a.primeEndsKey            ?? null,
+                    topologyMapKey:          cc.stage4a.topologyMapKey          ?? null,
+                    componentMapKey:         cc.stage4a.componentMapKey         ?? null,
+                    lipschitzEndsKey:        cc.stage4a.lipschitzEndsKey        ?? null,
+                    motionMapsKey:           cc.stage4a.motionMapsKey           ?? null,
+                    // Stage 3 / DifferentialGeometry
+                    principalFrameKey:       null,  // e1/e2 in dgInline
+                    curvatureKey:            null,  // kH in dgInline
+                    directionalFieldKey:     cc.directionalFieldKey             ?? null,
+                    // Stage 1 keys — null, data is in stage1Inline above
+                    directnessKey:           null,
+                    penumbraKey:             null,
+                    // Meta
+                    resolution:              cc.differentialGeometry?.reconstructionResolution
+                                             ?? cc.reconstructionResolution
+                                             ?? 512,
+                    cameraId:                cc.cameraId ?? 'default'
+                  }
           });
           console.log('[Stage5] main.js: ambi.worker dispatched (AMBI_ANALYZE)', { metaKey });
         } catch (ambiErr) {

@@ -2885,6 +2885,21 @@ const markReconRunning = async (metaKey, reqId, maxRuntimeMs = 600000) => {
           }
         }
         
+        // Remove any stale prior records for this metaKey so the reaper
+        // doesn't find old 'running' entries and cause heartbeat-restore churn.
+        // IDBIndex.openCursor iterates all records for this metaKey.
+        const cleanupCursor = index.openCursor(IDBKeyRange.only(metaKey));
+        cleanupCursor.onsuccess = (e) => {
+          const cursor = e.target.result;
+          if (cursor) {
+            const old = cursor.value;
+            // Delete any prior record that isn't this new reqId and isn't 'done'
+            if (old.reqId !== reqId && old.state !== 'done') {
+              cursor.delete();
+            }
+            cursor.continue();
+          }
+        };
         // Create or update record (use reqId as primary key)
         const rec = {
           reqId,                                    // PRIMARY KEY
@@ -2893,6 +2908,11 @@ const markReconRunning = async (metaKey, reqId, maxRuntimeMs = 600000) => {
           attempts: (existing?.attempts || 0) + 1,
           startedAt: now,
           lastHeartbeat: now,                       // INITIALIZE heartbeat
+          deadline: now + maxRuntimeMs,             // REAPER GUARD — without this,
+                                                    // deadline is undefined and the
+                                                    // reaper kills the job immediately
+                                                    // every 60s, causing constant
+                                                    // heartbeat-restore IDB churn
           finishedAt: null,
           lastError: null,
           nextRetryAt: null,

@@ -86,39 +86,115 @@ self.onmessage = async (evt) => {
       const sw  = _wrapStorage(api);
 
       // ── Load all artifacts in parallel ──────────────────────────────────
-      const [
-        directionalFieldArt,
-        sdfFieldArt,
-        diskSeedsArt,
-        curvatureArt,
-        principalFrameArt,
-        flowFieldArt,
-        flowCurlArt,
-        flowDivArt,
-        directnessArt,
-        normalCurlArt,
-        penumbraArt,
-        normalMapArt
-      ] = await Promise.all([
-        _loadArtifact(api, artifactKeys.directionalFieldKey),
-        _loadArtifact(api, artifactKeys.sdfFieldKey),
-        _loadArtifact(api, artifactKeys.diskSeedsKey),
-        _loadArtifact(api, artifactKeys.curvatureKey),
-        _loadArtifact(api, artifactKeys.principalFrameKey),
-        _loadArtifact(api, artifactKeys.flowFieldKey),
-        _loadArtifact(api, artifactKeys.flowCurlKey),
-        _loadArtifact(api, artifactKeys.flowDivKey),
-        _loadArtifact(api, artifactKeys.directnessFieldKey),
-        _loadArtifact(api, artifactKeys.normalCurlKey),
-        _loadArtifact(api, artifactKeys.penumbraFieldKey),
-        _loadArtifact(api, artifactKeys.normalMapKey)
-      ]);
+      // directnessArt and penumbraArt come from stage1Inline (not IDB).
+      // Their IDB keys are null — loading them would return null anyway.
+      const stage1Inline = msg.stage1Inline ?? null;
+      const sdfInline    = msg.sdfInline    ?? null;
+      const normalInline = msg.normalInline ?? null;
+      // normalInline is always null at dispatch — main.js passes it as null by design.
+    // topology.worker uses dgInline.normalCurl only; the raw normal field is not needed.
+    if (normalInline) {
+      console.warn('[topology.worker] normalInline unexpectedly non-null — ignored (topology uses dgInline.normalCurl only)');
+    }
+      const dgInline = msg.dgInline ?? null;
+      if (dgInline) {
+        console.log('[topology.worker] dgInline received:', {
+          hasKH:         !!dgInline.kH,
+          hasNormalCurl: !!dgInline.normalCurl,
+          hasFlowCurl:   !!dgInline.flowCurl,
+          hasFlowDiv:    !!dgInline.flowDiv
+        });
+      } else {
+        console.warn('[topology.worker] dgInline absent — kH/curl fields will be null');
+      }
+
+    console.log('[topology.worker] Loading artifacts:', {
+      hasSdfInline:        !!sdfInline,
+      hasStage1Inline:     !!stage1Inline,
+      directionalFieldKey: artifactKeys.directionalFieldKey ?? null,
+      diskSeedsKey:        artifactKeys.diskSeedsKey        ?? null,
+      curvatureKey:        artifactKeys.curvatureKey        ?? null
+    });
+
+    // sdfFieldArt is constructed from sdfInline — not loaded from IDB.
+    // sdfFieldKey is null (the IDB record contains only scalar metadata).
+    // Shape matches what getArtifact would have returned so downstream
+    // code that reads sdfFieldArt.data.signedSdf etc. is unchanged.
+    const sdfFieldArt = sdfInline
+      ? {
+          data: {
+            signedSdf:      sdfInline.signedSdf,
+            narrowBandMask: sdfInline.narrowBandMask,
+            densityMap:     sdfInline.densityMap  ?? null,
+            surfaceMask:    sdfInline.surfaceMask ?? null
+          }
+        }
+      : null;  // will cause 'sdfField' to appear in missing[] below
+
+    if (sdfInline) {
+      console.log('[topology.worker] sdfInline received:', {
+        signedSdfLength:      sdfInline.signedSdf?.length      ?? 0,
+        narrowBandMaskLength: sdfInline.narrowBandMask?.length ?? 0,
+        densityMapLength:     sdfInline.densityMap?.length     ?? 0,
+        surfaceMaskLength:    sdfInline.surfaceMask?.length    ?? 0
+      });
+    } else {
+      console.warn('[topology.worker] sdfInline absent — sdfFieldArt will be null');
+    }
+
+    const [
+      directionalFieldArt,
+      diskSeedsArt,
+      curvatureArt,
+      principalFrameArt,
+      flowFieldArt,
+      flowCurlArt,
+      flowDivArt,
+      normalCurlArt
+    ] = await Promise.all([
+      _loadArtifact(api, artifactKeys.directionalFieldKey),
+      _loadArtifact(api, artifactKeys.diskSeedsKey),
+      _loadArtifact(api, artifactKeys.curvatureKey),
+      _loadArtifact(api, artifactKeys.principalFrameKey),
+      _loadArtifact(api, artifactKeys.flowFieldKey),
+      _loadArtifact(api, artifactKeys.flowCurlKey),
+      _loadArtifact(api, artifactKeys.flowDivKey),
+      _loadArtifact(api, artifactKeys.normalCurlKey)
+    ]);
+
+    // Stage 1 inline — directnessArt and penumbraArt from msg, not IDB
+    const directnessArt = stage1Inline?.fMapFinal
+      ? { data: {
+            fMap:        stage1Inline.fMapFinal.fMap,
+            directness:  stage1Inline.fMapFinal.directness,
+            modalLabels: stage1Inline.fMapFinal.modalLabels
+          }}
+      : null;
+
+    const penumbraArt = stage1Inline?.penumbra
+      ? { data: {
+            widthMap:   stage1Inline.penumbra.widthMap,
+            edgeMask:   stage1Inline.penumbra.edgeMask,
+            lightTrack: stage1Inline.penumbra.lightTrack
+          }}
+      : null;
+
+    console.log('[topology.worker] Artifact load complete:', {
+      hasDirectionalField: !!directionalFieldArt,
+      hasSdfField:         !!sdfFieldArt,
+      hasCurvature:        !!curvatureArt,
+      hasDirectness:       !!directnessArt,
+      hasPenumbra:         !!penumbraArt,
+      hasDiskSeeds:        !!diskSeedsArt
+    });
 
       // ── Validate required artifacts ──────────────────────────────────────
       const missing = [];
       if (!directionalFieldArt) missing.push('directionalField');
       if (!sdfFieldArt)         missing.push('sdfField');
-      if (!curvatureArt)        missing.push('curvature');
+      // curvature can come from dgInline.kH (inline path) or curvatureArt (IDB path)
+      const hasKH = !!(dgInline?.kH ?? curvatureArt?.data?.kH);
+      if (!hasKH) missing.push('curvature (neither dgInline.kH nor curvatureArt available)');
       if (missing.length > 0) throw new Error(`Missing required artifacts: ${missing.join(', ')}`);
 
       // ── Unpack into typed arrays ──────────────────────────────────────────
@@ -135,25 +211,41 @@ self.onmessage = async (evt) => {
         signedSdf:         sdfFieldArt.data.signedSdf,
         narrowBandMask:    sdfFieldArt.data.narrowBandMask,
 
-        kH:                curvatureArt.data.kH                             ?? null,
-        normalCurl:        normalCurlArt?.data.curl                         ?? null,
-
-        flowU:             flowFieldArt?.data.u                             ?? null,
-        flowV:             flowFieldArt?.data.v                             ?? null,
-        flowCurl:          flowCurlArt?.data.curl                           ?? null,
-        flowDivergence:    flowDivArt?.data.divergence                      ?? null,
+        // DG fields from dgInline — no IDB read needed
+        kH:                dgInline?.kH                                    ?? null,
+        normalCurl:        dgInline?.normalCurl                            ?? null,
+        flowU:             flowFieldArt?.data.u                            ?? null,
+        flowV:             flowFieldArt?.data.v                            ?? null,
+        flowCurl:          dgInline?.flowCurl                              ?? null,
+        flowDivergence:    dgInline?.flowDiv                               ?? null,
       };
 
       // ── Run analysis ──────────────────────────────────────────────────────
+      // Timeout scales with resolution: PixelGraph + PrimeEnds BFS at 1024²
+      // (1M nodes) legitimately takes 60–120s with flow. Without flow LQE hangs
+      // indefinitely. Scale by (res/512)² so 512²→60s, 1024²→240s.
+      const TOPOLOGY_TIMEOUT_MS = 60_000 * Math.pow(Math.max(res, 512) / 512, 2);
       const analyzer = new TopologyAnalyzer(_flags);
-      const result   = await analyzer.compute({
-        artifacts,
-        storageWrapper: sw,
-        sourceMetaKey:  metaKey,
-        cameraId:       msg.cameraId ?? 'default',
-        resolution:     res,
-        frameIndex:     msg.frameIndex ?? 0
-      });
+      const result = await Promise.race([
+        analyzer.compute({
+          artifacts,
+          storageWrapper: sw,
+          sourceMetaKey:  metaKey,
+          cameraId:       msg.cameraId ?? 'default',
+          resolution:     res,
+          frameIndex:     msg.frameIndex ?? 0
+        }),
+        new Promise((_, reject) =>
+          setTimeout(
+            () => reject(new Error(
+              `TopologyAnalyzer.compute() timed out after ${TOPOLOGY_TIMEOUT_MS}ms ` +
+              `at resolution ${res}² — likely LipschitzQuaternionEnds solver hang ` +
+              `on null flowCurl/flowDiv. Ensure enableOpticalFlow=true.`
+            )),
+            TOPOLOGY_TIMEOUT_MS
+          )
+        )
+      ]);
 
       // ── Broadcast completion ──────────────────────────────────────────────
       _bcPost({

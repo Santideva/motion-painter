@@ -141,7 +141,7 @@ function _extractCoherence(art) {
 
 // ── AMBI_ANALYZE handler ─────────────────────────────────────────────────
 async function _handleAmbiAnalyze(msg) {
-  const { jobId, metaKey, flags: jobFlags, artifactKeys, stage4a, stage4b } = msg;
+  const { jobId, metaKey, flags: jobFlags, artifactKeys, stage4a, stage4b, stage1Inline, dgInline } = msg;
   if (jobFlags) Object.assign(_flags, jobFlags);
 
   const startMs = Date.now();
@@ -178,19 +178,33 @@ async function _handleAmbiAnalyze(msg) {
       motionMapsArt,
       principalFrameArt,
       curvatureArt,
-      directionalArt,
-      directnessArt,
-      penumbraArt
+      directionalArt
     ] = await Promise.all([
       _loadArtifact(api, artifactKeys.componentMapKey),
       _loadArtifact(api, artifactKeys.lipschitzEndsKey),
       _loadArtifact(api, artifactKeys.motionMapsKey),
       _loadArtifact(api, artifactKeys.principalFrameKey),
       _loadArtifact(api, artifactKeys.curvatureKey),
-      _loadArtifact(api, artifactKeys.directionalFieldKey),
-      _loadArtifact(api, artifactKeys.directnessKey),
-      _loadArtifact(api, artifactKeys.penumbraKey)
+      _loadArtifact(api, artifactKeys.directionalFieldKey)
     ]);
+
+    // directnessArt and penumbraArt come from stage1Inline — not IDB.
+    // Reconstruct the same shape that getArtifact would have returned.
+    const directnessArt = stage1Inline?.fMapFinal
+      ? { data: {
+            fMap:        stage1Inline.fMapFinal.fMap,
+            directness:  stage1Inline.fMapFinal.directness,
+            modalLabels: stage1Inline.fMapFinal.modalLabels
+          }}
+      : null;
+
+    const penumbraArt = stage1Inline?.penumbra
+      ? { data: {
+            widthMap:   stage1Inline.penumbra.widthMap,
+            edgeMask:   stage1Inline.penumbra.edgeMask,
+            lightTrack: stage1Inline.penumbra.lightTrack
+          }}
+      : null;
 
     // ── Unpack Group A ─────────────────────────────────────────────────────
     const phiMin         = phiMinArt.data.phi;
@@ -227,11 +241,20 @@ async function _handleAmbiAnalyze(msg) {
         }
       : { motionMagnitude: null, saliencyMap: null, rotationalMap: null };
 
-    const principalFrame = principalFrameArt?.data?.frame
-                           ?? principalFrameArt?.data?.principalFrame
-                           ?? null;
+    // principalFrame and curvatureField from dgInline — no IDB read needed
+    const principalFrame = dgInline
+      ? { e1: dgInline.principalE1, e2: dgInline.principalE2 }
+      : (principalFrameArt?.data?.frame ?? principalFrameArt?.data?.principalFrame ?? null);
 
-    const curvatureField = curvatureArt?.data?.kH ?? null;
+    const curvatureField = dgInline?.kH ?? curvatureArt?.data?.kH ?? null;
+
+    if (dgInline) {
+      console.log('[ambi.worker] DG fields from dgInline:', {
+        hasKH:          !!dgInline.kH,
+        hasPrincipalE1: !!dgInline.principalE1,
+        hasPrincipalE2: !!dgInline.principalE2
+      });
+    }
 
     // Defensive coherence extraction (Issue 4)
     const coherencePerPixel = _extractCoherence(directionalArt);

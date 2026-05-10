@@ -75,15 +75,32 @@ export class TopologyAnalyzer {
     // ── Stage 4A-2: Lipschitz Quaternion Ends ────────────────────────────
     let lqeResult = null;
     if (flags.enableLQE !== false) {
-      const lqe = new LipschitzQuaternionEnds(G, {
-        flowU, flowV,
-        derivatives,
-        coherencePerPixel,
-        normalCurl,
-        flowCurl,
-        flowDivergence
-      }, w, flags);
-      lqeResult = lqe.compute(frameIndex);
+      // Guard: LQE's solver requires at least one non-null flow input to form
+      // a convergence criterion. With all flow inputs null the solver has no
+      // gradient signal and will never converge — hanging the worker.
+      // derivatives (DirectionalLifting temporal signal) is not sufficient
+      // alone: it provides It but not the (u,v) directional stopping criterion.
+      // Normal path: enableOpticalFlow=true ensures flowU/flowV are non-null.
+      // Fallback path (GPU failure / flag override): LQE is skipped; topology
+      // map and prime-ends still complete, quaternion_field key will be null.
+      const hasFlowInput = !!(flowU || flowCurl || flowDivergence);
+      if (hasFlowInput) {
+        const lqe = new LipschitzQuaternionEnds(G, {
+          flowU, flowV,
+          derivatives,
+          coherencePerPixel,
+          normalCurl,
+          flowCurl,
+          flowDivergence
+        }, w, flags);
+        lqeResult = lqe.compute(frameIndex);
+      } else {
+        console.warn(
+          '[TopologyAnalyzer] LQE skipped — flowU, flowCurl and flowDivergence are all null.' +
+          ' Ensure enableOpticalFlow=true in motion.worker flags.' +
+          ' lipschitz_ends, quaternion_field and motion_maps keys will be null this frame.'
+        );
+      }
     }
 
     // ── Persist artifacts ────────────────────────────────────────────────

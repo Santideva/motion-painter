@@ -1114,7 +1114,7 @@ const CALIB = {
       
       console.log('CALIB: Processing dark frames...');
       const darkFrame = await this._processFrameGroup(frames, darkIndices, { width, height });
-      
+
       console.log('CALIB: Processing flat frames...');
       const flatFrame = await this._processFrameGroup(frames, flatIndices, { width, height });
       
@@ -1976,7 +1976,74 @@ async function handleComputeCalibration({ jobId, frames, framesNeeded, resolutio
   
   try {
     postMessage({ event: 'progress', jobId, stage: 'calibration_start', frameCount: frames.length });
-    
+
+    // ── Compute frame mean BEFORE CALIB.computeCalibration closes the frames ──
+    // CALIB.computeCalibration calls _processFrameGroup which calls frame.close()
+    // on every frame. After it returns, all frames in the array are closed.
+    // We compute the calibrated reference (temporal mean) here while frames
+    // are still valid and open.
+    postMessage({ event: 'progress', jobId, stage: 'creating_calibrated_reference' });
+
+    let precomputedMeanBitmap = null;
+    {
+      const calibW = Math.min(512, resolution.width);
+      const calibH = Math.min(512, Math.round(resolution.height * calibW / resolution.width));
+      const rSum   = new Float32Array(calibW * calibH);
+      const gSum   = new Float32Array(calibW * calibH);
+      const bSum   = new Float32Array(calibW * calibH);
+      let framesCounted = 0;
+
+      const sumCanvas = new OffscreenCanvas(calibW, calibH);
+      const sumCtx    = sumCanvas.getContext('2d', { alpha: false });
+
+      for (const frame of frames) {
+        try {
+          sumCtx.drawImage(frame, 0, 0, calibW, calibH);
+          const px = sumCtx.getImageData(0, 0, calibW, calibH).data;
+          for (let i = 0; i < calibW * calibH; i++) {
+            rSum[i] += px[i * 4];
+            gSum[i] += px[i * 4 + 1];
+            bSum[i] += px[i * 4 + 2];
+          }
+          framesCounted++;
+        } catch (e) {
+          console.warn('CALIB: skipping frame during mean computation:', e.message);
+        }
+      }
+
+      if (framesCounted === 0) {
+        throw new Error('No frames available for calibrated reference computation');
+      }
+
+      const meanData = new Uint8ClampedArray(calibW * calibH * 4);
+      let maxLum = 0;
+      for (let i = 0; i < calibW * calibH; i++) {
+        const r = Math.round(rSum[i] / framesCounted);
+        const g = Math.round(gSum[i] / framesCounted);
+        const b = Math.round(bSum[i] / framesCounted);
+        meanData[i * 4]     = r;
+        meanData[i * 4 + 1] = g;
+        meanData[i * 4 + 2] = b;
+        meanData[i * 4 + 3] = 255;
+        const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+        if (lum > maxLum) maxLum = lum;
+      }
+
+      console.log('CALIB: calibrated reference (frame mean):', {
+        framesCounted,
+        calibW,
+        calibH,
+        maxLuminance: maxLum.toFixed(2) + ' / 255',
+        verdict: maxLum > 10
+          ? '✅ Signal present — depth estimation will work'
+          : '⚠️ Low signal — dark scene, histogram stretch will apply'
+      });
+
+      sumCtx.putImageData(new ImageData(meanData, calibW, calibH), 0, 0);
+      precomputedMeanBitmap = await createImageBitmap(sumCanvas);
+    }
+
+    // Now call CALIB.computeCalibration — this will close all frames internally
     const result = await CALIB.computeCalibration({ frames, framesNeeded, resolution });
 
     // CRITICAL: Clone result bitmaps IMMEDIATELY before they might be closed/transferred
@@ -1989,16 +2056,12 @@ async function handleComputeCalibration({ jobId, frames, framesNeeded, resolutio
       throw new Error('Failed to clone calibration bitmaps - source frames may be closed');
     }
 
-    postMessage({ event: 'progress', jobId, stage: 'creating_calibrated_reference' });
+    // calibratedBitmap was precomputed before CALIB.computeCalibration closed the frames
+    calibratedBitmap = precomputedMeanBitmap;
+    precomputedMeanBitmap = null;
 
-    // Create calibrated reference frame by applying calibration to flat frame
-    calibratedBitmap = await CALIB.applyCalibrationToBitmap(
-      flatBitmapClone,
-      { outW: flatBitmapClone.width, outH: flatBitmapClone.height }
-    );
-    
     if (!calibratedBitmap) {
-      throw new Error('Failed to create calibrated reference bitmap');
+      throw new Error('Failed to create calibrated reference bitmap — precomputation failed');
     }
 
     postMessage({ event: 'progress', jobId, stage: 'serializing_artifacts' });

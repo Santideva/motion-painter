@@ -156,7 +156,7 @@ const DEFAULTS = {
                                         // scaleneVariance as sdf_diagnostics artifact
 
     // ── Stage 3: Horn-Schunck optical flow ───────────────────────────────────
-    enableOpticalFlow:     false,    // gate entire H-S pass (adds ~5–15ms GPU cost)
+    enableOpticalFlow:     true,    // gate entire H-S pass (adds ~5–15ms GPU cost)
     opticalFlowAlpha:      1.0,      // smoothness weight α² [0.1, 10]
     opticalFlowIterations: 30,       // ping-pong passes    [10, 100]                                        
 
@@ -226,7 +226,7 @@ const DEFAULTS = {
   ambiLegibilityWeightThresh:      0.1,    // minimum weight for coverage fraction count
 
   // Debug
-  ambiDebug:                       false,  // emit ambi_anamorph_telemetry artifact
+  ambiDebug:                       true,  // emit ambi_anamorph_telemetry artifact
 
   // Pipeline phase control (NEW)
   // enablePreprocessAnnotate: allow preprocessors to annotate manifests / metadata
@@ -402,7 +402,24 @@ function _readFlagsFromStorage() {
       const parsed = JSON.parse(raw || '{}') || {};
       const merged = Object.assign({}, DEFAULTS, parsed);
       if (!('featureFlagsVersion' in merged)) merged.featureFlagsVersion = FEATURE_FLAGS_VERSION;
-      // ensure sequence
+
+      // When the flags version in localStorage is older than the current version,
+      // any flags that are NEW in this version (didn't exist in localStorage before)
+      // are correct because DEFAULTS wins for missing keys. But flags that existed
+      // before with a different default need to be explicitly reset to DEFAULTS,
+      // otherwise the old localStorage value permanently overrides the new default.
+      // List here any flag whose default changed between versions:
+      const RESET_ON_VERSION_BUMP = [
+        'enableOpticalFlow'   // added in v2 as true; any stale false must be cleared
+      ];
+      if ((parsed.featureFlagsVersion ?? 0) < FEATURE_FLAGS_VERSION) {
+        RESET_ON_VERSION_BUMP.forEach(key => {
+          merged[key] = DEFAULTS[key];
+        });
+        merged.featureFlagsVersion = FEATURE_FLAGS_VERSION;
+        console.log('[featureFlags] version bump detected — reset:', RESET_ON_VERSION_BUMP);
+      }
+
       _ensureSeqObject(merged);
       _inMemoryFallback = merged;
       return deepClone(merged);

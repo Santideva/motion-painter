@@ -138,8 +138,17 @@ function extractSOCs(fluxArt, resolution) {
     cosThetaSoc[i] = 0;  // default: 90° contact angle
   }
 
-  // Override from SOC cone descriptors if available
-  if (fluxArt.data.SOCs) {
+  // Override from precomputed cosThetaSoc Float32Array (SOCs array removed — OOM fix).
+  // If cosThetaSoc is present it already contains cos(halfAngle) per pixel.
+  if (fluxArt.data.cosThetaSoc) {
+    const src = fluxArt.data.cosThetaSoc;
+    for (let i = 0; i < pxN; i++) {
+      if (hasSoc[i] && src[i] !== 0) {
+        cosThetaSoc[i] = src[i];
+      }
+    }
+  } else if (fluxArt.data.SOCs) {
+    // Legacy fallback if SOCs still present
     for (const soc of fluxArt.data.SOCs) {
       const px = soc.pixelIdx;
       if (px >= 0 && px < pxN && hasSoc[px]) {
@@ -359,15 +368,102 @@ self.onmessage = async (evt) => {
       const sw  = _wrapStorage(api);
 
       // ── Load artifacts in parallel ────────────────────────────────────
-      const [sdfArt, diskSeedsArt, fluxArt, curvArt, normalArt] = await Promise.all([
-        _loadArtifact(api, artifactKeys.sdfFieldKey),
-        _loadArtifact(api, artifactKeys.diskSeedsKey),
-        _loadArtifact(api, artifactKeys.fluxFieldKey),
+      const sdfInline = msg.sdfInline ?? null;
+
+      console.log('[minimizer.worker] Loading artifacts:', {
+        hasSdfInline: !!sdfInline,
+        diskSeedsKey: artifactKeys.diskSeedsKey ?? null,
+        fluxFieldKey: artifactKeys.fluxFieldKey ?? null,
+        curvatureKey: artifactKeys.curvatureKey ?? null
+      });
+
+      // sdfArt is constructed from sdfInline — not loaded from IDB.
+      // sdfFieldKey is null (the IDB record contains only scalar metadata).
+      // Shape matches what getArtifact would have returned so the unpack
+      // block below (signedSdf, narrowBandMask) is unchanged.
+      const sdfArt = sdfInline
+        ? {
+            data: {
+              signedSdf:      sdfInline.signedSdf,
+              narrowBandMask: sdfInline.narrowBandMask,
+              densityMap:     sdfInline.densityMap  ?? null,
+              surfaceMask:    sdfInline.surfaceMask ?? null
+            }
+          }
+        : null;
+
+      if (sdfInline) {
+        console.log('[minimizer.worker] sdfInline received:', {
+          signedSdfLength:      sdfInline.signedSdf?.length      ?? 0,
+          narrowBandMaskLength: sdfInline.narrowBandMask?.length ?? 0,
+          densityMapLength:     sdfInline.densityMap?.length     ?? 0,
+          surfaceMaskLength:    sdfInline.surfaceMask?.length    ?? 0
+        });
+      } else {
+        console.warn('[minimizer.worker] sdfInline absent — sdfArt will be null, minimizer will throw');
+      }
+
+      // fluxArt is constructed from fluxInline — not loaded from IDB.
+      // fluxFieldKey is null — flux_field bypasses IDB entirely.
+      // Shape matches what getArtifact would return so extractSOCs() and
+      // any other consumer of fluxArt.data is unchanged.
+      const fluxInline = msg.fluxInline ?? null;
+      const fluxArt = fluxInline
+        ? { data: {
+              // Full flux_field — all components available
+              A_coo:       fluxInline.A_coo       ?? null,
+              A_csr:       fluxInline.A_csr       ?? null,
+              b:           fluxInline.b           ?? null,
+              SOCs:        fluxInline.SOCs        ?? null,
+              groups:      fluxInline.groups      ?? null,
+              supports:    fluxInline.supports    ?? null,
+              init_h:      fluxInline.init_h      ?? null,
+              diagnostics: fluxInline.diagnostics ?? null,
+              solverReady: fluxInline.solverReady ?? false
+            }}
+        : null;
+
+      if (fluxInline) {
+        console.log('[minimizer.worker] fluxInline received (full flux_field):', {
+          hasACoo:       !!fluxInline.A_coo,
+          hasAcsr:       !!fluxInline.A_csr,
+          hasB:          !!fluxInline.b,
+          hasSOCs:       !!fluxInline.SOCs,
+          hasInitH:      !!fluxInline.init_h,
+          acoRowLength:  fluxInline.A_coo?.row?.length  ?? 0,
+          solverReady:   fluxInline.solverReady          ?? false
+        });
+      } else {
+        console.warn('[minimizer.worker] fluxInline absent — SOC normals will be zero (90° contact angle)');
+      }
+
+      // disk_seeds: use inline if provided, fall back to IDB.
+      // Note: IDB format uses {header, payload} binary — diskSeedsArt.data.seeds
+      // was always undefined. Inline format uses {x, y, r} directly.
+      const diskSeedsInline = msg.diskSeedsInline ?? null;
+
+      const [curvArt, normalArt] = await Promise.all([
         _loadArtifact(api, artifactKeys.curvatureKey),
         _loadArtifact(api, artifactKeys.normalMapKey)
       ]);
 
-      if (!sdfArt) throw new Error('sdf_field artifact required for minimizer');
+      // diskSeedsArt only loaded from IDB if inline is absent
+      let diskSeedsArt = null;
+      if (!diskSeedsInline && artifactKeys.diskSeedsKey) {
+        diskSeedsArt = await _loadArtifact(api, artifactKeys.diskSeedsKey);
+      }
+
+      console.log('[minimizer.worker] Artifact load complete:', {
+        hasSdfArt:      !!sdfArt,
+        hasFluxArt:     !!fluxArt,
+        hasFluxInline:  !!fluxInline,
+        hasDiskSeeds:   !!diskSeedsArt,
+        hasCurvature:   !!curvArt,
+        hasNormalMap:   !!normalArt,
+        diskSeedsCount: diskSeedsArt?.data?.seeds?.length ?? 0
+      });
+
+      if (!sdfArt) throw new Error('sdf_field artifact required for minimizer — sdfInline was absent in MINIMIZE message');
 
       const resolution = artifactKeys.resolution ?? 512;
 
@@ -375,18 +471,29 @@ self.onmessage = async (evt) => {
       const signedSdf      = sdfArt.data.signedSdf;
       const narrowBandMask = sdfArt.data.narrowBandMask;
 
-      // ── Disk seeds ─────────────────────────────────────────────────────
+      // ── Disk seeds ─────────────────────────────────────────────────────────
+      // Prefer inline (normalized {x,y,r} objects, already in [0,1]).
+      // IDB format uses {header,payload} binary — diskSeedsArt.data.seeds was
+      // always undefined, so minimizer was silently receiving empty diskSeeds.
       let diskSeeds = [];
-      if (diskSeedsArt?.data) {
+      if (diskSeedsInline?.length > 0) {
+        diskSeeds = diskSeedsInline;
+        console.log('[minimizer.worker] disk_seeds inline:', diskSeeds.length, 'seeds, bypassing IDB');
+      } else if (diskSeedsArt?.data) {
         diskSeeds = diskSeedsArt.data.seeds ?? [];
+        console.log('[minimizer.worker] disk_seeds from IDB:', diskSeeds.length, 'seeds');
       }
 
       // ── SOC extraction ─────────────────────────────────────────────────
       const { socNx, socNy, hasSoc, cosThetaSoc, socPixelCount } =
         extractSOCs(fluxArt, resolution);
 
-      // ── Curvature warm-start ───────────────────────────────────────────
-      const kH = curvArt?.data?.kH ?? null;
+      // ── Curvature warm-start — from dgInline, not IDB ─────────────────
+      const dgInline = msg.dgInline ?? null;
+      const kH = dgInline?.kH ?? curvArt?.data?.kH ?? null;
+      if (dgInline?.kH) {
+        console.log('[minimizer.worker] kH from dgInline — bypassing IDB read');
+      }
 
       // ── Placeholder componentMap (single component) ───────────────────
       // Will be replaced in Phase B when TOPOLOGY_DONE arrives.

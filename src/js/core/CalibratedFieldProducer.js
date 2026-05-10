@@ -105,6 +105,67 @@ export class CalibratedFieldProducer {
 
       if (!artifact) throw new Error(`Calibrated artifact not found for key ${candidateKey || '(artifact provided but falsy)'}`);
 
+      // ── DIAGNOSTIC: verify we loaded the right artifact ─────────────────
+      // Check that the loaded artifact is the calibrated frame and not
+      // accidentally the dark, flat, or bias frame.
+      console.log('[CALIB-PRODUCER-DIAG] Artifact loaded:', {
+        key:            candidateKey,
+        hasBlob:        !!artifact.blob,
+        blobType:       artifact.blob?.type ?? 'none',
+        blobSize:       artifact.blob?.size ?? 0,
+        hasDataField:   !!(artifact.data?.field),
+        metaType:       artifact.meta?.type ?? 'unknown',
+        metaKeys:       artifact.meta ? Object.keys(artifact.meta) : [],
+        // These should all be null/undefined — if any are present,
+        // we may have loaded a calibration component instead of the output
+        isDark:         artifact.meta?.type === 'dark' ||
+                        candidateKey?.includes(':dark:'),
+        isFlat:         artifact.meta?.type === 'flat' ||
+                        candidateKey?.includes(':flat:'),
+        isBias:         artifact.meta?.type === 'bias' ||
+                        candidateKey?.includes(':bias:'),
+        isCalibrated:   candidateKey?.includes(':calibrated:'),
+        verdict: candidateKey?.includes(':calibrated:')
+          ? '✅ Key looks correct (calibrated frame)'
+          : candidateKey?.includes(':dark:')
+            ? '❌ WRONG ARTIFACT — loaded dark frame instead of calibrated frame'
+            : candidateKey?.includes(':flat:')
+              ? '❌ WRONG ARTIFACT — loaded flat frame instead of calibrated frame'
+              : '⚠️ Key type unclear — inspect manually'
+      });
+
+      // If it is an image blob, sample a few pixels immediately to check brightness
+      if (artifact.blob && artifact.blob.size > 0) {
+        try {
+          const bmpCheck = await createImageBitmap(artifact.blob);
+          const checkCanvas = new OffscreenCanvas(32, 32); // tiny sample
+          const checkCtx = checkCanvas.getContext('2d');
+          checkCtx.drawImage(bmpCheck, 0, 0, 32, 32);
+          const checkData = checkCtx.getImageData(0, 0, 32, 32).data;
+          let maxPx = 0, sumPx = 0;
+          for (let i = 0; i < checkData.length; i += 4) {
+            const lum = 0.299 * checkData[i] + 0.587 * checkData[i+1] + 0.114 * checkData[i+2];
+            if (lum > maxPx) maxPx = lum;
+            sumPx += lum;
+          }
+          const meanPx = sumPx / (checkData.length / 4);
+          console.log('[CALIB-PRODUCER-DIAG] Artifact blob pixel sample (32×32):', {
+            maxLuminance:  maxPx.toFixed(2) + ' / 255',
+            meanLuminance: meanPx.toFixed(2) + ' / 255',
+            isNearBlack:   maxPx < 5,
+            verdict: maxPx < 5
+              ? '❌ BLOB IS NEARLY BLACK — wrong artifact or dark frame loaded'
+              : maxPx < 20
+                ? '⚠️ LOW SIGNAL — may be dark frame or underexposed'
+                : '✅ Blob has usable signal'
+          });
+          try { bmpCheck.close(); } catch (_) {}
+        } catch (e) {
+          console.warn('[CALIB-PRODUCER-DIAG] Blob pixel check failed:', e.message);
+        }
+      }
+      // ── END DIAGNOSTIC ────────────────────────────────────────────────────
+      
       // Artifact can contain data (structured) or blob (binary)
       if (!artifact.blob && artifact.data && artifact.data.field) {
         // If storage returned a structured Float32Array under artifact.data.field, accept it

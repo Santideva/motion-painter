@@ -91,7 +91,8 @@ const DEFAULT_CONFIG = {
     // ── SDF / EDT ──────────────────────────────────────────────────────────
     /** Min absolute depth difference (normalised [0,1]) to seed a zero-level
      *  set candidate.  Adaptively loosened in penumbra regions. */
-    depthDiscontinuityThreshold: 0.04,
+    depthDiscontinuityThreshold: 0.004,   // smooth transitions (~0.003–0.010 in
+                                          // normalized [0,1]); 
 
     /** Penumbra multiplier: in penumbra pixels the threshold is multiplied by
      *  this factor (>1 = looser, acknowledging genuine surface transitions). */
@@ -386,6 +387,35 @@ export class PackingSDF {
             }
         }
 
+        // Fallback: if too few edges detected (< 0.05% of pixels), the scene has
+        // no detectable depth discontinuities at this threshold. Rather than returning
+        // an all-INF SDF (degenerate narrow band), fall back to Sobel gradient
+        // magnitude thresholded at a much lower level so SOME surface structure exists.
+        let edgeCount = 0;
+        for (let i = 0; i < n; i++) edgeCount += mask[i];
+
+        if (edgeCount < n * 0.0005) {
+            console.warn(`[PackingSDF] Only ${edgeCount} edge pixels detected (${(edgeCount/n*100).toFixed(3)}%). ` +
+                         `Falling back to Sobel gradient threshold for surface mask.`);
+            const sobelThresh = 0.001;  // Much lower — catches any texture/gradient
+            for (let y = 1; y < height - 1; y++) {
+                for (let x = 1; x < width - 1; x++) {
+                    const i = y * width + x;
+                    if (mask[i]) continue;  // Already flagged
+                    const d = depthMap[i];
+                    // 3×3 Sobel-like: max gradient across all 4 axes
+                    const gx = Math.abs(depthMap[i + 1] - depthMap[i - 1]) * 0.5;
+                    const gy = Math.abs(depthMap[i + width] - depthMap[i - width]) * 0.5;
+                    const gd1 = Math.abs(depthMap[i + width + 1] - depthMap[i - width - 1]) * 0.354;
+                    const gd2 = Math.abs(depthMap[i + width - 1] - depthMap[i - width + 1]) * 0.354;
+                    if (Math.max(gx, gy, gd1, gd2) >= sobelThresh) mask[i] = 1;
+                }
+            }
+            let fallbackCount = 0;
+            for (let i = 0; i < n; i++) fallbackCount += mask[i];
+            console.log(`[PackingSDF] Fallback Sobel detected ${fallbackCount} edge pixels (${(fallbackCount/n*100).toFixed(2)}%)`);
+        }
+
         return mask;
     }
 
@@ -434,9 +464,17 @@ export class PackingSDF {
         }
 
         // Vertical pass
+        const maxDist = Math.sqrt(width * width + height * height);
         for (let x = 0; x < width; x++) {
             this._edt1D(f, tmp, v, z, x, width, height);
-            for (let y = 0; y < height; y++) d[y * width + x] = Math.sqrt(tmp[y]);
+            for (let y = 0; y < height; y++) {
+                const dist = Math.sqrt(tmp[y]);
+                // Cap sentinel values (1e9 = INF marker for pixels with no nearby
+                // edge) to the image diagonal. Without this cap, a sparse surfaceMask
+                // causes sdfRange = 1e9, making bandBase = GPT_ALPHA × 1e9 ≈ 93M px,
+                // which puts the entire image inside the narrow band.
+                d[y * width + x] = Math.min(dist, maxDist);
+            }
         }
 
         return d;

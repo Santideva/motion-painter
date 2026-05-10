@@ -342,8 +342,14 @@ const DEFAULTS = {
 Object.assign(_flags, DEFAULTS.packingDefaults);
 
 // ── Stage 3: Horn-Schunck optical flow defaults ───────────────────────────
+// enableOpticalFlow defaults to true — DirectionalLifting's derivatives.field
+// provides the temporal gradient (It) that H-S requires, so the full flow
+// pipeline is always available. H-S runs GPU-side (~5ms at 512²) and falls
+// back to flowField=null gracefully on GPU failure. Disabling this flag
+// starves DifferentialGeometry of flowCurl/flowDiv, which in turn causes
+// LipschitzQuaternionEnds to hang with no convergence criterion.
 Object.assign(_flags, {
-  enableOpticalFlow:     false,  // gate entire H-S pass — default false (adds GPU + readback cost)
+  enableOpticalFlow:     true,   // H-S optical flow enabled by default
   opticalFlowAlpha:      1.0,    // smoothness weight α² [0.1, 10]
   opticalFlowIterations: 30      // ping-pong passes [10, 100]
 });
@@ -2468,6 +2474,44 @@ async function _computeDepthNormalsFlux(frameBitmap, calibData, options = {}) {
       validateResolution(gridSize, calibResult.resolution, 'CalibratedFieldProducer');
       validateBuffer(calibratedField, gridSize * gridSize * 4, 'calibratedField');
 
+      // ── DIAGNOSTIC: calibrated field signal check ─────────────────────
+      // fieldStats from telemetry shows mean ~0.003 — nearly black input.
+      // If maxR/maxG/maxB are all near zero, the camera signal is too low
+      // for depth estimation and all downstream stages will be degenerate.
+      try {
+        let maxR = 0, maxG = 0, maxB = 0, sumR = 0, sumG = 0, sumB = 0;
+        const sampleStride = Math.max(1, Math.floor(calibratedField.length / (4 * 10000)));
+        let sampleCount = 0;
+        for (let i = 0; i < calibratedField.length; i += 4 * sampleStride) {
+          const r = calibratedField[i], g = calibratedField[i+1], b = calibratedField[i+2];
+          if (r > maxR) maxR = r;
+          if (g > maxG) maxG = g;
+          if (b > maxB) maxB = b;
+          sumR += r; sumG += g; sumB += b;
+          sampleCount++;
+        }
+        const meanR = sumR / sampleCount;
+        const meanG = sumG / sampleCount;
+        const meanB = sumB / sampleCount;
+        const isDegenerate = maxR < 0.01 && maxG < 0.01 && maxB < 0.01;
+        console.log('[DIAG-CALIB] Calibrated field signal:', {
+          maxR:  maxR.toFixed(5),
+          maxG:  maxG.toFixed(5),
+          maxB:  maxB.toFixed(5),
+          meanR: meanR.toFixed(5),
+          meanG: meanG.toFixed(5),
+          meanB: meanB.toFixed(5),
+          sampleCount,
+          isDegenerate,
+          verdict: isDegenerate
+            ? '❌ NEARLY BLACK — depth will be flat, SDF will be degenerate'
+            : '✅ Signal present — calibration OK'
+        });
+      } catch (diagErr) {
+        console.warn('[DIAG-CALIB] Signal check failed:', diagErr.message);
+      }
+      // ── END DIAGNOSTIC ────────────────────────────────────────────────
+
       if (_flags.persistIntermediates || _flags.calibDebug) {
         try {
           await _persistAndPin(options.storageWrapper, {
@@ -2902,11 +2946,18 @@ async function _computeDepthNormalsFlux(frameBitmap, calibData, options = {}) {
           throw new Error('float textures not supported — H-S requires FloatType RenderTarget');
         }
 
+        // Scale iterations down at high resolution to bound GPU time.
+        // 30 passes at 512² ≈ 5ms; at 1024² the same passes take ~20ms.
+        // Halving iterations at 1024² keeps wall time ≤10ms with minimal
+        // accuracy loss — H-S converges quickly in the first 15 passes.
+        const hsItersScaled = gridSize > 512
+          ? Math.max(10, Math.floor(hsIters / Math.pow(gridSize / 512, 1.5)))
+          : hsIters;
         const hsResult = _runHornSchunck(
           THREE, renderer,
           It, Ix, Iy,
           gridSize, gridSize,
-          hsAlpha, hsIters
+          hsAlpha, hsItersScaled
         );
 
         flowField = {
@@ -3038,6 +3089,46 @@ async function _computeDepthNormalsFlux(frameBitmap, calibData, options = {}) {
       validateBuffer(triangleResult.depths,         count, 'triangleResult.depths');
       validateBuffer(triangleResult.tilts,           count, 'triangleResult.tilts');
       validateBuffer(triangleResult.windingNumbers,  count, 'triangleResult.windingNumbers');
+
+      // ── DIAGNOSTIC: depth field variation check ───────────────────────
+      // If min ≈ max, depth is flat → SDF will have no zero crossings →
+      // narrowBandPixels = 0 → seedCount = 0. This is the most common
+      // cause of degenerate PackingSDF output.
+      try {
+        let dMin = Infinity, dMax = -Infinity, dSum = 0;
+        const depths = triangleResult.depths;
+        // Sample up to 10000 points for speed
+        const dStride = Math.max(1, Math.floor(depths.length / 10000));
+        let dCount = 0;
+        for (let i = 0; i < depths.length; i += dStride) {
+          const v = depths[i];
+          if (v < dMin) dMin = v;
+          if (v > dMax) dMax = v;
+          dSum += v;
+          dCount++;
+        }
+        const dMean   = dSum / dCount;
+        const dRange  = dMax - dMin;
+        const isFlat  = dRange < 0.01;
+        console.log('[DIAG-DEPTH] Triangle depth field stats:', {
+          min:      dMin.toFixed(6),
+          max:      dMax.toFixed(6),
+          mean:     dMean.toFixed(6),
+          range:    dRange.toFixed(6),
+          samples:  dCount,
+          isFlat,
+          verdict: isFlat
+            ? '❌ FLAT DEPTH — SDF will be degenerate (no zero crossings)'
+            : '✅ Depth has variation — SDF should be non-degenerate'
+        });
+        // Also log first 5 raw values for cross-checking
+        console.log('[DIAG-DEPTH] First 5 depth values:',
+          Array.from(depths.slice(0, 5)).map(v => v.toFixed(6)));
+        console.log('[DIAG-DEPTH] Triangle preprocessor stats:', triangleResult.stats);
+      } catch (diagErr) {
+        console.warn('[DIAG-DEPTH] Depth check failed:', diagErr.message);
+      }
+      // ── END DIAGNOSTIC ──────────────────────────────────────────────── 
 
       if (_flags.persistIntermediates) {
         try {
@@ -3220,22 +3311,37 @@ async function _computeDepthNormalsFlux(frameBitmap, calibData, options = {}) {
 
     fMapFinal = fMapRouteB;   // always have a Route B fallback
 
-    if (depthMap && _flags.enableFMapRouteA !== false) {
-      try {
-        fMapFinal = _computeFMapRouteA(
-          depthMap,
-          calibratedField,
-          gridSize,
-          penumbraResult?.lightTrack ?? [],
-          options.fresnelDensityMap  ?? null,
-          _buildSamplingContext(options.manifest ?? null, gridSize),
-          { N_samples: _flags.fMapNSamples ?? 128 }
-        );
-      } catch (e) {
-        telemetry.warnings.push(`FMap RouteA failed: ${e.message} — keeping Route B`);
-        console.warn('motion.worker: FMap RouteA failed, retaining Route B', e);
-      }
+    fMapFinal = _computeFMapRouteB(coherence?.perPixel ?? null, gridSize);
+
+if (depthMap && _flags.enableFMapRouteA !== false) {
+  try {
+    // Scale sample count down quadratically with resolution to keep
+    // wall time roughly constant. At 512²: N=128 (~5s). At 1024²: N=32 (~13s).
+    // Route B (coherence proxy) is retained as fallback if Route A is too slow.
+    const _fMapBaseN = _flags.fMapNSamples ?? 128;
+    const _fMapResScale = Math.pow(Math.min(1, 512 / gridSize), 2);
+    const _fMapN = Math.max(4, Math.round(_fMapBaseN * _fMapResScale));
+
+    if (_fMapN < _fMapBaseN) {
+      console.log(
+        `[FMap-RouteA] N scaled ${_fMapBaseN}→${_fMapN} for resolution ${gridSize}²`
+      );
     }
+
+    fMapFinal = _computeFMapRouteA(
+      depthMap,
+      calibratedField,
+      gridSize,
+      penumbraResult?.lightTrack ?? [],
+      options.fresnelDensityMap ?? null,
+      _buildSamplingContext(options.manifest ?? null, gridSize),
+      { N_samples: _fMapN }
+    );
+  } catch (e) {
+    telemetry.warnings.push(`FMap RouteA failed: ${e.message} — keeping Route B`);
+    console.warn('motion.worker: FMap RouteA failed, retaining Route B', e);
+  }
+}
 
     telemetry.stages.fmapA_ms = performance.now() - telemetry.stages.fmapA_start;
 
@@ -3824,77 +3930,49 @@ console.log('[STAGE4] Final calibData state before depth computation:', {
       throw new Error('Depth persistence failed');
     }
     console.log('[CHECKPOINT] persisting normal_map');
-    const normalResult = await _persistAndPin(
-      storageWrapper, 
-      {
-        type: 'normal_map',
-        data: { field: normalMap.data },
-        meta: {
-          sourceMetaKey: metaKey,
-          cameraId: cameraId,
-          plenopticContext: plenopticStub,
-          resolution: normalMap.resolution,
-          encoding: normalMap.encoding,
-          fallback: normalMap.fallback || false,
-          computedAt: Date.now()
-        },
-        createdAt: new Date().toISOString()
-      },
-      {
-        owner: 'motion.worker',
-        ttlMs: ARTIFACT_PIN_TTL_MS,
-        pinType: 'soft'
-      }
-    );
-
-    if (!normalResult?.metaKey) {
-      throw new Error('Normal persistence failed');
-    }
+    // normal_map — bypasses IDB entirely.
+    // topology.worker reads normalMap.data for gradient/curvature computation.
+    // The field travels inline in RECON_DONE as normalInline.
+    // normalResult is null — cc.normalMapKey will be null everywhere.
+    const normalResult = null;
+    console.log('[NORMAL] Bypassing IDB — normal_map forwarded inline:', {
+      resolution:  normalMap?.resolution,
+      fieldLength: normalMap?.data?.length ?? 0,
+      encoding:    normalMap?.encoding,
+      fallback:    normalMap?.fallback ?? false
+    });
     console.log('[CHECKPOINT] persisting flux_field');
+    // flux_field — entirely bypasses IDB.
+    // All components (A_coo, A_csr, b, SOCs, groups, supports, init_h,
+    // diagnostics) are passed inline in the RECON_DONE payload as fluxInline.
+    //
+    // Rationale for skipping IDB completely:
+    //   - flux_field is a per-frame derived artifact — meaningless across sessions
+    //   - IDB write cost is proportional to data size and was causing stalls
+    //   - All downstream consumers can receive the data directly via msg.fluxInline
+    //   - If a future consumer needs IDB durability, reinstate persistence here
+    //
+    // fluxResult stays null — cc.fluxFieldKey will be null everywhere.
+    // Consumers must read from msg.fluxInline / cc.fluxInline.
     let fluxResult = null;
     if (fluxData) {
-      try {
-        // Only persist what minimizer.worker actually reads — A_coo for SOC
-        // normal extraction in extractSOCs(). All other fields (A_csr, b,
-        // init_h, supports, groups, SOCs) are either unused by downstream
-        // consumers or cause catastrophic IDB serialization hangs:
-        //   - init_h:  Array.from(Float32Array[1M]) → 1M plain-array floats
-        //   - A_csr:   large sparse matrix arrays
-        //   - SOCs:    1M objects → cosThetaSoc defaults to 0° (90° contact)
-        // A_coo.row/col/data are TypedArrays with only constraintCount entries
-        // (e.g. 42) so they serialize instantly via the parts mechanism.
-        const fluxDataToStore = {
-          A_coo: fluxData.A_coo
-            ? {
-                row:  fluxData.A_coo.row,
-                col:  fluxData.A_coo.col,
-                data: fluxData.A_coo.data
-              }
-            : null
-        };
-
-        fluxResult = await _persistAndPin(
-          storageWrapper,
-          {
-            type: 'flux_field',
-            data: fluxDataToStore,
-            meta: {
-              sourceMetaKey: metaKey,
-              cameraId:      cameraId,
-              computedAt:    Date.now(),
-              solverReady:   true
-            },
-            createdAt: new Date().toISOString()
-          },
-          {
-            owner:   'motion.worker',
-            ttlMs:   ARTIFACT_PIN_TTL_MS,
-            pinType: 'soft'
-          }
-        );
-      } catch (fluxErr) {
-        console.warn('motion.worker: Flux persistence failed', fluxErr);
-      }
+      console.log('[FLUX] flux_field bypassing IDB — full data inline:', {
+        hasACoo:         !!fluxData.A_coo,
+        hasAcsr:         !!fluxData.A_csr,
+        hasB:            !!fluxData.b,
+        hasSOCs:         !!fluxData.SOCs,
+        hasGroups:       !!fluxData.groups,
+        hasSupports:     !!fluxData.supports,
+        hasInitH:        !!fluxData.init_h,
+        hasDiagnostics:  !!fluxData.diagnostics,
+        solverReady:     fluxData.solverReady ?? false,
+        acoRowLength:    fluxData.A_coo?.row?.length  ?? 0,
+        socCount:        Array.isArray(fluxData.SOCs)
+                           ? fluxData.SOCs.length
+                           : (fluxData.SOCs?.length ?? 0)
+      });
+    } else {
+      console.log('[FLUX] fluxData is null — no flux inline data to forward');
     }
 
     // ── Stage 1 artifact persistence ────────────────────────────────────────
@@ -3904,103 +3982,11 @@ console.log('[STAGE4] Final calibData state before depth computation:', {
     let modalResult       = null;
     let penumbraArtResult = null;
 
-    if (fMapFinal) {
-      try {
-        directnessResult = await _persistAndPin(
-          storageWrapper,
-          {
-            type: 'directness_field',
-            data: {
-              fMap:        fMapFinal.fMap,
-              directness:  fMapFinal.directness,
-              modalLabels: fMapFinal.modalLabels
-            },
-            meta: {
-              sourceMetaKey:   metaKey,
-              cameraId,
-              resolution:      chosenRes,
-              route:           fMapFinal.route,
-              N_samples:       fMapFinal.N_samples,
-              samplingContext: stage1SamplingContext,
-              thresholds: {
-                direct:       _flags.fMapDirectThresh ?? 0.9,
-                penumbra_low: _flags.fMapUmbraThresh  ?? 0.1
-              },
-              computedAt: Date.now()
-            },
-            createdAt: new Date().toISOString()
-          },
-          { owner: 'motion.worker', ttlMs: ARTIFACT_PIN_TTL_MS, pinType: 'soft' }
-        );
-        console.log('[PERSIST] ✓ directness_field:', directnessResult?.metaKey?.slice(0, 32));
-      } catch (e) {
-        console.warn('[PERSIST] ✗ directness_field (non-fatal):', e.message);
-      }
-    }
-
-    if (doaModalResult) {
-      try {
-        modalResult = await _persistAndPin(
-          storageWrapper,
-          {
-            type: 'modal_decomposition',
-            data: {
-              kappa:       doaModalResult.kappa,
-              meanDir:     doaModalResult.meanDir,
-              direct:      doaModalResult.direct,
-              diffuse:     doaModalResult.diffuse,
-              specular:    doaModalResult.specular,
-              multiBounce: doaModalResult.multiBounce
-            },
-            meta: {
-              sourceMetaKey:   metaKey,
-              cameraId,
-              resolution:      chosenRes,
-              kappaThreshold:  _flags.doaKappaThreshold ?? 3.0,
-              samplingContext: stage1SamplingContext,
-              computedAt:      Date.now()
-            },
-            createdAt: new Date().toISOString()
-          },
-          { owner: 'motion.worker', ttlMs: ARTIFACT_PIN_TTL_MS, pinType: 'soft' }
-        );
-        console.log('[PERSIST] ✓ modal_decomposition:', modalResult?.metaKey?.slice(0, 32));
-      } catch (e) {
-        console.warn('[PERSIST] ✗ modal_decomposition (non-fatal):', e.message);
-      }
-    }
-
-    if (penumbraResult) {
-      try {
-        penumbraArtResult = await _persistAndPin(
-          storageWrapper,
-          {
-            type: 'penumbra_field',
-            data: {
-              widthMap:   penumbraResult.widthMap,
-              edgeMask:   penumbraResult.edgeMask,
-              lightTrack: penumbraResult.lightTrack
-            },
-            meta: {
-              sourceMetaKey:    metaKey,
-              cameraId,
-              resolution:       chosenRes,
-              edgeCount:        penumbraResult.telemetry?.edgeCount       ?? 0,
-              lightCount:       penumbraResult.telemetry?.lightCount      ?? 0,
-              meanWidth:        penumbraResult.telemetry?.meanWidth       ?? 0,
-              profileFitMeanR2: penumbraResult.telemetry?.profileFitMeanR2 ?? 0,
-              samplingContext:  stage1SamplingContext,
-              computedAt:       Date.now()
-            },
-            createdAt: new Date().toISOString()
-          },
-          { owner: 'motion.worker', ttlMs: ARTIFACT_PIN_TTL_MS, pinType: 'soft' }
-        );
-        console.log('[PERSIST] ✓ penumbra_field:', penumbraArtResult?.metaKey?.slice(0, 32));
-      } catch (e) {
-        console.warn('[PERSIST] ✗ penumbra_field (non-fatal):', e.message);
-      }
-    }
+    // Stage 1 artifacts — NOT persisted to IDB.
+    // directness_field, modal_decomposition, and penumbra_field are passed
+    // inline in the RECON_DONE payload as stage1Inline.
+    // This avoids ~200MB of sequential IDB serialization (80-120s wall time).
+    // main.js receives them and forwards to consumer workers directly.
 
     // ── STAGE 2: PackingSDF ──────────────────────────────────────────────────
     // All inputs are in scope at this point:
@@ -4037,8 +4023,40 @@ console.log('[STAGE4] Final calibData state before depth computation:', {
           umbraPolicy:   _flags.packingUmbraPolicy ?? 'half-weight'
         });
 
+        // ── DIAGNOSTIC: SDF inputs check ─────────────────────────────────
+        // Verify depth and normal maps are non-degenerate before passing to SDF.
+        try {
+          const depthData = depthMap.data;
+          let sdfDMin = Infinity, sdfDMax = -Infinity;
+          const sdfStride = Math.max(1, Math.floor(depthData.length / 5000));
+          for (let i = 0; i < depthData.length; i += sdfStride) {
+            if (depthData[i] < sdfDMin) sdfDMin = depthData[i];
+            if (depthData[i] > sdfDMax) sdfDMax = depthData[i];
+          }
+          console.log('[DIAG-SDF-INPUT] depth range entering PackingSDF:', {
+            min:   sdfDMin.toFixed(6),
+            max:   sdfDMax.toFixed(6),
+            range: (sdfDMax - sdfDMin).toFixed(6),
+            isFlat: (sdfDMax - sdfDMin) < 0.01
+          });
+        } catch (diagErr) {
+          console.warn('[DIAG-SDF-INPUT] Input check failed:', diagErr.message);
+        }
+        // ── END DIAGNOSTIC ────────────────────────────────────────────────
+
+        // Normalize depth to [0,1] — PackingSDF's depthDiscontinuityThreshold
+        // and GPT σ² scalene variance assume this range. Raw triangle preprocessor
+        // output is in physical units (~0.8–2.5), causing almost no edges to be
+        // detected and the EDT to fill with sentinel values (1e9).
+        const { min: _dMin, max: _dMax } = typedMinMax(depthMap.data);
+        const _dRange = Math.max(1e-6, _dMax - _dMin);
+        const _normalizedDepth = new Float32Array(depthMap.data.length);
+        for (let i = 0; i < depthMap.data.length; i++) {
+          _normalizedDepth[i] = (depthMap.data[i] - _dMin) / _dRange;
+        }
+
         sdfResult = await _getPackingSDF().compute(
-          depthMap.data,
+          _normalizedDepth,
           normalMap.data,
           directnessField,
           penumbraField,
@@ -4065,6 +4083,49 @@ console.log('[STAGE4] Final calibData state before depth computation:', {
             sdfRange:         sdfResult.meta?.sdfRange         ?? 'n/a'
           });
 
+          // ── DIAGNOSTIC: SDF output quality check ─────────────────────────
+        try {
+          const narrowBandPx  = sdfResult.meta?.narrowBandPixels ?? 0;
+          const seedCount     = sdfResult.diskSeeds?.length ?? 0;
+          const sdfRange      = sdfResult.meta?.sdfRange ?? [null, null];
+          const sentinelMin   = sdfRange[0] > 1e8;  // uninitialized sentinel
+          const sentinelMax   = sdfRange[1] > 1e8;
+          const isDegenerate  = narrowBandPx === 0 || seedCount === 0 || sentinelMin || sentinelMax;
+
+          console.log('[DIAG-SDF-OUTPUT] PackingSDF result quality:', {
+            narrowBandPixels: narrowBandPx,
+            seedCount,
+            sdfRangeMin:      sdfRange[0],
+            sdfRangeMax:      sdfRange[1],
+            hasSentinelValues: sentinelMin || sentinelMax,
+            isDegenerate,
+            verdict: isDegenerate
+              ? '❌ DEGENERATE SDF — minimizer will receive empty constraint system'
+              : '✅ SDF looks valid'
+          });
+
+          if (isDegenerate) {
+            // Sample the signedSdf buffer directly to see what PackingSDF produced
+            if (sdfResult.signedSdf) {
+              let sMin = Infinity, sMax = -Infinity;
+              const s = sdfResult.signedSdf;
+              const stride = Math.max(1, Math.floor(s.length / 5000));
+              for (let i = 0; i < s.length; i += stride) {
+                if (s[i] < sMin) sMin = s[i];
+                if (s[i] > sMax) sMax = s[i];
+              }
+              console.log('[DIAG-SDF-OUTPUT] signedSdf buffer range:', {
+                min:    sMin,
+                max:    sMax,
+                first5: Array.from(s.slice(0, 5))
+              });
+            }
+          }
+        } catch (diagErr) {
+          console.warn('[DIAG-SDF-OUTPUT] Output check failed:', diagErr.message);
+        }
+        // ── END DIAGNOSTIC ────────────────────────────────────────────────
+
       } catch (sdfErr) {
         console.warn('[STAGE2-SDF] compute() failed (non-fatal):', sdfErr.message);
         telemetry.warnings.push(`packingSDF: ${sdfErr.message}`);
@@ -4073,17 +4134,30 @@ console.log('[STAGE4] Final calibData state before depth computation:', {
 
       if (sdfResult) {
 
-        // ── Persist sdf_field ──────────────────────────────────────────────
+        // ── Persist sdf_field (scalar metadata only) ───────────────────────
+        // signedSdf, narrowBandMask, densityMap, surfaceMask are NOT written
+        // to IDB — they are passed inline in the RECON_DONE payload (sdfInline).
+        // This eliminates a ~13MB sequential IDB write that caused 900s+ stalls.
+        //
+        // What IS persisted: scalar metadata only (ranges, counts, policy params)
+        // for durability/debugging. This record has a metaKey that downstream
+        // code can use to check whether Stage 2 ran, but contains no TypedArrays.
+        //
+        // Consumers (topology.worker, minimizer.worker) receive the actual arrays
+        // via msg.sdfInline — no getArtifact call needed for these fields.
         try {
           sdfFieldArtResult = await _persistAndPin(
             storageWrapper,
             {
               type: 'sdf_field',
               data: {
-                signedSdf:      sdfResult.signedSdf,
-                narrowBandMask: sdfResult.narrowBandMask,
-                densityMap:     sdfResult.densityMap,
-                surfaceMask:    sdfResult.surfaceMask
+                // Scalar summary only — no TypedArrays
+                sdfRange:         sdfResult.meta?.sdfRange         ?? null,
+                narrowBandPixels: sdfResult.meta?.narrowBandPixels ?? null,
+                seedCount:        sdfResult.diskSeeds?.length      ?? 0,
+                modalBreakdown:   sdfResult.meta?.modalBreakdown   ?? null,
+                // Flag so consumers know the real data is inline, not here
+                dataInline:       true
               },
               meta: {
                 sourceMetaKey:   metaKey,
@@ -4101,9 +4175,14 @@ console.log('[STAGE4] Final calibData state before depth computation:', {
             },
             { owner: 'motion.worker', ttlMs: ARTIFACT_PIN_TTL_MS, pinType: 'soft' }
           );
-          console.log('[PERSIST] sdf_field:', sdfFieldArtResult?.metaKey?.slice(0, 32));
+          console.log('[PERSIST] ✓ sdf_field (scalar metadata only, arrays are inline):', {
+            metaKey:          sdfFieldArtResult?.metaKey?.slice(0, 32),
+            narrowBandPixels: sdfResult.meta?.narrowBandPixels ?? 0,
+            seedCount:        sdfResult.diskSeeds?.length ?? 0,
+            sdfRange:         sdfResult.meta?.sdfRange ?? null
+          });
         } catch (e) {
-          console.warn('[PERSIST] sdf_field failed (non-fatal):', e.message);
+          console.warn('[PERSIST] ✗ sdf_field scalar metadata failed (non-fatal):', e.message);
         }
 
         // ── Persist disk_seeds ─────────────────────────────────────────────
@@ -4235,21 +4314,50 @@ console.log('[STAGE4] Final calibData state before depth computation:', {
     // ── STAGE 4: DifferentialGeometry ────────────────────────────────────────
     let diffGeoResult = null;
 
-    if (sdfFieldArtResult?.metaKey && normalResult?.metaKey) {
+    if (sdfFieldArtResult?.metaKey && normalMap?.data) {
       console.log('[CHECKPOINT] Stage 4 — starting DifferentialGeometry.compute()');
+      // Diagnose seed format so we can normalize correctly for DG
+      if (sdfResult?.diskSeeds?.length > 0) {
+        const s0 = sdfResult.diskSeeds[0];
+        console.log('[DG-SEED-FORMAT] First seed keys:', Object.keys(s0 ?? {}));
+        console.log('[DG-SEED-FORMAT] First seed values:', JSON.stringify(s0));
+      }
       try {
-      const dg = _getDifferentialGeometry();           // no storageWrapper — singleton holds only flags
+      const dg = _getDifferentialGeometry();
       diffGeoResult = await dg.compute({
-        storageWrapper,                                // ← fresh per-job, no stale reference
-        sdfFieldKey:  sdfFieldArtResult.metaKey,
-        diskSeedsKey: diskSeedsResult?.metaKey ?? null,
-        normalMapKey: normalResult.metaKey,
-        flowFieldKey: flowFieldResult?.metaKey ?? null,
-        fluxFieldKey: fluxResult?.metaKey      ?? null,
+        storageWrapper,
+        sdfFieldKey:   sdfFieldArtResult?.metaKey  ?? null,
+        diskSeedsKey:  diskSeedsResult?.metaKey    ?? null,
+        normalMapKey:  null,
+        flowFieldKey:  flowFieldResult?.metaKey    ?? null,
+        fluxFieldKey:  null,
+        // Pass flow inline — avoids the IDB round-trip that sdfInline/normalInline
+        // already eliminated. flowFieldKey is kept as a durability fallback.
+        flowInline: flowField
+          ? { u: flowField.u, v: flowField.v }
+          : null,
         sourceMetaKey: metaKey,
         cameraId,
-        resolution:   chosenRes,
-        samplingContext: stage1SamplingContext
+        resolution:    chosenRes,
+        samplingContext: stage1SamplingContext,
+        sdfInline: sdfResult ? {
+          signedSdf:      sdfResult.signedSdf,
+          narrowBandMask: sdfResult.narrowBandMask
+        } : null,
+        normalInline: normalMap ? {
+          field:      normalMap.data,
+          resolution: normalMap.resolution
+        } : null,
+        fluxInline: fluxData ? {
+          A_coo: fluxData.A_coo ?? null
+        } : null,
+        diskSeedsInline: sdfResult?.diskSeeds?.length > 0
+          ? sdfResult.diskSeeds.map(s => ({
+              x: s.xNorm,
+              y: s.yNorm,
+              r: s.radius ?? 0
+            }))
+          : null
       });
 
         // Broadcast DIFFGEO_DONE on BroadcastChannel
@@ -4338,96 +4446,100 @@ console.log('[STAGE4] Final calibData state before depth computation:', {
     // ========================================
     // STAGE 9: Persist telemetry artifact
     // ========================================
-    console.log('[CHECKPOINT] Stage 9 — persisting telemetry');
-    try {
-      const telemetryPayload = {
-        jobId,
-        metaKey,
-        cameraId:        cameraId,
-        cameraContainer: cameraContainer || undefined,
-        priority:        options.priority || 50,
-        resolution:      options.resolution,
+    console.log('[CHECKPOINT] Stage 9 — persisting telemetry (fire-and-forget)');
+    // Not awaited — telemetry is debug-only, no downstream consumer reads it.
+    // Removing the await lets RECON_DONE broadcast immediately after Stage 10.
+    (async () => {
+      try {
+        const telemetryPayload = {
+          jobId,
+          metaKey,
+          cameraId:        cameraId,
+          cameraContainer: cameraContainer || undefined,
+          priority:        options.priority || 50,
+          resolution:      options.resolution,
 
-        // Stage 0
-        reconstructionResolution: depthMap ? depthMap.resolution : (options.resolution || null),
-        effectiveWindowMs:        _effectiveWindowMs,
+          // Stage 0
+          reconstructionResolution: depthMap ? depthMap.resolution : (options.resolution || null),
+          effectiveWindowMs:        _effectiveWindowMs,
 
-        // Stage 1
-        stage1: {
-          directnessKey:   directnessResult?.metaKey    ?? null,
-          modalKey:        modalResult?.metaKey          ?? null,
-          penumbraKey:     penumbraArtResult?.metaKey    ?? null,
-          fMapRoute:       fMapFinal?.route              ?? null,
-          fMapNSamples:    fMapFinal?.N_samples          ?? 0,
-          lightCount:      penumbraResult?.telemetry?.lightCount  ?? 0,
-          edgeCount:       penumbraResult?.telemetry?.edgeCount   ?? 0,
-          meanWidth:       penumbraResult?.telemetry?.meanWidth   ?? null,
-          meanKappa:       doaModalResult?.telemetry?.meanKappa   ?? null,
-          samplingContext: stage1SamplingContext
-        },
+          // Stage 1
+          stage1: {
+            directnessKey:   directnessResult?.metaKey    ?? null,
+            modalKey:        modalResult?.metaKey          ?? null,
+            penumbraKey:     penumbraArtResult?.metaKey    ?? null,
+            fMapRoute:       fMapFinal?.route              ?? null,
+            fMapNSamples:    fMapFinal?.N_samples          ?? 0,
+            lightCount:      penumbraResult?.telemetry?.lightCount  ?? 0,
+            edgeCount:       penumbraResult?.telemetry?.edgeCount   ?? 0,
+            meanWidth:       penumbraResult?.telemetry?.meanWidth   ?? null,
+            meanKappa:       doaModalResult?.telemetry?.meanKappa   ?? null,
+            samplingContext: stage1SamplingContext
+          },
 
-        // Stage 2
-        stage2: {
-          sdfFieldKey:    sdfFieldArtResult?.metaKey  ?? null,
-          diskSeedsKey:   diskSeedsResult?.metaKey    ?? null,
-          sdfDiagsKey:    sdfDiagsResult?.metaKey     ?? null,
-          seedCount:      sdfResult?.diskSeeds?.length ?? 0,
-          narrowBandPx:   sdfResult?.meta?.narrowBandPixels ?? null,
-          sdfRange:       sdfResult?.meta?.sdfRange         ?? null,
-          modalBreakdown: sdfResult?.meta?.modalBreakdown   ?? null,
-          umbraPolicy:    _flags.packingUmbraPolicy          ?? 'half-weight',
-          timings:        sdfResult?.meta?.timings           ?? null
-        },
+          // Stage 2
+          stage2: {
+            sdfFieldKey:    sdfFieldArtResult?.metaKey  ?? null,
+            diskSeedsKey:   diskSeedsResult?.metaKey    ?? null,
+            sdfDiagsKey:    sdfDiagsResult?.metaKey     ?? null,
+            seedCount:      sdfResult?.diskSeeds?.length ?? 0,
+            narrowBandPx:   sdfResult?.meta?.narrowBandPixels ?? null,
+            sdfRange:       sdfResult?.meta?.sdfRange         ?? null,
+            modalBreakdown: sdfResult?.meta?.modalBreakdown   ?? null,
+            umbraPolicy:    _flags.packingUmbraPolicy          ?? 'half-weight',
+            timings:        sdfResult?.meta?.timings           ?? null
+          },
 
-        // Stage 3 prerequisite
-        stage3: {
-          flowFieldKey:   flowFieldResult?.metaKey   ?? null,
-          method:         'horn_schunck',
-          alpha:          _flags.opticalFlowAlpha      ?? 1.0,
-          iterations:     _flags.opticalFlowIterations ?? 30
-        },
+          // Stage 3 prerequisite
+          stage3: {
+            flowFieldKey:   flowFieldResult?.metaKey   ?? null,
+            method:         'horn_schunck',
+            alpha:          _flags.opticalFlowAlpha      ?? 1.0,
+            iterations:     _flags.opticalFlowIterations ?? 30
+          },
 
-        // Stage 4
-        stage4: {
-          curvatureKey:      diffGeoResult?.curvatureKey      ?? null,
-          principalFrameKey: diffGeoResult?.principalFrameKey ?? null,
-          sdfDivKey:         diffGeoResult?.sdfDivKey         ?? null,
-          sdfCurlKey:        diffGeoResult?.sdfCurlKey        ?? null,
-          normalCurlKey:     diffGeoResult?.normalCurlKey     ?? null,
-          flowDivKey:        diffGeoResult?.flowDivKey        ?? null,
-          flowCurlKey:       diffGeoResult?.flowCurlKey       ?? null,
-          overhangCurlKey:   diffGeoResult?.overhangCurlKey   ?? null
-        },        
+          // Stage 4
+          stage4: {
+            curvatureKey:      diffGeoResult?.curvatureKey      ?? null,
+            principalFrameKey: diffGeoResult?.principalFrameKey ?? null,
+            sdfDivKey:         diffGeoResult?.sdfDivKey         ?? null,
+            sdfCurlKey:        diffGeoResult?.sdfCurlKey        ?? null,
+            normalCurlKey:     diffGeoResult?.normalCurlKey     ?? null,
+            flowDivKey:        diffGeoResult?.flowDivKey        ?? null,
+            flowCurlKey:       diffGeoResult?.flowCurlKey       ?? null,
+            overhangCurlKey:   diffGeoResult?.overhangCurlKey   ?? null
+          },
 
-        stages:               telemetry.stages,
-        modules:              telemetry.modules,
-        processingMs:         processingMs,
-        estimatedMemoryBytes: telemetry.estimatedMemoryBytes || null,
-        depthStats:           depthMap ? { min: depthMap.min, max: depthMap.max } : null,
-        depthFallback:        !!(depthMap && depthMap.fallback),
-        fluxPoints:           fluxData ? (fluxData.sampleSummary?.points || null) : null,
-        flags:                _flags,
-        errors:               telemetry.errors   || [],
-        warnings:             telemetry.warnings || []
-      };
+          stages:               telemetry.stages,
+          modules:              telemetry.modules,
+          processingMs:         processingMs,
+          estimatedMemoryBytes: telemetry.estimatedMemoryBytes || null,
+          depthStats:           depthMap ? { min: depthMap.min, max: depthMap.max } : null,
+          depthFallback:        !!(depthMap && depthMap.fallback),
+          fluxPoints:           fluxData ? (fluxData.sampleSummary?.points || null) : null,
+          flags:                _flags,
+          errors:               telemetry.errors   || [],
+          warnings:             telemetry.warnings || []
+        };
 
-      const telemetryRes = await _persistArtifact(storageWrapper, null, telemetryPayload, {
-        type: 'recon_telemetry',
-        sourceMetaKey: metaKey,
-        jobId
-      });
-
-      if (telemetryRes && telemetryRes.metaKey) {
-        _bcPost({
-          event: 'artifact:ready',
-          msgId: generateMsgId(),
-          metaKey: telemetryRes.metaKey,
-          meta: { type: 'recon_telemetry', jobId }
+        const telemetryRes = await _persistArtifact(storageWrapper, null, telemetryPayload, {
+          type: 'recon_telemetry',
+          sourceMetaKey: metaKey,
+          jobId
         });
+
+        if (telemetryRes && telemetryRes.metaKey) {
+          _bcPost({
+            event: 'artifact:ready',
+            msgId: generateMsgId(),
+            metaKey: telemetryRes.metaKey,
+            meta: { type: 'recon_telemetry', jobId }
+          });
+        }
+      } catch (tErr) {
+        console.warn('motion.worker: telemetry persistence failed', tErr);
       }
-    } catch (tErr) {
-      console.warn('motion.worker: telemetry persistence failed', tErr);
-    }
+    })();
 
     // ========================================
     // STAGE 10: Verify Ownership & Mark Done
@@ -4481,6 +4593,29 @@ console.log('[STAGE4] Final calibData state before depth computation:', {
     // ========================================
     // STAGE 12: Reply & Broadcast RECON_DONE
     // ========================================
+
+    // ── Precompute cosThetaSoc before building replyPayload ───────────────
+    // fluxData.SOCs is an array of up to 1M+ objects. Structured-cloning 1M
+    // objects via _bcPost(replyPayload) allocates 50–200MB extra and kills
+    // the renderer process (OOM). cosThetaSoc (4MB Float32Array) carries
+    // exactly the same per-pixel information.
+    let _cosThetaSoc = null;
+    if (fluxData?.SOCs?.length > 0) {
+      const _pxN = chosenRes * chosenRes;
+      _cosThetaSoc = new Float32Array(_pxN); // default 0 = 90° contact angle
+      for (const soc of fluxData.SOCs) {
+        const px = soc.pixelIdx;
+        if (typeof px === 'number' && px >= 0 && px < _pxN) {
+          _cosThetaSoc[px] = Math.cos(soc.halfAngle ?? 0);
+        }
+      }
+      console.log('[FLUX] cosThetaSoc precomputed from SOCs:', {
+        pixelCount:  _pxN,
+        socCount:    fluxData.SOCs.length,
+        nonZeroApprox: fluxData.SOCs.length
+      });
+    }
+
     const replyPayload = {
       event:    'RECON_DONE',
       msgId:    generateMsgId(),
@@ -4494,21 +4629,42 @@ console.log('[STAGE4] Final calibData state before depth computation:', {
       reconstructionResolution: depthMap ? depthMap.resolution : (options.resolution || null),
       effectiveWindowMs:        _effectiveWindowMs,
 
-      // Stage 1 keys + summary
+      // Stage 1 keys — null because these are passed inline, not via IDB
       stage1: {
-        directnessKey: directnessResult?.metaKey    ?? null,
-        modalKey:      modalResult?.metaKey          ?? null,
-        penumbraKey:   penumbraArtResult?.metaKey    ?? null,
+        directnessKey: null,
+        modalKey:      null,
+        penumbraKey:   null,
         fMapRoute:     fMapFinal?.route              ?? null,
         lightCount:    penumbraResult?.telemetry?.lightCount ?? 0,
         edgeCount:     penumbraResult?.telemetry?.edgeCount  ?? 0,
         meanWidth:     penumbraResult?.telemetry?.meanWidth  ?? null
       },
 
+      // Stage 1 inline data — transferred directly to avoid IDB serialization.
+      // main.js forwards each field to the consumer worker that needs it.
+      // TypedArrays are structured-cloned here (one copy); main.js then
+      // transfers ownership to the consumer (zero additional copy).
+      stage1Inline: {
+        fMapFinal: fMapFinal ? {
+          fMap:        fMapFinal.fMap,        // Float32Array res²
+          directness:  fMapFinal.directness,  // Float32Array res²
+          modalLabels: fMapFinal.modalLabels, // Uint8Array   res²
+          route:       fMapFinal.route,
+          N_samples:   fMapFinal.N_samples
+        } : null,
+        doaModal: null, // 6×4MB Float32Arrays — no consumer in topology/minimizer/ambi
+        penumbra: penumbraResult ? {
+          widthMap:   penumbraResult.widthMap,   // Float32Array res²
+          edgeMask:   penumbraResult.edgeMask,   // Uint8Array   res²
+          lightTrack: penumbraResult.lightTrack, // small array of light positions
+          telemetry:  penumbraResult.telemetry
+        } : null
+      },
+
       // Stage 2 keys + summary.
-      // main.js RECON_DONE handler should write sdfFieldKey and diskSeedsKey
-      // onto cameraContainer so Stage 3 (DifferentialGeometry) and Stage 4B
-      // (ConstrainedMinimizer) can look up their inputs without a storage query.
+      // sdfFieldKey points to the scalar-metadata-only IDB record (no arrays).
+      // Actual SDF arrays travel in sdfInline below.
+      // diskSeedsKey points to the full binary seeds artifact in IDB (small, kept).
       stage2: {
         sdfFieldKey:  sdfFieldArtResult?.metaKey ?? null,
         diskSeedsKey: diskSeedsResult?.metaKey   ?? null,
@@ -4516,13 +4672,48 @@ console.log('[STAGE4] Final calibData state before depth computation:', {
         sdfRange:     sdfResult?.meta?.sdfRange   ?? null
       },
 
+      // Disk seeds for minimizer.worker — normalized {x,y,r} in [0,1].
+      // Eliminates the IDB read inside minimizer.worker for disk_seeds.
+      // Seeds are tiny (~35 objects × ~24 bytes = <1KB), negligible clone cost.
+      diskSeedsForMinimizer: sdfResult?.diskSeeds?.length > 0
+        ? sdfResult.diskSeeds.map(s => ({
+            x: s.xNorm,
+            y: s.yNorm,
+            r: s.radius ?? 0
+          }))
+        : null,
+
+      // ── sdfInline: SDF TypedArrays transferred directly, no IDB round-trip ──
+      // signedSdf + narrowBandMask: consumed by topology.worker and minimizer.worker.
+      // densityMap + surfaceMask:   no confirmed consumer yet — included so
+      //   cameraContainer.sdfInline has the full picture for future consumers.
+      //   If a future stage needs them, main.js already has them in cc.sdfInline
+      //   and can forward without any IDB read.
+      //
+      // All four fields are excluded from IDB to eliminate the ~13MB write stall.
+      // Any consumer that needs them reads from msg.sdfInline (worker dispatch) or
+      // cc.sdfInline (cameraContainer lookup in main.js).
+      sdfInline: sdfResult ? {
+        signedSdf:      sdfResult.signedSdf,
+        narrowBandMask: sdfResult.narrowBandMask
+        // densityMap and surfaceMask: no confirmed consumer
+      } : null,
+
+      // normal_map inline — xyz-float32 normals forwarded directly.
+      // DifferentialGeometry and topology.worker read from msg.normalInline.
+      // No IDB write — eliminates the 12MB sequential serialization stall.
+      // normalInline removed from BC payload — DG consumed it and produced
+      // dgInline.normalCurl. No downstream worker reads normalInline.field.
+      // The 12MB Float32Array was cloned 3+ times for no purpose.
+      normalInline: null,
+
       // Stage 3 prerequisite
       stage3: {
         flowFieldKey:         flowFieldResult?.metaKey            ?? null,
         directionalFieldKey:  directionalFieldArtResult?.metaKey  ?? null
       },
 
-      // Stage 4 — consumers write these to cameraContainer.differentialGeometry
+      // Stage 4 — IDB keys (persisted for durability)
       stage4: {
         curvatureKey:      diffGeoResult?.curvatureKey      ?? null,
         principalFrameKey: diffGeoResult?.principalFrameKey ?? null,
@@ -4534,10 +4725,56 @@ console.log('[STAGE4] Final calibData state before depth computation:', {
         overhangCurlKey:   diffGeoResult?.overhangCurlKey   ?? null
       },
 
-      // Flux field key — hoisted to top-level so main.js can write it onto
-      // cameraContainer directly. minimizer.worker (Stage 4B) and ambi.worker
-      // (Stage 5) both read cc.fluxFieldKey for SOC extraction.
-      fluxFieldKey: fluxResult?.metaKey ?? null,
+      // ── dgInline: DG arrays forwarded directly, no IDB round-trip ─────
+      // kH consumed by topology, minimizer, ambi.
+      // principalE1/E2 consumed by ambi only.
+      // normalCurl, flowCurl, flowDiv consumed by topology only.
+      // All are structured-cloned on postMessage — each consumer gets
+      // its own independent copy, no ownership conflict.
+      dgInline: diffGeoResult?.dgInline ? {
+        kH:          diffGeoResult.dgInline.kH,
+        principalE1: diffGeoResult.dgInline.principalE1,
+        principalE2: diffGeoResult.dgInline.principalE2,
+        normalCurl:  diffGeoResult.dgInline.normalCurl  ?? null,
+        flowCurl:    diffGeoResult.dgInline.flowCurl    ?? null,
+        flowDiv:     diffGeoResult.dgInline.flowDiv     ?? null
+      } : null,
+
+      // fluxFieldKey is null — flux_field is entirely bypassed for IDB.
+      fluxFieldKey: null,
+
+      // ── fluxInline: complete flux_field data, no IDB involved ─────────────
+      // Components:
+      //   A_coo        — sparse constraint matrix (COO format) — used by extractSOCs()
+      //   A_csr        — sparse constraint matrix (CSR format) — used by solver
+      //   b            — right-hand side vector
+      //   cosThetaSoc  — Float32Array res² replacing SOCs (1M objects → 4MB TypedArray)
+      //   groups       — constraint group assignments
+      //   supports     — support region masks
+      //   init_h       — warm-start vector (Float32Array)
+      //   diagnostics  — solver telemetry
+      //   solverReady  — flag indicating constraint system is valid
+      //
+      // SOCs deliberately excluded: 1M JavaScript objects × structured-clone overhead
+      // = 50–200MB extra allocation → OOM renderer crash. cosThetaSoc carries the
+      // same per-pixel cos(halfAngle) data as a 4MB Float32Array.
+      // init_h forced to Float32Array: plain JS arrays of 1M numbers are also
+      // expensive to clone (~32MB vs 4MB for TypedArray).
+      fluxInline: fluxData ? {
+        A_coo:       fluxData.A_coo        ?? null,
+        A_csr:       fluxData.A_csr        ?? null,
+        b:           fluxData.b            ?? null,
+        SOCs:        null,          // removed — replaced by cosThetaSoc below
+        cosThetaSoc: _cosThetaSoc,  // Float32Array res² — cos(halfAngle) per pixel
+        groups:      fluxData.groups       ?? null,
+        supports:    fluxData.supports     ?? null,
+        init_h:      fluxData.init_h instanceof Float32Array
+                       ? fluxData.init_h
+                       : (fluxData.init_h ? new Float32Array(fluxData.init_h) : null),
+        diagnostics:  fluxData.diagnostics  ?? null,
+        solverReady:  fluxData.solverReady  ?? false,
+        sampleSummary: fluxData.sampleSummary ?? null
+      } : null,
 
       telemetry: {
         processingMs,
@@ -4555,17 +4792,51 @@ console.log('[STAGE4] Final calibData state before depth computation:', {
     };
 
     console.log('[CHECKPOINT] Stage 12 — broadcasting RECON_DONE');
-    self.postMessage(replyPayload);
 
-    _bcPost({
-      event:        'RECON_DONE',
-      msgId:        generateMsgId(),
-      metaKey,
-      derivedKeys,
-      fluxFieldKey: fluxResult?.metaKey ?? null,
-      producer:     'motion.worker',
-      timestamp:    Date.now()
+    // ── Traceability log before RECON_DONE dispatch ────────────────────────
+    console.log('[RECON_DONE] Broadcasting payload summary:', {
+      // sdfInline
+      hasSdfInline:         !!replyPayload.sdfInline,
+      signedSdfLength:      replyPayload.sdfInline?.signedSdf?.length      ?? 0,
+      narrowBandMaskLength: replyPayload.sdfInline?.narrowBandMask?.length ?? 0,
+      densityMapLength:     replyPayload.sdfInline?.densityMap?.length     ?? 0,
+      surfaceMaskLength:    replyPayload.sdfInline?.surfaceMask?.length    ?? 0,
+      // fluxInline — now carries full flux_field, not just A_coo
+      hasFluxInline:        !!replyPayload.fluxInline,
+      fluxHasACoo:          !!replyPayload.fluxInline?.A_coo,
+      fluxHasAcsr:          !!replyPayload.fluxInline?.A_csr,
+      fluxHasSOCs:          !!replyPayload.fluxInline?.SOCs,
+      fluxHasInitH:         !!replyPayload.fluxInline?.init_h,
+      fluxSolverReady:      replyPayload.fluxInline?.solverReady ?? false,
+      acoRowLength:         replyPayload.fluxInline?.A_coo?.row?.length    ?? 0,
+      // stage1Inline
+      hasStage1Inline:      !!replyPayload.stage1Inline,
+      // normalInline
+      hasNormalInline:      !!replyPayload.normalInline,
+      normalFieldLength:    replyPayload.normalInline?.field?.length ?? 0,
+      // dgInline
+      hasDgInline:          !!replyPayload.dgInline,
+      hasKH:                !!replyPayload.dgInline?.kH,
+      hasPrincipalE1:       !!replyPayload.dgInline?.principalE1,
+      kHLength:             replyPayload.dgInline?.kH?.length ?? 0,
+      // IDB keys — flux is null (inline), sdf is scalar only
+      sdfFieldKey:          replyPayload.stage2?.sdfFieldKey               ?? null,
+      diskSeedsKey:         replyPayload.stage2?.diskSeedsKey              ?? null,
+      fluxFieldKey:         null,
+      derivedKeyCount:      replyPayload.derivedKeys?.length               ?? 0
     });
+
+    // MotionWorkerWrapper only needs job metadata — strip the inline arrays.
+    // Sending the full replyPayload here clones ~140MB that is immediately discarded.
+    self.postMessage({
+      event:       'RECON_DONE',
+      msgId:       replyPayload.msgId,
+      jobId:       replyPayload.jobId,
+      metaKey:     replyPayload.metaKey,
+      derivedKeys: replyPayload.derivedKeys,
+      cached:      false
+    });
+    _bcPost(replyPayload);
 
   } catch (err) {
     const se = safeErrSummary(err);

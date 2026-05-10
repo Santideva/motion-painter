@@ -106,10 +106,13 @@ export class DifferentialGeometry {
    * }>}
    */
     async compute({
-    storageWrapper,                          // ← required: fresh per-job, no stale singleton
+    storageWrapper,
     sdfFieldKey, diskSeedsKey = null, normalMapKey,
     flowFieldKey = null, fluxFieldKey = null,
-    sourceMetaKey, cameraId, resolution, samplingContext = null
+    sourceMetaKey, cameraId, resolution, samplingContext = null,
+    sdfInline = null, normalInline = null, fluxInline = null,
+    diskSeedsInline = null,
+    flowInline = null
   }) {
     const t0    = performance.now();
     const w     = resolution;
@@ -121,38 +124,78 @@ export class DifferentialGeometry {
     // ── Load inputs ──────────────────────────────────────────────────────────
     tel.stages.load_start = performance.now();
 
-    const sdfArt  = await sw.getArtifact(sdfFieldKey,  { denormalize: true });
-    if (!sdfArt?.data?.signedSdf) {
-      throw new Error(`DifferentialGeometry: sdf_field missing signedSdf (key: ${sdfFieldKey})`);
+    // ── Load SDF — prefer inline data, fall back to IDB ───────────────────
+    let signedSdf, narrowBandMask, sdfArt = null;
+    if (sdfInline?.signedSdf) {
+      console.log('[DG] using sdfInline — bypassing IDB read for sdf_field');
+      signedSdf      = sdfInline.signedSdf;
+      narrowBandMask = sdfInline.narrowBandMask ?? null;
+      // sdfArt remains null — references to sdfArt.meta below use ?. safely
+    } else {
+      sdfArt = await sw.getArtifact(sdfFieldKey, { denormalize: true });
+      if (!sdfArt?.data?.signedSdf) {
+        throw new Error(`DifferentialGeometry: sdf_field missing signedSdf (key: ${sdfFieldKey})`);
+      }
+      signedSdf      = sdfArt.data.signedSdf;
+      narrowBandMask = sdfArt.data.narrowBandMask ?? null;
     }
-    const signedSdf      = sdfArt.data.signedSdf;
-    const narrowBandMask = sdfArt.data.narrowBandMask ?? null;
 
-    const normArt = await sw.getArtifact(normalMapKey, { denormalize: true });
-    if (!normArt?.data?.field) {
-      throw new Error(`DifferentialGeometry: normal_map missing field (key: ${normalMapKey})`);
+    // ── Load normal map — prefer inline data, fall back to IDB ───────────
+    let normalData;
+    if (normalInline?.field) {
+      console.log('[DG] using normalInline — bypassing IDB read for normal_map');
+      normalData = normalInline.field;
+    } else {
+      const normArt = await sw.getArtifact(normalMapKey, { denormalize: true });
+      if (!normArt?.data?.field) {
+        throw new Error(`DifferentialGeometry: normal_map missing field (key: ${normalMapKey})`);
+      }
+      normalData = normArt.data.field;
     }
-    const normalData = normArt.data.field;   // Float32Array res²×4
 
-    // disk_seeds: Stage 2 collocation points for RBF-FD curvature estimation
+    // disk_seeds: Stage 2 collocation points for RBF-FD curvature estimation.
+    // Prefer inline data (passed directly from motion.worker, bypasses IDB).
+    // Fall back to IDB load only when inline data is absent.
     let diskSeeds = null;
-    if (diskSeedsKey) {
+    if (diskSeedsInline?.length > 0) {
+      // Filter to seeds with valid finite [0,1] coordinates — prevents
+      // _buildKNNGrid from crashing on NaN bucket indices if any seed
+      // has undefined x/y (e.g. wrong property names in normalization).
+      diskSeeds = diskSeedsInline.filter(s =>
+        typeof s?.x === 'number' && typeof s?.y === 'number' &&
+        isFinite(s.x) && isFinite(s.y) &&
+        s.x >= 0 && s.x <= 1 && s.y >= 0 && s.y <= 1
+      );
+      const filtered = diskSeedsInline.length - diskSeeds.length;
+      if (filtered > 0) {
+        console.warn(`[DG] diskSeedsInline: filtered ${filtered} seeds with invalid coordinates`);
+      }
+      tel.stages.seedCount = diskSeeds.length;
+      console.log(`[DG] disk_seeds inline — ${diskSeeds.length} valid seeds, bypassing IDB read`);
+      if (diskSeeds.length === 0) diskSeeds = null; // all invalid — fall through to IDB
+    }
+    if (!diskSeeds && diskSeedsKey) {
       try {
         const seedArt = await sw.getArtifact(diskSeedsKey, { denormalize: true });
         if (seedArt?.data?.header && seedArt?.data?.payload) {
           diskSeeds = PackingSDF.deserialize(seedArt.data.header, seedArt.data.payload);
           tel.stages.seedCount = diskSeeds?.length ?? 0;
-          console.log(`[DG] loaded ${tel.stages.seedCount} disk seeds`);
+          console.log(`[DG] loaded ${tel.stages.seedCount} disk seeds from IDB`);
         }
       } catch (e) {
         tel.warnings.push(`disk_seeds load failed: ${e.message} — falling back to FD`);
         diskSeeds = null;
       }
-    }    
+    } 
 
-    // Optional: optical flow
+    // Optional: optical flow — prefer inline data, fall back to IDB key.
+    // Inline path eliminates the IDB round-trip; consistent with sdfInline/normalInline.
     let flowU = null, flowV = null;
-    if (flowFieldKey) {
+    if (flowInline?.u) {
+      console.log('[DG] using flowInline — bypassing IDB read for flow_field');
+      flowU = flowInline.u;
+      flowV = flowInline.v;
+    } else if (flowFieldKey) {
       try {
         const flowArt = await sw.getArtifact(flowFieldKey, { denormalize: true });
         flowU = flowArt?.data?.u ?? null;
@@ -162,9 +205,12 @@ export class DifferentialGeometry {
       }
     }
 
-    // Optional: flux field for overhang curl
+    // Optional: flux field for overhang curl — prefer inline, fall back to IDB
     let fluxData = null;
-    if (fluxFieldKey) {
+    if (fluxInline?.A_coo) {
+      console.log('[DG] using fluxInline — bypassing IDB read for flux_field');
+      fluxData = fluxInline;
+    } else if (fluxFieldKey) {
       try {
         const fluxArt = await sw.getArtifact(fluxFieldKey, { denormalize: true });
         fluxData = fluxArt?.data ?? null;
@@ -257,112 +303,131 @@ export class DifferentialGeometry {
     //   so motion.worker logs it as a stage failure rather than a null key
     //   silently propagating into RECON_DONE.
     // required=false (default): diagnostic / conditional outputs — null key is OK.
-    tel.stages.persist_start = performance.now();
+    // ── All DG outputs travel inline — persistence is debug-only ──────────
+    // Consumers receive kH, principalE1/E2, normalCurl, flowCurl, flowDiv
+    // directly via dgInline in RECON_DONE. No downstream worker reads these
+    // from IDB. persistMany is fire-and-forget so DG returns immediately.
 
-    const persistDescriptors = [
-      // 0
-      {
-        type:     'curvature_field',
-        data:     { kH: curvature.kH, kG: curvature.kG, k1: curvature.k1, k2: curvature.k2 },
-        meta:     { ...baseMeta, method: 'finite_differences_2d_sdf',
-                    narrowBandPx: sdfArt.meta?.narrowBandPx ?? null },
-        ttl:      TTL.PINNED,
-        pinType:  PIN.SOFT,
-        required: true
-      },
-      // 1
-      {
-        type:     'principal_frame',
-        data:     { e1: principalFrm.e1, e2: principalFrm.e2 },
-        meta:     baseMeta,
-        ttl:      TTL.PINNED,
-        pinType:  PIN.SOFT,
-        required: true
-      },
-      // 2
-      {
-        type:     'sdf_divergence',
-        data:     { divergence: sdfDivergence, narrowBandPx: sdfArt.meta?.narrowBandPx ?? null },
-        meta:     { ...baseMeta, geometryType: 'surface_level_set', curvatureMethod },
-        ttl:      TTL.PINNED,
-        pinType:  PIN.SOFT,
-        required: true
-      },
-      // 3
-      {
-        type:    'sdf_curl',
-        data:    { curl: sdfCurl },
-        meta:    { ...baseMeta, note: 'diagnostic — should be ≈0 for valid SDF' },
-        ttl:     TTL.PINNED,
-        pinType: PIN.SOFT
-      },
-      // 4
-      {
-        type:    'normal_curl',
-        data:    { curl: normalCurl },
-        meta:    { ...baseMeta, source: 'normal_map' },
-        ttl:     TTL.PINNED,
-        pinType: PIN.SOFT
-      },
-      // 5 — conditional on optical flow
-      {
-        type:    'flow_divergence',
-        data:    flowDivergence ? { divergence: flowDivergence } : null,
-        meta:    { ...baseMeta, source: 'horn_schunck' },
-        ttl:     TTL.PINNED,
-        pinType: PIN.SOFT,
-        skip:    !flowDivergence
-      },
-      // 6 — conditional on optical flow
-      {
-        type:    'flow_curl',
-        data:    flowCurl ? { curl: flowCurl } : null,
-        meta:    { ...baseMeta, source: 'horn_schunck' },
-        ttl:     TTL.PINNED,
-        pinType: PIN.SOFT,
-        skip:    !flowCurl
-      },
-      // 7 — conditional on flux field / overhang
-      {
-        type:    'overhang_curl',
-        data:    overhangCurl ? { curl: overhangCurl } : null,
-        meta:    { ...baseMeta, source: 'flux_field_soc_normals' },
-        ttl:     TTL.PINNED,
-        pinType: PIN.SOFT,
-        skip:    !overhangCurl
-      }
-    ];
-
-    const [
-      curvatureRes, principalFrameRes, sdfDivRes, sdfCurlRes,
-      normalCurlRes, flowDivRes, flowCurlRes, overhangCurlRes
-    ] = await persistMany(store, persistDescriptors);
-
-    const curvatureKey      = safeKey(curvatureRes);
-    const principalFrameKey = safeKey(principalFrameRes);
-    const sdfDivKey         = safeKey(sdfDivRes);
-    const sdfCurlKey        = safeKey(sdfCurlRes);
-    const normalCurlKey     = safeKey(normalCurlRes);
-    const flowDivKey        = safeKey(flowDivRes);
-    const flowCurlKey       = safeKey(flowCurlRes);
-    const overhangCurlKey   = safeKey(overhangCurlRes);
-
-    tel.stages.persist_ms = performance.now() - tel.stages.persist_start;
-    tel.processingMs      = performance.now() - t0;
+    tel.processingMs = performance.now() - t0;
 
     console.log(
       `[DG] computed in ${tel.processingMs.toFixed(1)}ms — ` +
       `curvature✓ principalFrame✓ sdfDiv✓ sdfCurl✓ normalCurl✓` +
-      ` flow:${!!flowDivKey} overhang:${!!overhangCurlKey}`
+      ` flow:${!!(flowCurl)} overhang:${!!(overhangCurl)}` +
+      ` — persisting async (non-blocking)`
     );
 
+    // Fire-and-forget: IDB writes happen in background after return.
+    // Keys are null — consumers use dgInline instead.
+    // Gated behind dgPersistDebug: in production the concurrent IDB writes
+    // (~11 MB of Float32Arrays) race with topology.worker and minimizer.worker
+    // reads, causing transaction contention and OOM pressure on postImageBitmap.
+    if (this._flags.dgPersistDebug) (async () => {
+      try {
+        tel.stages.persist_start = performance.now();
+
+        const persistDescriptors = [
+          // 0
+          {
+            type:     'curvature_field',
+            data:     { kH: curvature.kH, kG: curvature.kG, k1: curvature.k1, k2: curvature.k2 },
+            meta:     { ...baseMeta, method: 'finite_differences_2d_sdf',
+                        narrowBandPx: sdfArt?.meta?.narrowBandPx ?? null },
+            ttl:      TTL.PINNED,
+            pinType:  PIN.SOFT,
+            required: false   // non-blocking — consumers use dgInline
+          },
+          // 1
+          {
+            type:     'principal_frame',
+            data:     { e1: principalFrm.e1, e2: principalFrm.e2 },
+            meta:     baseMeta,
+            ttl:      TTL.PINNED,
+            pinType:  PIN.SOFT,
+            required: false
+          },
+          // 2
+          {
+            type:     'sdf_divergence',
+            data:     { divergence: sdfDivergence, narrowBandPx: sdfArt?.meta?.narrowBandPx ?? null },
+            meta:     { ...baseMeta, geometryType: 'surface_level_set', curvatureMethod },
+            ttl:      TTL.PINNED,
+            pinType:  PIN.SOFT,
+            required: false
+          },
+          // 3
+          {
+            type:    'sdf_curl',
+            data:    { curl: sdfCurl },
+            meta:    { ...baseMeta, note: 'diagnostic — should be ≈0 for valid SDF' },
+            ttl:     TTL.PINNED,
+            pinType: PIN.SOFT
+          },
+          // 4
+          {
+            type:    'normal_curl',
+            data:    { curl: normalCurl },
+            meta:    { ...baseMeta, source: 'normal_map' },
+            ttl:     TTL.PINNED,
+            pinType: PIN.SOFT
+          },
+          // 5 — conditional on optical flow
+          {
+            type:    'flow_divergence',
+            data:    flowDivergence ? { divergence: flowDivergence } : null,
+            meta:    { ...baseMeta, source: 'horn_schunck' },
+            ttl:     TTL.PINNED,
+            pinType: PIN.SOFT,
+            skip:    !flowDivergence
+          },
+          // 6 — conditional on optical flow
+          {
+            type:    'flow_curl',
+            data:    flowCurl ? { curl: flowCurl } : null,
+            meta:    { ...baseMeta, source: 'horn_schunck' },
+            ttl:     TTL.PINNED,
+            pinType: PIN.SOFT,
+            skip:    !flowCurl
+          },
+          // 7 — conditional on flux field / overhang
+          {
+            type:    'overhang_curl',
+            data:    overhangCurl ? { curl: overhangCurl } : null,
+            meta:    { ...baseMeta, source: 'flux_field_soc_normals' },
+            ttl:     TTL.PINNED,
+            pinType: PIN.SOFT,
+            skip:    !overhangCurl
+          }
+        ];
+
+        await persistMany(store, persistDescriptors);
+        tel.stages.persist_ms = performance.now() - tel.stages.persist_start;
+        console.log(`[DG] background persistence complete in ${tel.stages.persist_ms.toFixed(1)}ms`);
+      } catch (e) {
+        console.warn('[DG] background persistence failed (non-fatal):', e.message);
+      }
+    })(); // end if (this._flags.dgPersistDebug)
+
+    // Return immediately with null IDB keys — all consumers use dgInline.
     return {
-      curvatureKey, principalFrameKey,
-      sdfDivKey, sdfCurlKey,
-      normalCurlKey,
-      flowDivKey, flowCurlKey,
-      overhangCurlKey,
-      telemetry: tel
+      curvatureKey:      null,
+      principalFrameKey: null,
+      sdfDivKey:         null,
+      sdfCurlKey:        null,
+      normalCurlKey:     null,
+      flowDivKey:        null,
+      flowCurlKey:       null,
+      overhangCurlKey:   null,
+      telemetry: tel,
+      // ── Inline arrays for direct transfer to consumer workers ──────────
+      dgInline: {
+        kH:          curvature.kH,
+        principalE1: principalFrm.e1,
+        principalE2: principalFrm.e2,
+        normalCurl:  normalCurl,
+        flowCurl:    flowCurl        ?? null,
+        flowDiv:     flowDivergence  ?? null
+      }
     };
   }
 
@@ -918,6 +983,9 @@ export class DifferentialGeometry {
         if (j === i) continue;
         const dx = seeds[i].x - seeds[j].x;
         const dy = seeds[i].y - seeds[j].y;
+        // Guard: skip pairs where coordinates are NaN or undefined.
+        // NaN distances would produce a corrupted kNN graph and garbage curvature.
+        if (!isFinite(dx) || !isFinite(dy)) continue;
         dists.push({ idx: j, d2: dx*dx + dy*dy });
       }
       dists.sort((a, b) => a.d2 - b.d2);
@@ -955,6 +1023,9 @@ export class DifferentialGeometry {
     for (let s = 0; s < N; s++) {
       const bx = Math.min(bw - 1, Math.floor(seeds[s].x * bw));
       const by = Math.min(bh - 1, Math.floor(seeds[s].y * bh));
+      // Guard: NaN or out-of-range index means seed has invalid coordinates.
+      // buckets[NaN] is undefined — .push on it throws the RBF-FD crash.
+      if (!isFinite(bx) || !isFinite(by) || bx < 0 || by < 0) continue;
       buckets[by * bw + bx].push(s);
     }
 
