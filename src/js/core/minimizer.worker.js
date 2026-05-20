@@ -165,6 +165,16 @@ async function _runPhaseB(job, topoData) {
   const { jobId, metaKey, module, startMs, sw } = job;
   const store = _buildStore(sw);
 
+  console.log('[minimizer.worker] Phase B starting', {
+    jobId,
+    metaKey,
+    hasTopology:   !!topoData,
+    hasComponentMap: !!topoData?.componentMap,
+    b0:            topoData?.b0 ?? null,
+    b1:            topoData?.b1 ?? null,
+    phaseAToPhaseB: Date.now() - startMs
+  });
+
   try {
     // Apply topology data if available
     if (topoData) {
@@ -312,15 +322,32 @@ async function _runPhaseB(job, topoData) {
 if (_bc) {
   _bc.addEventListener('message', (evt) => {
     const data = evt.data;
-    if (!data) return;
+    if (!data || data.event !== 'TOPOLOGY_DONE') return;
 
-    if (data.event === 'TOPOLOGY_DONE' && _pendingJob) {
-      // Load component_map artifact then run Phase B
+    console.log('[minimizer.worker] BC: TOPOLOGY_DONE received', {
+      metaKey:           data.metaKey,
+      hasPendingJob:     !!_pendingJob,
+      pendingJobMetaKey: _pendingJob?.metaKey ?? null,
+      metaKeyMatch:      data.metaKey === _pendingJob?.metaKey,
+      hasTopoInline:     !!data.topoInline,
+      hasComponentMap:   !!data.topoInline?.componentMap,
+      receivedAt:        Date.now()
+    });
+
+    if (_pendingJob) {
+      // Phase A already done — run Phase B immediately
       _loadTopoAndRunPhaseB(data).catch(err => {
         console.error('[minimizer.worker] topology load failed:', err);
-        // Run Phase B without topology data (global λ fallback)
         if (_pendingJob) _runPhaseB(_pendingJob, null).catch(console.error);
       });
+    } else {
+      // Phase A still in progress — cache for pickup once _pendingJob is set
+      _topoData = {
+        componentMap: data.topoInline?.componentMap ?? null,
+        b0: data.topoInline?.betti?.b0 ?? data.betti?.b0 ?? 1,
+        b1: data.topoInline?.betti?.b1 ?? data.betti?.b1 ?? 0
+      };
+      console.log('[minimizer.worker] TOPOLOGY_DONE cached (Phase A still running)');
     }
   });
 }
@@ -329,18 +356,33 @@ async function _loadTopoAndRunPhaseB(topoMsg) {
   const job = _pendingJob;
   if (!job) return;
 
-  const api = await _loadStorageAPI();
+  // Fast path: componentMap travels inline — skip IDB entirely.
+  let componentMap = topoMsg.topoInline?.componentMap ?? null;
 
-  // Load component_map artifact (persisted by TopologyAnalyzer)
-  const componentMapArt = topoMsg.componentMapKey
-    ? await _loadArtifact(api, topoMsg.componentMapKey)
-    : null;
+  if (!componentMap && topoMsg.componentMapKey) {
+    // Slow path: inline absent, fall back to IDB.
+    const api = await _loadStorageAPI();
+    // Re-check: timeout may have fired and cleared _pendingJob while we awaited IDB.
+    if (_pendingJob?.jobId !== job.jobId) {
+      console.warn('[minimizer.worker] _loadTopoAndRunPhaseB: job superseded during IDB load — aborting');
+      return;
+    }
+    componentMap = (await _loadArtifact(api, topoMsg.componentMapKey))?.data?.map ?? null;
+  }
 
-  const topoData = componentMapArt
+  // Guard: if timeout already claimed the job, don't run Phase B a second time.
+  if (_pendingJob?.jobId !== job.jobId) {
+    console.warn('[minimizer.worker] _loadTopoAndRunPhaseB: job superseded before Phase B — aborting');
+    return;
+  }
+
+  const topoData = componentMap
     ? {
-        componentMap: new Int32Array(componentMapArt.data.map),
-        b0:           topoMsg.betti?.b0 ?? 1,
-        b1:           topoMsg.betti?.b1 ?? 0
+        componentMap: componentMap instanceof Int32Array
+          ? componentMap
+          : new Int32Array(componentMap),
+        b0: topoMsg.topoInline?.betti?.b0 ?? topoMsg.betti?.b0 ?? 1,
+        b1: topoMsg.topoInline?.betti?.b1 ?? topoMsg.betti?.b1 ?? 0
       }
     : null;
 
@@ -354,6 +396,23 @@ self.onmessage = async (evt) => {
 
   if (msg.op === 'init') {
     if (msg.flags) Object.assign(_flags, msg.flags);  // FIX MW-B2: was applyFlagsSnapshot
+    return;
+  }
+
+  if (msg.op === 'TOPOLOGY_DONE') {
+    if (_pendingJob) {
+      _loadTopoAndRunPhaseB(msg).catch(err => {
+        console.error('[minimizer.worker] direct topology load failed:', err);
+        if (_pendingJob) _runPhaseB(_pendingJob, null).catch(console.error);
+      });
+    } else {
+      _topoData = {
+        componentMap: msg.topoInline?.componentMap ?? null,
+        b0: msg.topoInline?.betti?.b0 ?? msg.betti?.b0 ?? 1,
+        b1: msg.topoInline?.betti?.b1 ?? msg.betti?.b1 ?? 0
+      };
+      console.log('[minimizer.worker] TOPOLOGY_DONE cached via direct message (Phase A still running)');
+    }
     return;
   }
 
@@ -515,6 +574,12 @@ self.onmessage = async (evt) => {
 
       // ── Store pending job ──────────────────────────────────────────────
       _pendingJob = { jobId, metaKey, module, startMs, sw, socPixelCount };
+      console.log('[minimizer.worker] Phase A complete — _pendingJob set', {
+        jobId,
+        metaKey,
+        phaseAMs: Date.now() - startMs,
+        setAt:    Date.now()
+      });
 
       // ── If topology data already arrived, run Phase B immediately ──────
       if (_topoData) {
@@ -525,10 +590,24 @@ self.onmessage = async (evt) => {
       // Otherwise Phase B fires when TOPOLOGY_DONE arrives via BC listener.
       // Timeout fallback ensures minimizer never stalls indefinitely.
       else {
-        const timeoutMs = 10_000;
+        // Scale wait to match topology.worker's own computation time.
+        // topology.worker caps at topoMaxResolution (default 512²) → 60s.
+        // Add 30s margin for IDB persist inside TopologyAnalyzer.
+        const _topoRes  = Math.min(artifactKeys.resolution ?? 512,
+                                   _flags.topoMaxResolution    ?? 512);
+        const timeoutMs = 60_000 * Math.pow(Math.max(_topoRes, 512) / 512, 2) + 30_000;
+        console.log(`[minimizer.worker] Waiting up to ${(timeoutMs/1000).toFixed(0)}s for TOPOLOGY_DONE (topoRes=${_topoRes})`);
         setTimeout(() => {
-          if (_pendingJob?.jobId === jobId) {
-            console.warn('[minimizer.worker] TOPOLOGY_DONE timeout — running Phase B without topology');
+          const jobMatch = _pendingJob?.jobId === jobId;
+          console.warn('[minimizer.worker] TOPOLOGY_DONE timeout fired', {
+            jobId,
+            jobMatch,
+            pendingJobId:      _pendingJob?.jobId ?? null,
+            actualElapsedMs:   Date.now() - startMs,
+            expectedTimeoutMs: timeoutMs
+          });
+          if (jobMatch) {
+            console.warn('[minimizer.worker] Running Phase B without topology');
             const job = _pendingJob;
             _runPhaseB(job, null).catch(console.error);
           }

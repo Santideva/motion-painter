@@ -3199,9 +3199,15 @@ const reapStaleRunning = async (maxRuntimeMs = 600000) => {
         
         if (cursor) {
           const record = cursor.value;
-          const runtime = now - record.startedAt;
-          
-          if (runtime > maxRuntimeMs) {
+          // Honour explicit deadline set by markReconRunning when present.
+          // Falls back to startedAt + maxRuntimeMs for legacy records without deadline.
+          // This prevents the reaper from killing a live job that markReconRunning
+          // protected with a deadline, even if startedAt is old.
+          const isStale = record.deadline
+            ? now > record.deadline
+            : (now - record.startedAt) > maxRuntimeMs;
+
+          if (isStale) {
             // Mark as failed with stale indicator
             const updated = {
               ...record,

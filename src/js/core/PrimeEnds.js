@@ -29,14 +29,16 @@ export class PrimeEnds {
   /**
    * @param {import('./PixelGraph.js').PixelGraph} G  — shared graph instance
    * @param {Float32Array} kH                         — level-set curvature res²
-   * @param {number}       resolution
+   * @param {number}       width
+   * @param {number}       height
    * @param {object}       [flags={}]
    */
-  constructor(G, kH, resolution, flags = {}) {
-    this._G          = G;
-    this._kH         = kH;
-    this._resolution = resolution;
-    this._flags      = flags;
+  constructor(G, kH, width, height, flags = {}) {
+    this._G      = G;
+    this._kH     = kH;
+    this._width  = width;
+    this._height = height;
+    this._flags  = flags;
   }
 
   // ── Public entry point ────────────────────────────────────────────────
@@ -44,7 +46,8 @@ export class PrimeEnds {
     const G     = this._G;
     const kH    = this._kH;
     const flags = this._flags;
-    const w     = this._resolution;
+    const w     = this._width;
+    const h     = this._height;
 
     // ── 1. Curvature peak detection ──────────────────────────────────────
     const curvaturePeaks = this._detectCurvaturePeaks(kH, w, G);
@@ -73,7 +76,7 @@ export class PrimeEnds {
     for (const end of ends) end.birthFrame = frameIndex;
 
     // ── 4. Full-resolution topology map ──────────────────────────────────
-    const topologyMap = this._buildTopologyMap(nodeEndMap, G, w);
+    const topologyMap = this._buildTopologyMap(nodeEndMap, G, w, h);
 
     // ── 5. Boundary parameterisation ─────────────────────────────────────
     const boundaryParam = this._buildBoundaryParam(ends, G, w);
@@ -107,7 +110,7 @@ export class PrimeEnds {
     }
 
     // ── 6. Invariant checks ───────────────────────────────────────────────
-    const invariantReport = this._checkInvariants(ends, nodeEndMap, topologyMap, G, w);
+    const invariantReport = this._checkInvariants(ends, nodeEndMap, topologyMap, G, w, h);
 
     const homologySummary = {
       b0:              G.componentCount,
@@ -143,7 +146,6 @@ export class PrimeEnds {
     const threshold = mean + sigmaF * std;
 
     // Local maxima of |kH| within narrow band (3×3 neighbourhood)
-    const h       = w;
     const peaks   = [];
     const adjPtr  = G._adjPtr;
     const adjNode = G._adjNode;
@@ -168,13 +170,18 @@ export class PrimeEnds {
   // Maps every pixel (w×h) to an end ID.
   // Narrow-band pixels: from nodeEndMap.
   // Outside narrow band: -1.
-  _buildTopologyMap(nodeEndMap, G, w) {
-    const total   = w * w;
+  _buildTopologyMap(nodeEndMap, G, width, height) {
+    const total = width * height;
     const topoMap = new Int32Array(total).fill(-1);
     const N       = G.nodeCount;
+
     for (let ni = 0; ni < N; ni++) {
-      topoMap[G.nodeToPixel(ni)] = nodeEndMap[ni];
+      const px = G.nodeToPixel(ni);
+      if (px >= 0 && px < total) {
+        topoMap[px] = nodeEndMap[ni];
+      }
     }
+
     return topoMap;
   }
 
@@ -219,9 +226,17 @@ export class PrimeEnds {
   }
 
   // ── Invariant checking ─────────────────────────────────────────────────
-  _checkInvariants(ends, nodeEndMap, topologyMap, G, w) {
+  _checkInvariants(ends, nodeEndMap, topologyMap, G, width, height) {
     const N      = G.nodeCount;
     const report = { passed: true, issues: [] };
+
+    const expectedPixels = width * height;
+    if (topologyMap.length !== expectedPixels) {
+      report.passed = false;
+      report.issues.push(
+        `topologyMap length mismatch: got ${topologyMap.length}, expected ${expectedPixels}`
+      );
+    }
 
     // 1. Angular interval sum ≈ 2π
     // (Only meaningful if ends.length > 0; boundaryParam computed separately)

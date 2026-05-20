@@ -81,6 +81,14 @@ self.onmessage = async (evt) => {
     if (jobFlags) Object.assign(_flags, jobFlags);                         // FIX Bug 3: was applyFlagsSnapshot(jobFlags)
 
     const startMs = Date.now();
+    if (self._activeTopoJobId) {
+      console.warn('[topology.worker] ⚠ CONCURRENT JOB DETECTED — previous job still running', {
+        activeJobId: self._activeTopoJobId,
+        newJobId:    jobId,
+        newMetaKey:  metaKey
+      });
+    }
+    self._activeTopoJobId = jobId;
     try {
       const api = await _loadStorageAPI();
       const sw  = _wrapStorage(api);
@@ -108,12 +116,14 @@ self.onmessage = async (evt) => {
         console.warn('[topology.worker] dgInline absent — kH/curl fields will be null');
       }
 
+    const _artifactLoadStart = Date.now();
     console.log('[topology.worker] Loading artifacts:', {
       hasSdfInline:        !!sdfInline,
       hasStage1Inline:     !!stage1Inline,
       directionalFieldKey: artifactKeys.directionalFieldKey ?? null,
       diskSeedsKey:        artifactKeys.diskSeedsKey        ?? null,
-      curvatureKey:        artifactKeys.curvatureKey        ?? null
+      curvatureKey:        artifactKeys.curvatureKey        ?? null,
+      loadStartedAt:       _artifactLoadStart
     });
 
     // sdfFieldArt is constructed from sdfInline — not loaded from IDB.
@@ -185,7 +195,8 @@ self.onmessage = async (evt) => {
       hasCurvature:        !!curvatureArt,
       hasDirectness:       !!directnessArt,
       hasPenumbra:         !!penumbraArt,
-      hasDiskSeeds:        !!diskSeedsArt
+      hasDiskSeeds:        !!diskSeedsArt,
+      artifactLoadMs:      Date.now() - _artifactLoadStart
     });
 
       // ── Validate required artifacts ──────────────────────────────────────
@@ -198,33 +209,85 @@ self.onmessage = async (evt) => {
       if (missing.length > 0) throw new Error(`Missing required artifacts: ${missing.join(', ')}`);
 
       // ── Unpack into typed arrays ──────────────────────────────────────────
-      // NOTE (Bug 7): field names below (e.g. .data.kH, .data.curl, .data.u/.v,
-      // .data.divergence) must be verified against DifferentialGeometry.js output
-      // before this worker is considered production-ready.
-      const res = artifactKeys.resolution ?? 512;
+      // Dimension resolution priority:
+      //   1. Explicit width/height in msg or artifactKeys (future non-square support)
+      //   2. artifactKeys.resolution (square grid — what main.js currently sends)
+      //   3. Derive from SDF length (sqrt(signedSdf.length)) — ground-truth fallback
+      //      that works even when main.js sends the wrong resolution value
+      //   4. Hard floor of 512
+      const _sdfDerivedRes = sdfInline?.signedSdf?.length
+        ? Math.round(Math.sqrt(sdfInline.signedSdf.length))
+        : null;
+      const _res = artifactKeys.resolution ?? _sdfDerivedRes ?? 512;
+      const sourceWidth  = msg.width  ?? artifactKeys.width  ?? _res;
+      const sourceHeight = msg.height ?? artifactKeys.height ?? _res;
+
+      // if (!Number.isFinite(sourceWidth) || !Number.isFinite(sourceHeight)) {
+      //   throw new Error(
+      //     'topology.worker: width/height are required for non-square images ' +
+      //     '(pass them in the message or artifactKeys)'
+      //   );
+      // }
+
+      // Cap topology resolution while preserving aspect ratio.
+      const TOPO_MAX_SIDE = _flags.topoMaxResolution ?? 512;
+      const scale = Math.min(1, TOPO_MAX_SIDE / Math.max(sourceWidth, sourceHeight));
+      const topoWidth  = Math.max(1, Math.round(sourceWidth  * scale));
+      const topoHeight = Math.max(1, Math.round(sourceHeight * scale));
+      // dsScale removed — _dsFlow multiplies by `scale` directly (< 1 when downsampling),
+      // which correctly shrinks pixel-space displacement vectors for the smaller grid.
+
+      // Nearest-neighbour downsample for stride-N fields.
+      // stride=1: scalar  stride=2: xy-pairs  stride=4: RGBA
+      const _dsN = (arr, stride) => {
+        if (!arr || scale === 1) return arr;
+        const out = new (arr.constructor)(topoWidth * topoHeight * stride);
+        for (let y = 0; y < topoHeight; y++) {
+          for (let x = 0; x < topoWidth; x++) {
+            const si = (Math.floor(y / scale) * sourceWidth + Math.floor(x / scale)) * stride;
+            const di = (y * topoWidth + x) * stride;
+            for (let s = 0; s < stride; s++) out[di + s] = arr[si + s];
+          }
+        }
+        return out;
+      };
+
+      // Flow vectors represent pixel-space displacements; rescale by the same factor.
+      const _dsFlow = (arr) => {
+        const d = _dsN(arr, 1);
+        if (d && scale !== 1) for (let i = 0; i < d.length; i++) d[i] *= scale;
+        return d;
+      };
 
       const artifacts = {
-        directionalField:  directionalFieldArt.data.field,
-        coherencePerPixel: directionalFieldArt.data.coherence?.perPixel   ?? null,
-        derivatives:       directionalFieldArt.data.derivatives             ?? null,
+        directionalField:  _dsN(directionalFieldArt.data.field, 4),
+        coherencePerPixel: _dsN(directionalFieldArt.data.coherence?.perPixel ?? null, 1),
+        derivatives:       directionalFieldArt.data.derivatives
+          ? { field:             _dsN(directionalFieldArt.data.derivatives.field, 4),
+              dt:                directionalFieldArt.data.derivatives.dt,
+              meanAbsDerivative: directionalFieldArt.data.derivatives.meanAbsDerivative }
+          : null,
 
-        signedSdf:         sdfFieldArt.data.signedSdf,
-        narrowBandMask:    sdfFieldArt.data.narrowBandMask,
+        signedSdf:         _dsN(sdfFieldArt.data.signedSdf, 1),
+        narrowBandMask:    _dsN(sdfFieldArt.data.narrowBandMask, 1),
 
         // DG fields from dgInline — no IDB read needed
-        kH:                dgInline?.kH                                    ?? null,
-        normalCurl:        dgInline?.normalCurl                            ?? null,
-        flowU:             flowFieldArt?.data.u                            ?? null,
-        flowV:             flowFieldArt?.data.v                            ?? null,
-        flowCurl:          dgInline?.flowCurl                              ?? null,
-        flowDivergence:    dgInline?.flowDiv                               ?? null,
+        kH:                _dsN(dgInline?.kH        ?? null, 1),
+        principalE1:       _dsN(dgInline?.principalE1 ?? null, 2), // xy-pairs, 2-channel
+        normalCurl:        _dsN(dgInline?.normalCurl ?? null, 1),
+        flowU:             _dsFlow(flowFieldArt?.data.u ?? null),
+        flowV:             _dsFlow(flowFieldArt?.data.v ?? null),
+        flowCurl:          _dsN(dgInline?.flowCurl  ?? null, 1),
+        flowDivergence:    _dsN(dgInline?.flowDiv   ?? null, 1),
       };
 
       // ── Run analysis ──────────────────────────────────────────────────────
-      // Timeout scales with resolution: PixelGraph + PrimeEnds BFS at 1024²
-      // (1M nodes) legitimately takes 60–120s with flow. Without flow LQE hangs
-      // indefinitely. Scale by (res/512)² so 512²→60s, 1024²→240s.
-      const TOPOLOGY_TIMEOUT_MS = 60_000 * Math.pow(Math.max(res, 512) / 512, 2);
+      console.log(
+        `[topology.worker] Entering TopologyAnalyzer.compute() — ` +
+        `topo=${topoWidth}x${topoHeight} (full res=${sourceWidth}x${sourceHeight}, scale=${scale.toFixed(2)})`
+      );
+      const TOPOLOGY_TIMEOUT_MS = 60_000 * Math.max(1, (topoWidth * topoHeight) / (512 * 512));
+      console.log(`[topology.worker] Timeout budget: ${(TOPOLOGY_TIMEOUT_MS/1000).toFixed(0)}s`);
       const analyzer = new TopologyAnalyzer(_flags);
       const result = await Promise.race([
         analyzer.compute({
@@ -232,15 +295,16 @@ self.onmessage = async (evt) => {
           storageWrapper: sw,
           sourceMetaKey:  metaKey,
           cameraId:       msg.cameraId ?? 'default',
-          resolution:     res,
+          resolution:     Math.max(topoWidth, topoHeight), // legacy field only
+          width:          topoWidth,
+          height:         topoHeight,
           frameIndex:     msg.frameIndex ?? 0
         }),
         new Promise((_, reject) =>
           setTimeout(
             () => reject(new Error(
               `TopologyAnalyzer.compute() timed out after ${TOPOLOGY_TIMEOUT_MS}ms ` +
-              `at resolution ${res}² — likely LipschitzQuaternionEnds solver hang ` +
-              `on null flowCurl/flowDiv. Ensure enableOpticalFlow=true.`
+              `at topo ${topoWidth}×${topoHeight} (full res ${sourceWidth}×${sourceHeight})`
             )),
             TOPOLOGY_TIMEOUT_MS
           )
@@ -248,18 +312,23 @@ self.onmessage = async (evt) => {
       ]);
 
       // ── Broadcast completion ──────────────────────────────────────────────
+      self._activeTopoJobId = null;
       _bcPost({
         event:              'TOPOLOGY_DONE',
         metaKey,
         jobId,
-        primeEndsKey:       result.primeEndsKey,
-        topologyMapKey:     result.topologyMapKey,
-        homologySummaryKey: result.homologySummaryKey,
-        boundaryParamKey:   result.boundaryParamKey,
-        lipschitzEndsKey:   result.lipschitzEndsKey,
-        quaternionFieldKey: result.quaternionFieldKey,
-        motionMapsKey:      result.motionMapsKey,
-        componentMapKey:    result.componentMapKey,
+        // Keys are null — all consumers use topoInline directly.
+        // Fire-and-forget IDB persistence runs in background inside TopologyAnalyzer.
+        primeEndsKey:       result.primeEndsKey       ?? null,
+        topologyMapKey:     result.topologyMapKey     ?? null,
+        homologySummaryKey: result.homologySummaryKey ?? null,
+        boundaryParamKey:   result.boundaryParamKey   ?? null,
+        lipschitzEndsKey:   result.lipschitzEndsKey   ?? null,
+        quaternionFieldKey: result.quaternionFieldKey ?? null,
+        motionMapsKey:      result.motionMapsKey      ?? null,
+        componentMapKey:    result.componentMapKey    ?? null,
+        // Inline topology data — typed arrays are structured-cloned (no IDB round-trip)
+        topoInline:         result.topoInline         ?? null,
         betti:              result.betti,
         endCount:           result.endCount,
         processingMs:       result.processingMs,
@@ -267,6 +336,7 @@ self.onmessage = async (evt) => {
       });
 
     } catch (err) {
+      self._activeTopoJobId = null;
       console.error('[topology.worker] TOPOLOGY_ANALYZE failed:', err);
       _bcPost({
         event:        'TOPOLOGY_ERROR',

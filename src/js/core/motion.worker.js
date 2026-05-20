@@ -4571,6 +4571,18 @@ console.log('[STAGE4] Final calibData state before depth computation:', {
 
         await storageWrapper.markReconDone(jobId, derivedKeys);
 
+        // Stop heartbeat immediately after markReconDone — the finally block
+        // will also attempt this, but stopping here prevents the race where
+        // the interval fires between markReconDone and finally cleanup,
+        // producing a spurious "not running (state: done)" miss log.
+        try {
+          const jobEntry = _jobs.get(jobId);
+          if (jobEntry?.heartbeatTimer) {
+            _stopHeartbeat(jobEntry.heartbeatTimer);
+            jobEntry.heartbeatTimer = null;
+          }
+        } catch (_) {}
+
       } catch (mdErr) {
         console.warn('motion.worker: markReconDone verification/update failed', mdErr);
         try {

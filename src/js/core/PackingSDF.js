@@ -116,6 +116,19 @@ const DEFAULT_CONFIG = {
     /** Per-pixel band scale: bandWidth(P) = bandBase + bandScale×widthMap(P) */
     bandScale: 3.0,
 
+    /** Hard cap on band half-width as a fraction of min(width,height).
+     *  Prevents GPT_ALPHA × sdfRange from producing a 67px+ base when sdfRange ≈ image diagonal.
+     *  At 512²: 0.02 × 512 = 10px.  At 1024²: 20px. */
+    bandBaseMaxFrac: 0.02,
+
+    /** Hard cap on penumbra contribution to band half-width (same scale).
+     *  bandScale=3 means a 10px penumbra adds 30px — this caps that at 5px. */
+    bandPenumbraMaxFrac: 0.01,
+
+    /** Fallback surface fraction: when primary edge detection fires < 0.05% of pixels,
+     *  the fallback selects exactly this fraction of pixels by gradient magnitude rank. */
+    fallbackSurfaceFrac: 0.005,
+
     /** Smooth fall-off exponent for the float narrow band mask
      *  (1 = linear, 2 = quadratic attenuation toward band edge). */
     bandFalloffExp: 2.0,
@@ -395,25 +408,64 @@ export class PackingSDF {
         for (let i = 0; i < n; i++) edgeCount += mask[i];
 
         if (edgeCount < n * 0.0005) {
-            console.warn(`[PackingSDF] Only ${edgeCount} edge pixels detected (${(edgeCount/n*100).toFixed(3)}%). ` +
-                         `Falling back to Sobel gradient threshold for surface mask.`);
-            const sobelThresh = 0.001;  // Much lower — catches any texture/gradient
+            // Smooth-depth scene — primary detector found essentially nothing.
+            // Select exactly fallbackSurfaceFrac of pixels by gradient magnitude rank
+            // (histogram percentile, O(n) — avoids sort) so the narrow band stays
+            // controlled regardless of scene content. The old sobelThresh=0.001 was
+            // detecting 20–50% of pixels as surface, inflating b1 to 400k+.
+            const targetFrac = this._cfg.fallbackSurfaceFrac ?? 0.005;
+            console.warn(
+                `[PackingSDF] Only ${edgeCount} primary edge pixels — ` +
+                `fallback: selecting top ${(targetFrac*100).toFixed(1)}% by gradient magnitude`
+            );
+
+            // Compute gradient magnitudes
+            const grads = new Float32Array(n);
             for (let y = 1; y < height - 1; y++) {
                 for (let x = 1; x < width - 1; x++) {
                     const i = y * width + x;
-                    if (mask[i]) continue;  // Already flagged
-                    const d = depthMap[i];
-                    // 3×3 Sobel-like: max gradient across all 4 axes
-                    const gx = Math.abs(depthMap[i + 1] - depthMap[i - 1]) * 0.5;
-                    const gy = Math.abs(depthMap[i + width] - depthMap[i - width]) * 0.5;
-                    const gd1 = Math.abs(depthMap[i + width + 1] - depthMap[i - width - 1]) * 0.354;
-                    const gd2 = Math.abs(depthMap[i + width - 1] - depthMap[i - width + 1]) * 0.354;
-                    if (Math.max(gx, gy, gd1, gd2) >= sobelThresh) mask[i] = 1;
+                    const gx = Math.abs(depthMap[i + 1]     - depthMap[i - 1])     * 0.5;
+                    const gy = Math.abs(depthMap[i + width]  - depthMap[i - width]) * 0.5;
+                    grads[i] = Math.sqrt(gx * gx + gy * gy);
                 }
+            }
+
+            // Histogram-based percentile threshold (avoids O(n log n) sort)
+            const nBins = 1000;
+            let gMin = Infinity, gMax = -Infinity;
+            for (let i = 0; i < n; i++) {
+                if (grads[i] > 0) {
+                    if (grads[i] < gMin) gMin = grads[i];
+                    if (grads[i] > gMax) gMax = grads[i];
+                }
+            }
+            const hist = new Int32Array(nBins);
+            const gRange = Math.max(gMax - gMin, 1e-8);
+            for (let i = 0; i < n; i++) {
+                if (grads[i] > 0)
+                    hist[Math.min(nBins - 1, ((grads[i] - gMin) / gRange * nBins) | 0)]++;
+            }
+            // Walk histogram from top to find the (1-targetFrac) cumulative threshold
+            const cutTarget = n * (1 - targetFrac);
+            let cum = 0, gradThresh = gMax;
+            for (let b = nBins - 1; b >= 0; b--) {
+                cum += hist[b];
+                if (cum >= n * targetFrac) {
+                    gradThresh = gMin + b / nBins * gRange;
+                    break;
+                }
+            }
+
+            // Apply threshold
+            for (let i = 0; i < n; i++) {
+                if (!mask[i] && grads[i] >= gradThresh) mask[i] = 1;
             }
             let fallbackCount = 0;
             for (let i = 0; i < n; i++) fallbackCount += mask[i];
-            console.log(`[PackingSDF] Fallback Sobel detected ${fallbackCount} edge pixels (${(fallbackCount/n*100).toFixed(2)}%)`);
+            console.log(
+                `[PackingSDF] Fallback selected ${fallbackCount} surface pixels ` +
+                `(${(fallbackCount/n*100).toFixed(2)}%, gradThresh=${gradThresh.toFixed(5)})`
+            );
         }
 
         return mask;
@@ -652,7 +704,14 @@ export class PackingSDF {
 
         // GPT latent heat lower bound on band base
         const latentHeatBandBase = GPT_ALPHA * sdfRange;
-        const bandBase = Math.max(this._cfg.bandBase * sdfRange, latentHeatBandBase);
+        const rawBandBase = Math.max(this._cfg.bandBase * sdfRange, latentHeatBandBase);
+
+        // Hard cap — prevents GPT_ALPHA × sdfRange from producing a base half-width
+        // approaching the image diagonal (≈67px at 512²) when surfaces are sparse.
+        // Uses a fraction of image dimension so it scales naturally with resolution.
+        const _shortSide = Math.min(width, height);
+        const bandBaseMaxPx = (this._cfg.bandBaseMaxFrac ?? 0.02) * _shortSide;
+        const bandBase = Math.min(rawBandBase, bandBaseMaxPx);
 
         const mask = new Float32Array(n);
         const { bandScale, bandFalloffExp } = this._cfg;
@@ -661,8 +720,11 @@ export class PackingSDF {
             const v = signedSdf[i];
             if (isNaN(v)) { mask[i] = 0; continue; }
 
-            const penW   = penumbraField ? penumbraField[i] : 0;
-            const bw     = bandBase + bandScale * penW;
+            const penW = penumbraField ? penumbraField[i] : 0;
+            // Cap penumbra contribution — bandScale=3 means a 10px penumbra adds 30px
+            // to the half-width, easily overwhelming bandBase and filling the image.
+            const penumbraMaxPx = (this._cfg.bandPenumbraMaxFrac ?? 0.01) * _shortSide;
+            const bw = bandBase + Math.min(bandScale * penW, penumbraMaxPx);
             const absV   = Math.abs(v);
 
             if (absV >= bw) {

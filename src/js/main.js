@@ -837,7 +837,9 @@ class MotionPainter {
                     normalCurlKey:       null,  // in dgInline
                     penumbraFieldKey:    null,
                     normalMapKey:        null,
-                    resolution:          cc.reconstructionResolution                   ?? 512
+                    resolution:          cc.differentialGeometry?.reconstructionResolution
+                                         ?? cc.reconstructionResolution
+                                         ?? 512
                   }
                 });
                 console.log('[Stage4A] main.js: topology.worker dispatched', {
@@ -954,23 +956,38 @@ class MotionPainter {
             if (this.cameraContainer) {
               try {
                 this._updateCameraContainer({
-                  passThrough: {
-                    stage4a: {
-                      primeEndsKey:       msg.primeEndsKey       ?? null,
-                      topologyMapKey:     msg.topologyMapKey     ?? null,
-                      homologySummaryKey: msg.homologySummaryKey ?? null,
-                      boundaryParamKey:   msg.boundaryParamKey   ?? null,
-                      lipschitzEndsKey:   msg.lipschitzEndsKey   ?? null,
-                      quaternionFieldKey: msg.quaternionFieldKey ?? null,
-                      motionMapsKey:      msg.motionMapsKey      ?? null,
-                      componentMapKey:    msg.componentMapKey    ?? null,
-                      betti:              msg.betti              ?? null,
-                      endCount:           msg.endCount           ?? null,
-                      completedAt:        Date.now()
-                    }
+                passThrough: {
+                  stage4a: {
+                    primeEndsKey:       msg.primeEndsKey       ?? null,
+                    topologyMapKey:     msg.topologyMapKey     ?? null,
+                    homologySummaryKey: msg.homologySummaryKey ?? null,
+                    boundaryParamKey:   msg.boundaryParamKey   ?? null,
+                    lipschitzEndsKey:   msg.lipschitzEndsKey   ?? null,
+                    quaternionFieldKey: msg.quaternionFieldKey ?? null,
+                    motionMapsKey:      msg.motionMapsKey      ?? null,
+                    componentMapKey:    msg.componentMapKey    ?? null,
+                    betti:              msg.betti              ?? null,
+                    endCount:           msg.endCount           ?? null,
+                    // Inline topology — forwarded to ambi.worker, no IDB read needed
+                    topoInline:         msg.topoInline         ?? null,
+                    completedAt:        Date.now()
                   }
-                });
+                }
+              });
                 this._checkStage4Complete(topoMetaKey);
+              if (this._minimizerWorker) {
+                try {
+                  this._minimizerWorker.postMessage({
+                    op:         'TOPOLOGY_DONE',
+                    metaKey:    msg.metaKey,
+                    topoInline: msg.topoInline ?? null,
+                    betti:      msg.betti      ?? null,
+                    endCount:   msg.endCount   ?? null
+                  });
+                } catch (e) {
+                  console.warn('[Stage4B] main.js: failed to forward TOPOLOGY_DONE to minimizer.worker', e);
+                }
+              }
                 console.log('[Stage4A] main.js: TOPOLOGY_DONE written to cameraContainer', {
                   topoMetaKey,
                   endCount: msg.endCount,
@@ -2535,7 +2552,8 @@ _ensureMotionWorker() {
             // not loaded from IDB. ambi.worker reads from msg.stage1Inline.
             stage1Inline: cc.stage1Inline ?? null,
             // dgInline: kH and principalE1/E2 forwarded directly
-                  dgInline: cc.dgInline ?? null,
+                  dgInline:   cc.dgInline            ?? null,
+                  topoInline: cc.stage4a?.topoInline ?? null,
                   artifactKeys: {
                     // Stage 4B
                     phiMinKey:               cc.stage4b.phiMinKey               ?? null,

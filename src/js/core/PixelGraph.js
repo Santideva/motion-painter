@@ -173,7 +173,9 @@ export function bidirectionalDijkstra(G, srcNode, dstNode, blocked) {
  *
  * @param {PixelGraph} G
  * @param {number}     startNode
- * @param {Uint8Array} blocked       — length G.nodeCount
+ * @param {Uint8Array} blocked       — length G.nodeCount; READ-ONLY — read only.
+ *                                     Callers may safely share a single blocked
+ *                                     buffer across calls if they manage its state.
  * @param {number}     [maxArea=Inf] — abort if more than maxArea nodes visited
  * @returns {Int32Array | null}
  */
@@ -224,12 +226,17 @@ export class PixelGraph {
    * @param {object}       [opts.flags={}]
    */
   constructor({ directionalField, kH, normalCurl, narrowBandMask,
-                signedSdf, resolution, flags = {} }) {
-    const w = resolution, h = resolution;
-    this._w          = w;
-    this._h          = h;
-    this._resolution = resolution;
-    this._flags      = flags;
+                signedSdf, width, height, flags = {} }) {
+    if (!Number.isFinite(width) || !Number.isFinite(height)) {
+      throw new Error('PixelGraph: width/height are required');
+    }
+
+    const w = width, h = height;
+    this._w = w;
+    this._h = h;
+    this._width = width;
+    this._height = height;
+    this._flags = flags;
 
     // ── 1. Fused gradient magnitude ───────────────────────────────────────
     this.fusedGradMag = this._computeFusedGradient(
@@ -356,7 +363,8 @@ export class PixelGraph {
   get cycleCount()        { return this._b1; }
   get eulerChar()         { return this._chi; }
   get boundaryNodes()     { return this._boundaryNodes; }
-  get resolution()        { return this._resolution; }
+  get width()             { return this._w; }
+  get height()            { return this._h; }
 
   pixelToNode(px)         { return this._nodeMap[px]; }
   nodeToPixel(ni)         { return this._nodes[ni]; }

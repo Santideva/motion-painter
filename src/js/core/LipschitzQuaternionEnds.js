@@ -50,6 +50,30 @@ function trimmedMean(values, trimFrac) {
   return slice.reduce((s, v) => s + v, 0) / slice.length;
 }
 
+// percentile99 on absolute values — avoids allocating an intermediate array
+// (src.flowCurl.map(Math.abs) at 1024² = 4MB wasted allocation)
+function percentile99Abs(arr, count) {
+  let mn = Infinity, mx = -Infinity;
+  for (let i = 0; i < count; i++) {
+    const v = Math.abs(arr[i]);
+    if (v < mn) mn = v;
+    if (v > mx) mx = v;
+  }
+  if (mx <= mn) return Math.max(mx, 1e-6);
+  const bins = 1000, hist = new Int32Array(bins);
+  const range = mx - mn;
+  for (let i = 0; i < count; i++) {
+    const v = Math.abs(arr[i]);
+    hist[Math.min(bins - 1, ((v - mn) / range * bins) | 0)]++;
+  }
+  const target = count * 0.99; let cum = 0;
+  for (let b = 0; b < bins; b++) {
+    cum += hist[b];
+    if (cum >= target) return mn + (b + 1) / bins * range;
+  }
+  return mx;
+}
+
 // ── Union-Find (component labelling for seed morphology) ─────────────────
 function labelComponents(mask, w, h) {
   const DX = [-1, 0, 1, -1, 1, -1, 0, 1];
@@ -435,7 +459,7 @@ export class LipschitzQuaternionEnds {
     // rotational_map (|flowCurl| normalised)
     const rotationalMap = new Float32Array(pxN);
     if (src.flowCurl) {
-      const p99 = percentile99(src.flowCurl.map(Math.abs), pxN);
+      const p99 = percentile99Abs(src.flowCurl, pxN);  // no intermediate array
       for (let i = 0; i < pxN; i++) {
         rotationalMap[i] = Math.min(1.0, Math.abs(src.flowCurl[i]) / p99);
       }
