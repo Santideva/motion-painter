@@ -53,6 +53,10 @@ class MotionPainter {
     this._currentFlags         = {};     // Flags snapshot kept current for worker dispatch
     this._heavyPathRequested = false;
     this.cameraContainer     = null;
+    // Transient Stage 4 payloads — held only until ambi.worker is dispatched, then nulled.
+    // Never stored on cameraContainer; typed arrays must not outlive the dispatch call.
+    this._pendingTopoInline      = null;
+    this._pendingMinimizerInline = null;
     // BroadcastChannel used for cross-worker signaling (listen for release_request etc.)
     this._bc = null;
 
@@ -633,6 +637,7 @@ class MotionPainter {
                 this._updateCameraContainer({
                   passThrough: { sdfInline: msg.sdfInline }
                 });
+                
                 console.log('[Stage2] main.js: sdfInline stored on cameraContainer:', {
                   signedSdfLength:      msg.sdfInline.signedSdf?.length      ?? 0,
                   narrowBandMaskLength: msg.sdfInline.narrowBandMask?.length ?? 0,
@@ -644,6 +649,39 @@ class MotionPainter {
               }
 } else {
               console.warn('[Stage2] main.js: sdfInline absent in RECON_DONE — topology and minimizer will lack SDF arrays');
+            }
+
+          // ── directionalFieldInline: store for topology + ambi workers ──────
+            if (msg.directionalFieldInline) {
+              try {
+                this._updateCameraContainer({
+                  passThrough: { directionalFieldInline: msg.directionalFieldInline }
+                });
+                console.log('[Stage3] main.js: directionalFieldInline stored on cameraContainer:', {
+                  fieldLength:     msg.directionalFieldInline.field?.length     ?? 0,
+                  coherenceLength: msg.directionalFieldInline.coherence?.perPixel?.length
+                                   ?? msg.directionalFieldInline.coherence?.length ?? 0
+                });
+              } catch (e) {
+                console.warn('[Stage3] main.js: directionalFieldInline writeback failed', e);
+              }
+            } else {
+              console.warn('[Stage3] main.js: directionalFieldInline absent — topology/ambi will fall back to IDB');
+            }    
+
+            // ── flowFieldInline: cache for KEM dispatch ──────────────────────
+            if (msg.flowFieldInline) {
+              try {
+                this._updateCameraContainer({
+                  passThrough: { flowFieldInline: msg.flowFieldInline }
+                });
+                console.log('[Stage3] main.js: flowFieldInline stored on cameraContainer:', {
+                  uLength: msg.flowFieldInline.u?.length ?? 0,
+                  vLength: msg.flowFieldInline.v?.length ?? 0
+                });
+              } catch (e) {
+                console.warn('[Stage3] main.js: flowFieldInline writeback failed', e);
+              }
             }
 
             // ── normalInline: store on cameraContainer for topology forwarding ─
@@ -800,6 +838,24 @@ class MotionPainter {
                 console.warn('[Stage4] main.js: stage4 writeback failed', e);
               }
             }
+            // Pause the periodic IDB evictor for the duration of Stage 4.
+            // The evictor fires checkQuotaAndEvict every 10s which creates a
+            // readwrite transaction on ARTIFACTS_STORE — this blocks topology.worker's
+            // readonly read on the same store across all IDB connections.
+            // Resumed in _checkStage4Complete once both Stage 4 workers finish.
+            try { storageAPI.stopEvictorLoop(); } catch(e) {
+              console.warn('[Stage4] main.js: failed to pause evictor', e);
+            }
+
+            // Pause the periodic IDB evictor for the duration of Stage 4.
+            // The evictor fires checkQuotaAndEvict every 10s which creates a
+            // readwrite transaction on ARTIFACTS_STORE — this blocks topology.worker's
+            // readonly read on the same store across all IDB connections.
+            // Resumed in _checkStage4Complete once both Stage 4 workers finish.
+            try { storageAPI.stopEvictorLoop(); } catch(e) {
+              console.warn('[Stage4] main.js: failed to pause evictor', e);
+            }
+
             // ── Stage 4A: fire topology.worker ──────────────────────────────
             // All inputs are now in cameraContainer after Stage 2–4 writes.
             // topology.worker broadcasts TOPOLOGY_DONE when complete.
@@ -823,14 +879,15 @@ class MotionPainter {
                     flowCurl:   cc.dgInline.flowCurl    ?? null,
                     flowDiv:    cc.dgInline.flowDiv     ?? null
                   } : null,
+                  directionalFieldInline: cc.directionalFieldInline ?? null,
                   artifactKeys: {
-                    directionalFieldKey: cc.directionalFieldKey                        ?? null,
+                    directionalFieldKey: cc.directionalFieldInline ? null : (cc.directionalFieldKey ?? null),
                     sdfFieldKey:         null,
-                    diskSeedsKey:        cc.stage2?.diskSeedsKey                       ?? null,
+                    diskSeedsKey:        null,   // disk seeds go to minimizer.worker only
                     curvatureKey:        null,  // kH in dgInline
                     principalFrameKey:   null,  // unused by topology
                     sdfDivKey:           cc.differentialGeometry?.sdfDivKey            ?? null,
-                    flowFieldKey:        cc.stage3?.flowFieldKey                       ?? null,
+                    flowFieldKey:        null,   // flowCurl + flowDiv from dgInline are sufficient; raw u/v not needed by topology
                     flowCurlKey:         null,  // in dgInline
                     flowDivKey:          null,  // in dgInline
                     directnessFieldKey:  null,
@@ -952,43 +1009,43 @@ class MotionPainter {
           if (msg && msg.event === 'TOPOLOGY_DONE') {
             const topoMetaKey = msg.metaKey;
             if (!topoMetaKey) return;
-            // In the current single-camera model, validate against active container
+
+            // Hold transiently — forwarded to minimizer.worker now and to
+            // ambi.worker when MINIMIZER_DONE arrives, then nulled immediately.
+            this._pendingTopoInline = msg.topoInline ?? null;
+
+            // Fanout 1: minimizer.worker needs componentMap to run Phase B
+            if (this._minimizerWorker && msg.topoInline) {
+              try {
+                this._minimizerWorker.postMessage({
+                  op:         'TOPOLOGY_DONE',
+                  metaKey:    msg.metaKey,
+                  topoInline: msg.topoInline,
+                  betti:      msg.betti    ?? null,
+                  endCount:   msg.endCount ?? null
+                });
+              } catch (e) {
+                console.warn('[Stage4B] main.js: failed to forward TOPOLOGY_DONE to minimizer.worker', e);
+              }
+            }
+
+            // Write only lightweight metadata to cameraContainer — no typed arrays.
+            // Clear stage4b so stale minimizer data from a prior frame cannot
+            // trigger _checkStage4Complete prematurely on this new topology result.
             if (this.cameraContainer) {
               try {
                 this._updateCameraContainer({
-                passThrough: {
-                  stage4a: {
-                    primeEndsKey:       msg.primeEndsKey       ?? null,
-                    topologyMapKey:     msg.topologyMapKey     ?? null,
-                    homologySummaryKey: msg.homologySummaryKey ?? null,
-                    boundaryParamKey:   msg.boundaryParamKey   ?? null,
-                    lipschitzEndsKey:   msg.lipschitzEndsKey   ?? null,
-                    quaternionFieldKey: msg.quaternionFieldKey ?? null,
-                    motionMapsKey:      msg.motionMapsKey      ?? null,
-                    componentMapKey:    msg.componentMapKey    ?? null,
-                    betti:              msg.betti              ?? null,
-                    endCount:           msg.endCount           ?? null,
-                    // Inline topology — forwarded to ambi.worker, no IDB read needed
-                    topoInline:         msg.topoInline         ?? null,
-                    completedAt:        Date.now()
+                  passThrough: {
+                    stage4b: null,
+                    stage4a: {
+                      betti:       msg.betti    ?? null,
+                      endCount:    msg.endCount ?? null,
+                      completedAt: Date.now()
+                    }
                   }
-                }
-              });
+                });
                 this._checkStage4Complete(topoMetaKey);
-              if (this._minimizerWorker) {
-                try {
-                  this._minimizerWorker.postMessage({
-                    op:         'TOPOLOGY_DONE',
-                    metaKey:    msg.metaKey,
-                    topoInline: msg.topoInline ?? null,
-                    betti:      msg.betti      ?? null,
-                    endCount:   msg.endCount   ?? null
-                  });
-                } catch (e) {
-                  console.warn('[Stage4B] main.js: failed to forward TOPOLOGY_DONE to minimizer.worker', e);
-                }
-              }
-                console.log('[Stage4A] main.js: TOPOLOGY_DONE written to cameraContainer', {
+                console.log('[Stage4A] main.js: TOPOLOGY_DONE processed', {
                   topoMetaKey,
                   endCount: msg.endCount,
                   betti:    msg.betti
@@ -1004,26 +1061,27 @@ class MotionPainter {
           if (msg && msg.event === 'MINIMIZER_DONE') {
             const miniMetaKey = msg.metaKey;
             if (!miniMetaKey) return;
+
+            // Hold transiently — forwarded to ambi.worker in _checkStage4Complete, then nulled.
+            this._pendingMinimizerInline = msg.minimizerInline ?? null;
+
+            // Write only lightweight metadata to cameraContainer — no typed arrays
             if (this.cameraContainer) {
               try {
                 this._updateCameraContainer({
                   passThrough: {
                     stage4b: {
-                      constrainedMinimizerKey: msg.constrainedMinimizerKey ?? null,
-                      phiMinKey:               msg.phiMinKey               ?? null,
-                      zeroCurveKey:            msg.zeroCurveKey            ?? null,
-                      telemetryKey:            msg.telemetryKey            ?? null,
-                      converged:               msg.converged               ?? false,
-                      stopReason:              msg.stopReason              ?? null,
-                      targetArea:              msg.targetArea              ?? null,
-                      finalArea:               msg.finalArea               ?? null,
-                      topologyConsistent:      msg.topologyConsistent      ?? false,
-                      completedAt:             Date.now()
+                      converged:          msg.converged          ?? false,
+                      stopReason:         msg.stopReason         ?? null,
+                      targetArea:         msg.targetArea         ?? null,
+                      finalArea:          msg.finalArea          ?? null,
+                      topologyConsistent: msg.topologyConsistent ?? false,
+                      completedAt:        Date.now()
                     }
                   }
                 });
                 this._checkStage4Complete(miniMetaKey);
-                console.log('[Stage4B] main.js: MINIMIZER_DONE written to cameraContainer', {
+                console.log('[Stage4B] main.js: MINIMIZER_DONE processed', {
                   miniMetaKey,
                   converged:          msg.converged,
                   topologyConsistent: msg.topologyConsistent,
@@ -1065,6 +1123,31 @@ class MotionPainter {
                 });
               }
 
+              // ── Cache ambi inline outputs for Stage 6/7 dispatch ──────────
+              if (msg.warpFieldInline || msg.worldFrameMapInline) {
+                try {
+                  this._updateCameraContainer({
+                    passThrough: {
+                      stage5Inline: {
+                        warpFieldInline:          msg.warpFieldInline          ?? null,
+                        worldFrameMapInline:      msg.worldFrameMapInline      ?? null,
+                        integrationWeightsInline: msg.integrationWeightsInline ?? null,
+                        surfaceParamInline:       msg.surfaceParamInline       ?? null
+                      }
+                    }
+                  });
+                  console.log('[Stage5] main.js: stage5Inline stored on cameraContainer:', {
+                    hasWarpField:        !!msg.warpFieldInline,
+                    hasWorldFrameMap:    !!msg.worldFrameMapInline,
+                    hasSurfaceParam:     !!msg.surfaceParamInline,
+                    warpFieldLength:     msg.warpFieldInline?.field?.length ?? 0,
+                    worldFrameMapLength: msg.worldFrameMapInline?.map?.length ?? 0
+                  });
+                } catch (e) {
+                  console.warn('[Stage5] main.js: stage5Inline writeback failed', e);
+                }
+              }
+
               // ── Reset stage 678 state and dispatch Stages 6 + 7 ──────────
               const cc = this.cameraContainer;
               this._stage678State = {
@@ -1078,24 +1161,36 @@ class MotionPainter {
               if (this._kemWorker) {
                 try {
                   this._kemWorker.postMessage({
-                    op:      'KEM_ANALYZE',
-                    jobId:   `kem:${ambiMetaKey}:${Date.now()}`,
-                    metaKey: ambiMetaKey,
+                    op:       'KEM_ANALYZE',
+                    jobId:    `kem:${ambiMetaKey}:${Date.now()}`,
+                    metaKey:  ambiMetaKey,
                     cameraId: cc.cameraId ?? 'default',
-                    flags:   this._currentFlags ?? {},
+                    flags:    this._currentFlags ?? {},
                     meanMotionMagnitude: cc.stage5?.meanMotionMagnitude ?? null,
                     meanLQESpeed:        cc.stage5?.meanLQESpeed        ?? null,
+                    // ── Inline data — eliminates all KEM IDB reads ────────────
+                    principalFrameInline: cc.dgInline
+                      ? { e1: cc.dgInline.principalE1 ?? null,
+                          e2: cc.dgInline.principalE2 ?? null }
+                      : null,
+                    flowFieldInline:    cc.flowFieldInline                    ?? null,
+                    motionMapsInline:   cc.stage67Inputs?.motionMaps          ?? null,
+                    coherenceInline:    (cc.directionalFieldInline?.coherence instanceof Float32Array)
+                                          ? cc.directionalFieldInline.coherence
+                                          : (cc.directionalFieldInline?.coherence?.perPixel ?? null),
+                    phiMinInline:       cc.stage67Inputs?.phiMin              ?? null,
+                    surfaceParamInline: cc.stage5Inline?.surfaceParamInline   ?? null,
                     artifactKeys: {
-                      principalFrameKey:   cc.differentialGeometry?.principalFrameKey ?? null,
-                      flowFieldKey:        cc.stage3?.flowFieldKey                    ?? null,
-                      directionalFieldKey: cc.directionalFieldKey                     ?? null,
-                      motionMapsKey:       cc.stage4a?.motionMapsKey                  ?? null,
-                      narrowBandKey:       cc.stage4b?.phiMinKey                      ?? null,
-                      surfaceParamKey:     cc.stage5?.surfaceParamKey                 ?? null,
-                      resolution:          cc.differentialGeometry?.reconstructionResolution
-                                           ?? cc.reconstructionResolution
-                                           ?? 512,
-                      cameraId:            cc.cameraId ?? 'default'
+                      // All null — data travels inline above
+                      principalFrameKey:   null,
+                      flowFieldKey:        null,
+                      directionalFieldKey: null,
+                      motionMapsKey:       null,
+                      narrowBandKey:       null,
+                      surfaceParamKey:     null,
+                      resolution: cc.differentialGeometry?.reconstructionResolution
+                                  ?? cc.reconstructionResolution ?? 512,
+                      cameraId:   cc.cameraId ?? 'default'
                     }
                   });
                   console.log('[Stage6] main.js: KEM_ANALYZE dispatched', { metaKey: ambiMetaKey });
@@ -1108,22 +1203,29 @@ class MotionPainter {
               if (this._correspondenceWorker) {
                 try {
                   this._correspondenceWorker.postMessage({
-                    op:      'CORRESPONDENCE_ANALYZE',
-                    jobId:   `corr:${ambiMetaKey}:${Date.now()}`,
-                    metaKey: ambiMetaKey,
+                    op:       'CORRESPONDENCE_ANALYZE',
+                    jobId:    `corr:${ambiMetaKey}:${Date.now()}`,
+                    metaKey:  ambiMetaKey,
                     cameraId: cc.cameraId ?? 'default',
-                    flags:   this._currentFlags ?? {},
+                    flags:    this._currentFlags ?? {},
+                    // ── Inline data — eliminates all Correspondence IDB reads ─
+                    warpFieldInline:     cc.stage5Inline?.warpFieldInline     ?? null,
+                    worldFrameMapInline: cc.stage5Inline?.worldFrameMapInline ?? null,
+                    primeEndsInline:     cc.stage67Inputs?.primeEnds          ?? null,
+                    topologyMapInline:   cc.stage67Inputs?.topologyMap        ?? null,
+                    phiMinInline:        cc.stage67Inputs?.phiMin             ?? null,
+                    surfaceParamInline:  cc.stage5Inline?.surfaceParamInline  ?? null,
                     artifactKeys: {
-                      warpFieldKey:      cc.stage5?.warpFieldKey      ?? null,
-                      worldFrameMapKey:  cc.stage5?.worldFrameMapKey  ?? null,
-                      surfaceParamKey:   cc.stage5?.surfaceParamKey   ?? null,
-                      primeEndsKey:      cc.stage4a?.primeEndsKey     ?? null,
-                      topologyMapKey:    cc.stage4a?.topologyMapKey   ?? null,
-                      phiMinKey:         cc.stage4b?.phiMinKey        ?? null,
-                      resolution:        cc.differentialGeometry?.reconstructionResolution
-                                         ?? cc.reconstructionResolution
-                                         ?? 512,
-                      cameraId:          cc.cameraId ?? 'default'
+                      // All null — data travels inline above
+                      warpFieldKey:     null,
+                      worldFrameMapKey: null,
+                      surfaceParamKey:  null,
+                      primeEndsKey:     null,
+                      topologyMapKey:   null,
+                      phiMinKey:        null,
+                      resolution: cc.differentialGeometry?.reconstructionResolution
+                                  ?? cc.reconstructionResolution ?? 512,
+                      cameraId:   cc.cameraId ?? 'default'
                     }
                   });
                   console.log('[Stage7] main.js: CORRESPONDENCE_ANALYZE dispatched', { metaKey: ambiMetaKey });
@@ -2512,12 +2614,7 @@ _ensureMotionWorker() {
   _checkStage4Complete(metaKey) {
     const cc = this.cameraContainer;
     if (!cc) return;
-    // Stage 5 (AmbiAnamorph) requires both 4A and 4B.
     if (cc.stage4a && cc.stage4b) {
-      // Broadcast STAGE4_DONE on BC for any other BC consumers (Stage 6/7 stubs).
-      // Note: BroadcastChannel does not deliver to the sender, so main.js will not
-      // receive this event in its own BC listener. ambi.worker is dispatched below
-      // via direct postMessage, not via BC.
       if (this._bc) {
         try {
           this._bc.postMessage({
@@ -2533,58 +2630,95 @@ _ensureMotionWorker() {
         }
       }
 
-      // ── Stage 5: dispatch ambi.worker directly ───────────────────────
-      // ambi.worker receives AMBI_ANALYZE via direct postMessage (not BC).
-      // All artifact keys are read from cameraContainer which is fully
-      // populated at this point — Stage 2/3/4 writes all occur in the
-      // RECON_DONE handler before _checkStage4Complete is called.
+      // ── Extract Stage 6/7 inputs before transient payloads are nulled ────
+      // _pendingTopoInline and _pendingMinimizerInline are cleared in the
+      // finally block after postMessage. KEM and Correspondence are dispatched
+      // from the AMBI_DONE handler — by that point both are null. Extract the
+      // fragments each Stage 6/7 worker needs and store on cameraContainer now.
+      {
+        const _t = this._pendingTopoInline;
+        const _m = this._pendingMinimizerInline;
+        if (_t || _m) {
+          try {
+            this._updateCameraContainer({
+              passThrough: {
+                stage67Inputs: {
+                  primeEnds:   _t?.primeEnds   ?? null,  // Correspondence — array of PrimeEnd
+                  topologyMap: _t?.topologyMap ?? null,  // Correspondence — Int32Array res²
+                  motionMaps:  _t?.motionMaps  ?? null,  // KEM — { motionMagnitude, motionEndsMap }
+                  phiMin:      _m?.phiMin      ?? null   // KEM + Correspondence — Float32Array res²
+                }
+              }
+            });
+            console.log('[Stage67] main.js: stage67Inputs stored on cameraContainer:', {
+              hasPrimeEnds:   !!(_t?.primeEnds),
+              hasTopologyMap: !!(_t?.topologyMap),
+              hasMotionMaps:  !!(_t?.motionMaps),
+              hasPhiMin:      !!(_m?.phiMin),
+              primeEndsCount: _t?.primeEnds?.length    ?? 0,
+              topologyMapLen: _t?.topologyMap?.length  ?? 0,
+              phiMinLen:      _m?.phiMin?.length       ?? 0
+            });
+          } catch (e) {
+            console.warn('[Stage67] main.js: stage67Inputs writeback failed', e);
+          }
+        }
+      }
+
       if (this._ambiWorker) {
         try {
           this._ambiWorker.postMessage({
-            op:      'AMBI_ANALYZE',
-            jobId:   `ambi:${metaKey}:${Date.now()}`,
+            op:       'AMBI_ANALYZE',
+            jobId:    `ambi:${metaKey}:${Date.now()}`,
             metaKey,
             cameraId: cc.cameraId ?? 'default',
-            flags:   this._currentFlags ?? {},
-            stage4a: cc.stage4a,
-            stage4b: cc.stage4b,
-            // Stage 1 inline — directness/modal/penumbra transferred directly,
-            // not loaded from IDB. ambi.worker reads from msg.stage1Inline.
-            stage1Inline: cc.stage1Inline ?? null,
-            // dgInline: kH and principalE1/E2 forwarded directly
-                  dgInline:   cc.dgInline            ?? null,
-                  topoInline: cc.stage4a?.topoInline ?? null,
-                  artifactKeys: {
-                    // Stage 4B
-                    phiMinKey:               cc.stage4b.phiMinKey               ?? null,
-                    zeroCurveKey:            cc.stage4b.zeroCurveKey            ?? null,
-                    constrainedMinimizerKey: cc.stage4b.constrainedMinimizerKey ?? null,
-                    // Stage 4A
-                    primeEndsKey:            cc.stage4a.primeEndsKey            ?? null,
-                    topologyMapKey:          cc.stage4a.topologyMapKey          ?? null,
-                    componentMapKey:         cc.stage4a.componentMapKey         ?? null,
-                    lipschitzEndsKey:        cc.stage4a.lipschitzEndsKey        ?? null,
-                    motionMapsKey:           cc.stage4a.motionMapsKey           ?? null,
-                    // Stage 3 / DifferentialGeometry
-                    principalFrameKey:       null,  // e1/e2 in dgInline
-                    curvatureKey:            null,  // kH in dgInline
-                    directionalFieldKey:     cc.directionalFieldKey             ?? null,
-                    // Stage 1 keys — null, data is in stage1Inline above
-                    directnessKey:           null,
-                    penumbraKey:             null,
-                    // Meta
-                    resolution:              cc.differentialGeometry?.reconstructionResolution
-                                             ?? cc.reconstructionResolution
-                                             ?? 512,
-                    cameraId:                cc.cameraId ?? 'default'
-                  }
+            flags:    this._currentFlags ?? {},
+            stage4a:  cc.stage4a,
+            stage4b:  cc.stage4b,
+            stage1Inline:    cc.stage1Inline ?? null,
+            dgInline:        cc.dgInline     ?? null,
+            // Transient payloads — large typed arrays forwarded directly and then discarded.
+            // These are never stored on cameraContainer.
+            topoInline:             this._pendingTopoInline      ?? null,
+            minimizerInline:        this._pendingMinimizerInline ?? null,
+            directionalFieldInline: cc.directionalFieldInline    ?? null,
+            artifactKeys: {
+              // All Stage 4A/4B artifact keys are null — data travels inline above.
+              phiMinKey:               null,
+              zeroCurveKey:            null,
+              constrainedMinimizerKey: null,
+              primeEndsKey:            null,
+              topologyMapKey:          null,
+              componentMapKey:         null,
+              lipschitzEndsKey:        null,
+              motionMapsKey:           null,
+              principalFrameKey:       null,
+              curvatureKey:            null,
+              directionalFieldKey:     cc.directionalFieldInline ? null : (cc.directionalFieldKey ?? null),
+              directnessKey:           null,
+              penumbraKey:             null,
+              resolution:              cc.differentialGeometry?.reconstructionResolution
+                                       ?? cc.reconstructionResolution
+                                       ?? 512,
+              cameraId:                cc.cameraId ?? 'default'
+            }
           });
           console.log('[Stage5] main.js: ambi.worker dispatched (AMBI_ANALYZE)', { metaKey });
         } catch (ambiErr) {
           console.warn('[Stage5] main.js: ambi.worker dispatch failed', ambiErr);
+        } finally {
+          // Discard transient payloads — large typed arrays must not be held beyond this point
+          this._pendingTopoInline      = null;
+          this._pendingMinimizerInline = null;
         }
       } else {
         console.warn('[Stage5] main.js: _ambiWorker not ready — AMBI_ANALYZE skipped for', metaKey);
+      }
+
+      // Resume evictor now that Stage 4 IDB reads (directional_field, disk_seeds,
+      // flow_field) are complete. Keeping it paused longer risks quota overflow.
+      try { storageAPI.startEvictorLoop(); } catch(e) {
+        console.warn('[Stage4] main.js: failed to resume evictor', e);
       }
     }
   }

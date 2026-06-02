@@ -1755,43 +1755,34 @@ const putInboundArtifact = async (artifact) => {
           const utilization = totalBytes / quotaBytes;
           
           if (utilization > 0.95) {
-            // ========================================
-            // CRITICAL PRESSURE (>95%)
-            // ========================================
-            // Risk: Imminent quota overflow
-            // Action: Immediate eviction (no delay)
-            // Tradeoff: May evict artifacts before consumers claim them
-            //           but prevents database writes from failing
-            // ========================================
+            // CRITICAL PRESSURE (>95%): delay eviction to allow pending IDB reads
+            // (topology.worker, ambi.worker etc.) to acquire their readonly
+            // transactions before the eviction readwrite lock blocks them.
+            // RECON_DONE dispatches topology immediately after the last artifact
+            // write — without this delay, the eviction readwrite transaction
+            // starts before topology.worker can open IDB, causing a 20s hang.
             console.warn(
               `storage: CRITICAL quota pressure (${(utilization * 100).toFixed(1)}%), ` +
-              `immediate eviction (${(totalBytes / (1024 * 1024)).toFixed(1)}MB / ${(quotaBytes / (1024 * 1024)).toFixed(1)}MB)`
+              `scheduling eviction in 5s (${(totalBytes / (1024 * 1024)).toFixed(1)}MB / ${(quotaBytes / (1024 * 1024)).toFixed(1)}MB)`
             );
-            
-            checkQuotaAndEvict().catch(err => 
-              console.error('storage: critical eviction failed', err)
-            );
-            
+            setTimeout(() => {
+              checkQuotaAndEvict().catch(err =>
+                console.error('storage: critical eviction failed', err)
+              );
+            }, 5_000);
+
           } else if (utilization > 0.85) {
-            // ========================================
-            // HIGH PRESSURE (85-95%)
-            // ========================================
-            // Risk: Moderate, approaching quota limits
-            // Action: Delayed eviction (100ms window)
-            // Benefit: Gives consumers ~100ms to claim artifacts
-            //          Fast consumers (50ms claim latency) are protected
-            // ========================================
-          } else if (utilization > 0.85) {
+            // HIGH PRESSURE (85-95%): same delay — fixes the duplicate else-if
+            // bug where this branch was previously unreachable.
             console.log(
               `storage: HIGH quota pressure (${(utilization * 100).toFixed(1)}%), ` +
-              `delayed eviction in 500ms (extended delay for pin safety)`
+              `scheduling eviction in 5s`
             );
-            
             setTimeout(() => {
-              checkQuotaAndEvict().catch(err => 
+              checkQuotaAndEvict().catch(err =>
                 console.warn('storage: delayed eviction failed', err)
               );
-            }, 500);
+            }, 5_000);
             
           } else {
             // ========================================

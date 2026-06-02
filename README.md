@@ -1,5 +1,9 @@
 (subject to change during development)
 
+
+turning any monocular video into a geometrically and topologically structured description of the motion it contains, without depth sensors, markers, or training data.
+
+
 motion-painter/
 ├── src/
 │ ├── js/

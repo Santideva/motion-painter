@@ -191,36 +191,14 @@ async function _runPhaseB(job, topoData) {
       diagnostics, telemetry
     } = result;
 
-    const resolution  = module._w;
-    const persistMeta = {
-      sourceMetaKey:      metaKey,
-      resolution,
-      converged,
-      stopReason,
-      iterations:         diagnostics.iterations,
-      targetAreas:        diagnostics.targetAreas,
-      finalAreas:         diagnostics.finalAreas,
-      topologyConsistent: diagnostics.topologyConsistent,
-      socPixelCount:      job.socPixelCount ?? 0,
-      solveMs,
-      processingMs:       Date.now() - startMs,
-      computedAt:         Date.now()
-    };
+    // Derive resolution from phiMin array length — module._w may reflect the
+    // constructor `resolution` param rather than the actual working grid size
+    // when MinimizerModule determines its grid from signedSdf.length internally.
+    const resolution = phiMin?.length > 0
+      ? Math.round(Math.sqrt(phiMin.length))
+      : (module._w ?? 512);
 
-    const TTL = PersistenceHelper.TTL.PINNED;  // 300_000 ms
-
-    // ── Persist phiMin ──────────────────────────────────────────────────
-    // FIX MW-B6: ttl and pinType moved inside descriptor (were silent third arg)
-    const phiMinResult = await PersistenceHelper.persist(store, {
-      type:    'phi_min',
-      data:    { phi: phiMin, width: resolution, height: resolution },
-      meta:    { ...persistMeta },
-      ttl:     TTL,
-      pinType: PersistenceHelper.PIN.SOFT
-    });
-
-    // ── Persist zeroCurve ───────────────────────────────────────────────
-    // Serialise loops/arcs (convert Float32Arrays to plain arrays for JSON)
+    // ── Serialise zeroCurve for inline transfer and background IDB ────────
     const zeroCurveSerial = {
       loops: zeroCurve.loops.map(l => ({
         ...l,
@@ -238,67 +216,96 @@ async function _runPhaseB(job, topoData) {
       chainCount:         zeroCurve.chainCount
     };
 
-    // FIX MW-B6: ttl and pinType moved inside descriptor
-    const zeroCurveResult = await PersistenceHelper.persist(store, {
-      type:    'zero_curve',
-      data:    zeroCurveSerial,
-      meta:    {
-        ...persistMeta,
-        loopCount: zeroCurve.loops.length,
-        arcCount:  zeroCurve.arcs.length
-      },
-      ttl:     TTL,
-      pinType: PersistenceHelper.PIN.SOFT
-    });
-
-    // ── Persist constrained_minimizer ───────────────────────────────────
-    // FIX MW-B6: ttl and pinType moved inside descriptor
-    const minimizerResult = await PersistenceHelper.persist(store, {
-      type:    'constrained_minimizer',
-      data:    {
-        phiMinKey:    phiMinResult?.metaKey    ?? null,
-        zeroCurveKey: zeroCurveResult?.metaKey ?? null,
-        diagnostics
-      },
-      meta:    { ...persistMeta },
-      ttl:     TTL,
-      pinType: PersistenceHelper.PIN.SOFT
-    });
-
-    // ── Persist telemetry (debug only) ──────────────────────────────────
-    // FIX MW-B6: ttl and pinType moved inside descriptor
-    let telemetryResult = null;
-    if (_flags.packingDebug) {
-      telemetryResult = await PersistenceHelper.persist(store, {
-        type:    'minimizer_telemetry',
-        data:    {
-          convergenceCurve: Array.from(telemetry.convergenceCurve),
-          lambdaCurve:      Array.from(telemetry.lambdaCurve),
-          maxDeltaPhiCurve: Array.from(telemetry.maxDeltaPhiCurve),
-          bandExpansions:   telemetry.bandExpansions,
-          reinitCount:      telemetry.reinitCount
-        },
-        meta:    { ...persistMeta },
-        ttl:     PersistenceHelper.TTL.DEBUG,   // 30_000 ms
-        pinType: PersistenceHelper.PIN.SOFT
-      });
-    }
-
+    // ── Broadcast immediately — ambi.worker reads minimizerInline directly ─
+    // IDB persistence runs fire-and-forget below; pipeline does not wait for it.
     _bcPost({
       event:                   'MINIMIZER_DONE',
       metaKey,
       jobId,
-      constrainedMinimizerKey: minimizerResult?.metaKey    ?? null,
-      phiMinKey:               phiMinResult?.metaKey       ?? null,
-      zeroCurveKey:            zeroCurveResult?.metaKey    ?? null,
-      telemetryKey:            telemetryResult?.metaKey    ?? null,
+      // Keys null — consumers use minimizerInline directly.
+      constrainedMinimizerKey: null,
+      phiMinKey:               null,
+      zeroCurveKey:            null,
+      telemetryKey:            null,
       converged,
       stopReason,
       targetArea:              diagnostics.targetAreas[0]  ?? null,
       finalArea:               diagnostics.finalAreas[0]   ?? null,
       topologyConsistent:      diagnostics.topologyConsistent,
+      minimizerInline: {
+        phiMin,                    // Float32Array — structured-cloned
+        zeroCurve: zeroCurveSerial,
+        diagnostics,
+        resolution,
+        converged,
+        stopReason
+      },
       processingMs:            Date.now() - startMs
     });
+
+    // ── Fire-and-forget IDB persistence (cold-start recovery only) ────────
+    (async () => {
+      const persistMeta = {
+        sourceMetaKey:      metaKey,
+        resolution,
+        converged,
+        stopReason,
+        iterations:         diagnostics.iterations,
+        targetAreas:        diagnostics.targetAreas,
+        finalAreas:         diagnostics.finalAreas,
+        topologyConsistent: diagnostics.topologyConsistent,
+        socPixelCount:      job.socPixelCount ?? 0,
+        solveMs,
+        processingMs:       Date.now() - startMs,
+        computedAt:         Date.now()
+      };
+      const TTL = PersistenceHelper.TTL.PINNED;
+      try {
+        const phiMinResult = await PersistenceHelper.persist(store, {
+          type:    'phi_min',
+          data:    { phi: phiMin, width: resolution, height: resolution },
+          meta:    { ...persistMeta },
+          ttl:     TTL,
+          pinType: PersistenceHelper.PIN.SOFT
+        });
+        const zeroCurveResult = await PersistenceHelper.persist(store, {
+          type:    'zero_curve',
+          data:    zeroCurveSerial,
+          meta:    { ...persistMeta, loopCount: zeroCurve.loops.length, arcCount: zeroCurve.arcs.length },
+          ttl:     TTL,
+          pinType: PersistenceHelper.PIN.SOFT
+        });
+        await PersistenceHelper.persist(store, {
+          type:    'constrained_minimizer',
+          data:    {
+            phiMinKey:    phiMinResult?.metaKey    ?? null,
+            zeroCurveKey: zeroCurveResult?.metaKey ?? null,
+            diagnostics
+          },
+          meta:    { ...persistMeta },
+          ttl:     TTL,
+          pinType: PersistenceHelper.PIN.SOFT
+        });
+        if (_flags.packingDebug && telemetry) {
+          await PersistenceHelper.persist(store, {
+            type:    'minimizer_telemetry',
+            data:    {
+              convergenceCurve: Array.from(telemetry.convergenceCurve),
+              lambdaCurve:      Array.from(telemetry.lambdaCurve),
+              maxDeltaPhiCurve: Array.from(telemetry.maxDeltaPhiCurve),
+              bandExpansions:   telemetry.bandExpansions,
+              reinitCount:      telemetry.reinitCount
+            },
+            meta:    { ...persistMeta },
+            ttl:     PersistenceHelper.TTL.DEBUG,
+            pinType: PersistenceHelper.PIN.SOFT
+          });
+        }
+        console.log('[minimizer.worker] Background persistence complete');
+      } catch (e) {
+        console.warn('[minimizer.worker] Background persistence failed (non-fatal):', e.message);
+      }
+    })();
 
   } catch (err) {
     console.error('[minimizer.worker] Phase B failed:', err);
@@ -595,7 +602,10 @@ self.onmessage = async (evt) => {
         // Add 30s margin for IDB persist inside TopologyAnalyzer.
         const _topoRes  = Math.min(artifactKeys.resolution ?? 512,
                                    _flags.topoMaxResolution    ?? 512);
-        const timeoutMs = 60_000 * Math.pow(Math.max(_topoRes, 512) / 512, 2) + 30_000;
+        // Base increased from 60s → 180s to match topology.worker's own timeout budget.
+        // At 512², topology takes ~29s + fire-and-forget IDB writes under quota pressure.
+        // minimizer must wait the full duration before falling back to null topology.
+        const timeoutMs = 180_000 * Math.pow(Math.max(_topoRes, 512) / 512, 2) + 30_000;
         console.log(`[minimizer.worker] Waiting up to ${(timeoutMs/1000).toFixed(0)}s for TOPOLOGY_DONE (topoRes=${_topoRes})`);
         setTimeout(() => {
           const jobMatch = _pendingJob?.jobId === jobId;

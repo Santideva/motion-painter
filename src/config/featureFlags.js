@@ -162,7 +162,18 @@ const DEFAULTS = {
 
     // ── Stage 4A: topology analysis ──────────────────────────────────────────
     enablePrimeEnds:         true,
+    // Fraction of the PackingSDF narrow band to retain for topology.
+    // PackingSDF band is wide (penumbra-scaled); >20% coverage causes
+    // pathological cycle counts. 0.25 keeps the tightest quartile.
+    topoNarrowBandFraction:  0.25,
     enableLQE:               true,
+    // Maximum side length (px) topology.worker downsamples to before running
+    // PixelGraph/PrimeEnds/LQE. Lower = faster but less accurate topology.
+    topoMaxResolution:       512,
+    // Guard for background IDB persistence of topology artifacts.
+    // false = skip entirely (normal path; data travels inline via topoInline).
+    // true  = persist prime_ends, topology_map etc. for cold-start recovery.
+    persistTopologyArtifacts: false,
     // PixelGraph gradient fusion weights (must sum to 1.0)
     topoGradWeightDir:       0.6,    // directional field weight
     topoGradWeightKH:        0.3,    // |kH| curvature weight
@@ -190,6 +201,15 @@ const DEFAULTS = {
     lqeMaxAspectRatio:       10.0,   // elongation filter
     lqeMaxEccentricity:      0.97,   // eccentricity filter
     lqeTrimmedMeanFrac:      0.05,   // per-end descriptor trimming
+
+    // ── Stage 4B: constrained minimizer ──────────────────────────────────────
+    minimizerMaxIter:        100,    // maximum PDE iterations
+    minimizerTolArea:        0.02,   // area convergence tolerance (fraction)
+    minimizerTolPhi:         0.005,  // phi convergence tolerance
+    minimizerReinitFreq:     10,     // reinitialization every N iterations
+    minimizerContactAlpha:   0.3,    // contact angle enforcement blend weight
+    minimizerBandWidth:      6,      // narrow band initial width (pixels)
+    minimizerDt:             null,   // PDE time step (null = auto: 0.2/resolution)
 
     // ── Stage 6: KEM ──────────────────────────────────────────────────────
   kemSplitThreshold:               2.0,   // KEM ratio above end-mean to split a clade
@@ -226,7 +246,7 @@ const DEFAULTS = {
   ambiLegibilityWeightThresh:      0.1,    // minimum weight for coverage fraction count
 
   // Debug
-  ambiDebug:                       true,  // emit ambi_anamorph_telemetry artifact
+  ambiDebug:                       false,  // emit ambi_anamorph_telemetry artifact (expensive: disable in production)
 
   // Pipeline phase control (NEW)
   // enablePreprocessAnnotate: allow preprocessors to annotate manifests / metadata
@@ -913,6 +933,62 @@ function _coerceOrWarn(key, value) {
     // ── Stage 4A ──────────────────────────────────────────────────────────────
     if (key === 'enablePrimeEnds' || key === 'enableLQE') {
       return typeof value === 'string' ? value === 'true' : !!value;
+    }
+
+    if (key === 'topoMaxResolution') {
+      const n = Math.floor(Number(value));
+      if (Number.isFinite(n) && n >= 64) return Math.min(2048, n);
+      return DEFAULTS.topoMaxResolution;
+    }
+
+    if (key === 'persistTopologyArtifacts') {
+      if (value === 'true'  || value === true)  return true;
+      if (value === 'false' || value === false) return false;
+      return DEFAULTS.persistTopologyArtifacts;
+    }
+
+    // ── Stage 4B ──────────────────────────────────────────────────────────────
+    if (key === 'minimizerMaxIter') {
+      const n = Math.floor(Number(value));
+      if (Number.isFinite(n) && n >= 1) return Math.min(2000, n);
+      return DEFAULTS.minimizerMaxIter;
+    }
+
+    if (key === 'minimizerTolArea' || key === 'minimizerTolPhi') {
+      const n = Number(value);
+      if (Number.isFinite(n) && n > 0) return clamp(n, 1e-6, 1.0);
+      return DEFAULTS[key];
+    }
+
+    if (key === 'minimizerReinitFreq') {
+      const n = Math.floor(Number(value));
+      if (Number.isFinite(n) && n >= 1) return Math.min(100, n);
+      return DEFAULTS.minimizerReinitFreq;
+    }
+
+    if (key === 'minimizerContactAlpha') {
+      const n = Number(value);
+      if (Number.isFinite(n)) return clamp(n, 0.0, 1.0);
+      return DEFAULTS.minimizerContactAlpha;
+    }
+
+    if (key === 'minimizerBandWidth') {
+      const n = Math.floor(Number(value));
+      if (Number.isFinite(n) && n >= 1) return Math.min(64, n);
+      return DEFAULTS.minimizerBandWidth;
+    }
+
+    if (key === 'minimizerDt') {
+      if (value === null || value === 'null') return null;
+      const n = Number(value);
+      if (Number.isFinite(n) && n > 0) return n;
+      return DEFAULTS.minimizerDt;
+    }
+
+    if (key === 'ambiDebug') {
+      if (value === 'true'  || value === true)  return true;
+      if (value === 'false' || value === false) return false;
+      return DEFAULTS.ambiDebug;
     }
 
     if ([

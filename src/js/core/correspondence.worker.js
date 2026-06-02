@@ -128,78 +128,92 @@ async function _handleCorrespondenceAnalyze(msg) {
     const api = await _loadStorageAPI();
     const sw  = _wrapStorage(api);
 
-    // ── Load Group A: always required ─────────────────────────────────────
-    const [
-      warpFieldArt,
-      worldFrameMapArt,
-      primeEndsArt,
-      topologyMapArt       // promoted to Group A — needed for per-end index
-    ] = await Promise.all([
-      _loadArtifact(api, artifactKeys.warpFieldKey),
-      _loadArtifact(api, artifactKeys.worldFrameMapKey),
-      _loadArtifact(api, artifactKeys.primeEndsKey),
-      _loadArtifact(api, artifactKeys.topologyMapKey)
-    ]);
-
-    if (!warpFieldArt)     throw new Error('warp_field artifact required for correspondence');
-    if (!worldFrameMapArt) throw new Error('world_frame_map artifact required for correspondence');
-    if (!primeEndsArt)     throw new Error('prime_ends artifact required for correspondence');
-
-    // topologyMap is critical for per-end indexing; warn but continue if absent
-    if (!topologyMapArt) {
-      console.warn(
-        '[correspondence.worker] topology_map absent — per-end spatial index ' +
-        'disabled; correspondence will use global fallback (degraded mode). ' +
-        'Cross-boundary unmatched check is also disabled.'
-      );
-    }
-
-    // ── Load Group B: soft failures ───────────────────────────────────────
-    const [
-      phiMinArt,
-      surfaceParamArt
-    ] = await Promise.all([
-      _loadArtifact(api, artifactKeys.phiMinKey),
-      _loadArtifact(api, artifactKeys.surfaceParamKey)
-    ]);
-
-    // ── Unpack ─────────────────────────────────────────────────────────────
+    // ── Resolve all inputs — inline-first, IDB fallback ──────────────────
     const resolution = artifactKeys.resolution ?? 512;
     const N          = resolution * resolution;
 
-    // warp_field → Float32Array
-    const warpFieldRaw = warpFieldArt.data?.field;
-    if (!warpFieldRaw) throw new Error('warp_field artifact missing field data');
-    const warpField = new Float32Array(warpFieldRaw);
-
-    // world_frame_map → Int32Array
-    const worldFrameMapRaw = worldFrameMapArt.data?.map;
-    if (!worldFrameMapRaw) throw new Error('world_frame_map artifact missing map data');
-    const worldFrameMap = new Int32Array(worldFrameMapRaw);
-
-    // prime_ends: PrimeEnd[] with boundaryInterval attached (Fix 1B)
-    const ends = primeEndsArt.data?.ends ?? [];
-    if (ends.length === 0) {
-      console.warn('[correspondence.worker] prime_ends has no ends — symmetry axis will be degenerate');
-    }
-
-    // topology_map → Int32Array (null in degraded mode)
-    // Used by CorrespondenceModule to build per-end spatial index and for
-    // the explicit cross-boundary unmatched check.
-    const topologyMap = topologyMapArt?.data?.map
-      ? new Int32Array(topologyMapArt.data.map)
-      : null;
-
-    // narrowBandMask — reconstructed from phi_min
-    let narrowBandMask;
-    if (phiMinArt?.data?.phi) {
-      narrowBandMask = _narrowBandFromPhi(new Float32Array(phiMinArt.data.phi), resolution);
+    // warpField — from warpFieldInline (ambi AMBI_DONE) or IDB
+    let warpField = null;
+    if (msg.warpFieldInline?.field) {
+      warpField = msg.warpFieldInline.field instanceof Float32Array
+        ? msg.warpFieldInline.field
+        : new Float32Array(msg.warpFieldInline.field);
+      console.log('[correspondence.worker] warpField from inline, length:', warpField.length);
     } else {
-      console.warn('[correspondence.worker] phi_min absent — using full-image narrow band');
-      narrowBandMask = new Float32Array(N).fill(1);
+      const wfArt = await _loadArtifact(api, artifactKeys.warpFieldKey);
+      if (!wfArt?.data?.field) throw new Error('warp_field artifact required for correspondence');
+      warpField = new Float32Array(wfArt.data.field);
     }
 
-    const legibilityScore = surfaceParamArt?.data?.legibilityScore ?? 1.0;
+    // worldFrameMap — from worldFrameMapInline (ambi AMBI_DONE) or IDB
+    let worldFrameMap = null;
+    if (msg.worldFrameMapInline?.map) {
+      worldFrameMap = msg.worldFrameMapInline.map instanceof Int32Array
+        ? msg.worldFrameMapInline.map
+        : new Int32Array(msg.worldFrameMapInline.map);
+      console.log('[correspondence.worker] worldFrameMap from inline, length:', worldFrameMap.length);
+    } else {
+      const wfmArt = await _loadArtifact(api, artifactKeys.worldFrameMapKey);
+      if (!wfmArt?.data?.map) throw new Error('world_frame_map artifact required for correspondence');
+      worldFrameMap = new Int32Array(wfmArt.data.map);
+    }
+
+    // primeEnds — from primeEndsInline (topoInline.primeEnds) or IDB
+    let ends = [];
+    if (Array.isArray(msg.primeEndsInline) && msg.primeEndsInline.length > 0) {
+      ends = msg.primeEndsInline;
+      console.log('[correspondence.worker] primeEnds from inline:', ends.length, 'ends');
+    } else {
+      const peArt = await _loadArtifact(api, artifactKeys.primeEndsKey);
+      ends = peArt?.data?.ends ?? [];
+      if (ends.length === 0) {
+        console.warn('[correspondence.worker] prime_ends has no ends — symmetry axis will be degenerate');
+      }
+    }
+
+    // topologyMap — from topologyMapInline (topoInline.topologyMap) or IDB
+    let topologyMap = null;
+    if (msg.topologyMapInline) {
+      topologyMap = msg.topologyMapInline instanceof Int32Array
+        ? msg.topologyMapInline
+        : new Int32Array(msg.topologyMapInline);
+      console.log('[correspondence.worker] topologyMap from inline, length:', topologyMap.length);
+    } else {
+      const tmArt = await _loadArtifact(api, artifactKeys.topologyMapKey);
+      if (tmArt?.data?.map) {
+        topologyMap = new Int32Array(tmArt.data.map);
+      } else {
+        console.warn(
+          '[correspondence.worker] topology_map absent — per-end spatial index ' +
+          'disabled; correspondence will use global fallback (degraded mode).'
+        );
+      }
+    }
+
+    // narrowBandMask — reconstruct from phiMinInline or IDB phi artifact
+    let narrowBandMask;
+    if (msg.phiMinInline instanceof Float32Array) {
+      narrowBandMask = _narrowBandFromPhi(msg.phiMinInline, resolution);
+      console.log('[correspondence.worker] narrowBandMask reconstructed from phiMinInline');
+    } else {
+      const phiArt = await _loadArtifact(api, artifactKeys.phiMinKey);
+      if (phiArt?.data?.phi) {
+        narrowBandMask = _narrowBandFromPhi(new Float32Array(phiArt.data.phi), resolution);
+      } else {
+        console.warn('[correspondence.worker] phiMin absent — using full-image narrow band');
+        narrowBandMask = new Float32Array(N).fill(1);
+      }
+    }
+
+    // legibilityScore — from surfaceParamInline or IDB
+    let legibilityScore = 1.0;
+    if (msg.surfaceParamInline) {
+      legibilityScore = msg.surfaceParamInline.legibilityScore ?? 1.0;
+      console.log('[correspondence.worker] surfaceParam from inline');
+    } else {
+      const spArt = await _loadArtifact(api, artifactKeys.surfaceParamKey);
+      legibilityScore = spArt?.data?.legibilityScore ?? 1.0;
+    }
 
     // ── Construct and run CorrespondenceModule ─────────────────────────────
     const corrModule = new CorrespondenceModule({

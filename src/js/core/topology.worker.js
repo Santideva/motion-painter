@@ -53,9 +53,17 @@ function _wrapStorage(api) {
 }
 
 // ── Load a single artifact by metaKey (with retry) ────────────────────────
-async function _loadArtifact(api, metaKey) {
+async function _loadArtifact(api, metaKey, timeoutMs = 20_000) {
   if (!metaKey) return null;
-  return _retryable(() => api.getArtifact(metaKey));
+  const result = await Promise.race([
+    _retryable(() => api.getArtifact(metaKey)),
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(
+        `getArtifact timed out after ${timeoutMs}ms for key: ${metaKey}`
+      )), timeoutMs)
+    )
+  ]);
+  return result;
 }
 
 // ── Error summary ─────────────────────────────────────────────────────────
@@ -126,6 +134,26 @@ self.onmessage = async (evt) => {
       loadStartedAt:       _artifactLoadStart
     });
 
+    const directionalFieldInline = msg.directionalFieldInline ?? null;
+    const directionalFieldArtInline = directionalFieldInline
+      ? { data: {
+            field: directionalFieldInline.field ?? null,
+            coherence: (directionalFieldInline.coherence instanceof Float32Array)
+              ? { perPixel: directionalFieldInline.coherence }
+              : (directionalFieldInline.coherence ?? null),
+            derivatives: directionalFieldInline.derivatives ?? null
+          } }
+      : null;
+
+    if (directionalFieldInline) {
+      console.log('[topology.worker] directionalFieldInline received — IDB read bypassed', {
+        fieldLength:      directionalFieldInline.field?.length ?? 0,
+        coherenceLength:  directionalFieldInline.coherence?.perPixel?.length
+                        ?? directionalFieldInline.coherence?.length ?? 0,
+        derivatives:      !!directionalFieldInline.derivatives
+      });
+    }
+
     // sdfFieldArt is constructed from sdfInline — not loaded from IDB.
     // sdfFieldKey is null (the IDB record contains only scalar metadata).
     // Shape matches what getArtifact would have returned so downstream
@@ -152,8 +180,8 @@ self.onmessage = async (evt) => {
       console.warn('[topology.worker] sdfInline absent — sdfFieldArt will be null');
     }
 
+    const _tap = (label, p) => p.then(r => { console.log(`[topology.worker] ✓ ${label}:`, !!r); return r; });
     const [
-      directionalFieldArt,
       diskSeedsArt,
       curvatureArt,
       principalFrameArt,
@@ -162,15 +190,17 @@ self.onmessage = async (evt) => {
       flowDivArt,
       normalCurlArt
     ] = await Promise.all([
-      _loadArtifact(api, artifactKeys.directionalFieldKey),
-      _loadArtifact(api, artifactKeys.diskSeedsKey),
-      _loadArtifact(api, artifactKeys.curvatureKey),
-      _loadArtifact(api, artifactKeys.principalFrameKey),
-      _loadArtifact(api, artifactKeys.flowFieldKey),
-      _loadArtifact(api, artifactKeys.flowCurlKey),
-      _loadArtifact(api, artifactKeys.flowDivKey),
-      _loadArtifact(api, artifactKeys.normalCurlKey)
+      _tap('diskSeeds',        Promise.resolve(null)),   // unused by topology — minimizer receives seeds directly
+      _tap('curvature',      _loadArtifact(api, artifactKeys.curvatureKey)),
+      _tap('principalFrame', _loadArtifact(api, artifactKeys.principalFrameKey)),
+      _tap('flowField',      _loadArtifact(api, artifactKeys.flowFieldKey)),
+      _tap('flowCurl',       _loadArtifact(api, artifactKeys.flowCurlKey)),
+      _tap('flowDiv',        _loadArtifact(api, artifactKeys.flowDivKey)),
+      _tap('normalCurl',     _loadArtifact(api, artifactKeys.normalCurlKey))
     ]);
+
+    const directionalFieldArt = directionalFieldArtInline
+      ?? await _loadArtifact(api, artifactKeys.directionalFieldKey);
 
     // Stage 1 inline — directnessArt and penumbraArt from msg, not IDB
     const directnessArt = stage1Inline?.fMapFinal
@@ -281,12 +311,64 @@ self.onmessage = async (evt) => {
         flowDivergence:    _dsN(dgInline?.flowDiv   ?? null, 1),
       };
 
+      // ── Topology-specific narrow band re-thresholding ─────────────────────
+      // PackingSDF produces a wide band (penumbra-scaled) calibrated for the
+      // minimizer. For PixelGraph/PrimeEnds, >20% band coverage causes
+      // pathological cycle counts (b1 >> nodes) and defeats the cross-cut
+      // budget cap. Re-threshold to the tightest topoNarrowBandFraction of
+      // the existing band using the SDF value distribution within that band.
+      {
+        const _nbFrac  = _flags.topoNarrowBandFraction ?? 0.25;
+        const _sdfArr  = artifacts.signedSdf;
+        const _curMask = artifacts.narrowBandMask;
+        if (_sdfArr && _curMask && _nbFrac < 1.0) {
+          let _minV = Infinity, _maxV = 0, _bandN = 0;
+          for (let _i = 0; _i < _sdfArr.length; _i++) {
+            if (_curMask[_i] > 0) {
+              const _v = Math.abs(_sdfArr[_i]);
+              if (_v < _minV) _minV = _v;
+              if (_v > _maxV) _maxV = _v;
+              _bandN++;
+            }
+          }
+          const _prevFrac = _bandN / _sdfArr.length;
+          if (_prevFrac > _nbFrac && _maxV > _minV) {
+            const _BINS = 500, _hist = new Int32Array(_BINS), _range = _maxV - _minV;
+            for (let _i = 0; _i < _sdfArr.length; _i++) {
+              if (_curMask[_i] > 0) {
+                const _b = Math.min(_BINS - 1, (((Math.abs(_sdfArr[_i]) - _minV) / _range) * _BINS) | 0);
+                _hist[_b]++;
+              }
+            }
+            const _target = _bandN * _nbFrac;
+            let _cum = 0, _threshBin = _BINS - 1;
+            for (let _b = 0; _b < _BINS; _b++) { _cum += _hist[_b]; if (_cum >= _target) { _threshBin = _b; break; } }
+            const _thresh = _minV + (_threshBin + 1) / _BINS * _range;
+            const _tight  = new Float32Array(_sdfArr.length);
+            let   _tightN = 0;
+            for (let _i = 0; _i < _sdfArr.length; _i++) {
+              if (_curMask[_i] > 0 && Math.abs(_sdfArr[_i]) <= _thresh) { _tight[_i] = 1; _tightN++; }
+            }
+            artifacts.narrowBandMask = _tight;
+            console.log(
+              `[topology.worker] Narrow band re-thresholded: ` +
+              `${_bandN}→${_tightN}/${_sdfArr.length} pixels ` +
+              `(${(100*_prevFrac).toFixed(1)}%→${(100*_tightN/_sdfArr.length).toFixed(1)}%) ` +
+              `sdfThresh=${_thresh.toFixed(4)} fraction=${_nbFrac}`
+            );
+          }
+        }
+      }
+
       // ── Run analysis ──────────────────────────────────────────────────────
       console.log(
         `[topology.worker] Entering TopologyAnalyzer.compute() — ` +
         `topo=${topoWidth}x${topoHeight} (full res=${sourceWidth}x${sourceHeight}, scale=${scale.toFixed(2)})`
       );
-      const TOPOLOGY_TIMEOUT_MS = 60_000 * Math.max(1, (topoWidth * topoHeight) / (512 * 512));
+      // Base increased from 60s → 180s: at 512² resolution, computation takes
+      // ~29s leaving only 31s for 8 IDB artifact writes (topologyMap = 1MB alone).
+      // Under quota pressure IDB writes stall; 180s gives 3× headroom.
+      const TOPOLOGY_TIMEOUT_MS = 180_000 * Math.max(1, (topoWidth * topoHeight) / (512 * 512));
       console.log(`[topology.worker] Timeout budget: ${(TOPOLOGY_TIMEOUT_MS/1000).toFixed(0)}s`);
       const analyzer = new TopologyAnalyzer(_flags);
       const result = await Promise.race([

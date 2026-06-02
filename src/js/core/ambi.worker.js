@@ -147,45 +147,84 @@ async function _handleAmbiAnalyze(msg) {
   const startMs = Date.now();
 
   try {
+    // ── Resolve inline sources ────────────────────────────────────────────
+    const topoInline      = msg.topoInline      ?? null;
+    const minimizerInline = msg.minimizerInline ?? null;
+
+    if (!minimizerInline?.phiMin)    throw new Error('minimizerInline.phiMin required — was MINIMIZER_DONE missing minimizerInline?');
+    if (!minimizerInline?.zeroCurve) throw new Error('minimizerInline.zeroCurve required — was MINIMIZER_DONE missing minimizerInline?');
+    if (!topoInline?.topologyMap)    throw new Error('topoInline.topologyMap required — was TOPOLOGY_DONE missing topoInline?');
+    if (!topoInline?.primeEnds)      console.warn('[ambi.worker] topoInline.primeEnds absent — ends will be empty');
+
+    // ── Resolution audit ──────────────────────────────────────────────────
+    // topology.worker downsamples to topoMaxResolution (default 512).
+    // minimizer runs at full reconstructionResolution (e.g. 1024).
+    // Mismatch causes OOB reads on topology arrays and OOM from 1024² allocations.
+    // Derive from actual array length — minimizerInline.resolution may be stale
+    // or undefined if module._w doesn't match the internal working grid size.
+    const minimizerResolution = minimizerInline.phiMin?.length > 0
+      ? Math.round(Math.sqrt(minimizerInline.phiMin.length))
+      : (minimizerInline.resolution ?? artifactKeys.resolution ?? 512);
+    const topoResolution      = topoInline?.topoResolution
+      ?? (topoInline?.componentMap?.length > 0
+          ? Math.round(Math.sqrt(topoInline.componentMap.length))
+          : null)
+      ?? minimizerResolution;
+    const resolutionMismatch  = topoResolution !== minimizerResolution;
+
+    // Count in-band nodes from componentMap for topology health diagnostics
+    let _topoNodeCount = 0;
+    if (topoInline?.componentMap) {
+      for (let _i = 0; _i < topoInline.componentMap.length; _i++) {
+        if (topoInline.componentMap[_i] >= 0) _topoNodeCount++;
+      }
+    }
+
+    console.log('[ambi.worker] Inline data received:', {
+      hasPhiMin:           !!minimizerInline.phiMin,
+      hasZeroCurve:        !!minimizerInline.zeroCurve,
+      hasTopologyMap:      !!topoInline.topologyMap,
+      hasComponentMap:     !!topoInline?.componentMap,
+      primeEndsCount:      topoInline?.primeEnds?.length     ?? 0,
+      lipschitzEndsCount:  topoInline?.lipschitzEnds?.length ?? 0,
+      betti:               topoInline?.betti                 ?? null,
+      minimizerResolution,
+      topoResolution,
+      resolutionMismatch,
+      phiMinLength:        minimizerInline.phiMin?.length     ?? 0,
+      topologyMapLength:   topoInline?.topologyMap?.length    ?? 0,
+      componentMapLength:  topoInline?.componentMap?.length   ?? 0,
+      topoNodeCount:       _topoNodeCount,
+      topoBandFraction:    topoInline?.componentMap?.length > 0
+        ? (_topoNodeCount / topoInline.componentMap.length).toFixed(3)
+        : 'n/a'
+    });
+    if (resolutionMismatch) {
+      console.warn(
+        `[ambi.worker] ⚠ Resolution mismatch: topology=${topoResolution}² minimizer=${minimizerResolution}². ` +
+        `Downsampling phiMin to ${topoResolution}² — ambi runs at topoResolution to avoid OOB and OOM.`
+      );
+    }
+
+    // ── Load only what cannot travel inline ───────────────────────────────
+    // directionalArt: needed for coherencePerPixel only.
+    // principalFrameArt + curvatureArt: fallback only when dgInline absent.
     const api = await _loadStorageAPI();
     const sw  = _wrapStorage(api);
 
-    // ── Load Group A: always required ─────────────────────────────────────
-    const [
-      phiMinArt,
-      zeroCurveArt,
-      primeEndsArt,
-      topologyMapArt,
-      constrainedMinimizerArt
-    ] = await Promise.all([
-      _loadArtifact(api, artifactKeys.phiMinKey),
-      _loadArtifact(api, artifactKeys.zeroCurveKey),
-      _loadArtifact(api, artifactKeys.primeEndsKey),
-      _loadArtifact(api, artifactKeys.topologyMapKey),
-      _loadArtifact(api, artifactKeys.constrainedMinimizerKey)
-    ]);
-
-    if (!phiMinArt)              throw new Error('phi_min artifact required for AmbiAnamorph');
-    if (!zeroCurveArt)           throw new Error('zero_curve artifact required for AmbiAnamorph');
-    if (!primeEndsArt)           throw new Error('prime_ends artifact required for AmbiAnamorph');
-    if (!topologyMapArt)         throw new Error('topology_map artifact required for AmbiAnamorph');
-    if (!constrainedMinimizerArt) throw new Error('constrained_minimizer artifact required for AmbiAnamorph');
-
-    // ── Load Group B: soft failures ───────────────────────────────────────
-    const [
-      componentMapArt,
-      lipschitzEndsArt,
-      motionMapsArt,
-      principalFrameArt,
-      curvatureArt,
-      directionalArt
-    ] = await Promise.all([
-      _loadArtifact(api, artifactKeys.componentMapKey),
-      _loadArtifact(api, artifactKeys.lipschitzEndsKey),
-      _loadArtifact(api, artifactKeys.motionMapsKey),
-      _loadArtifact(api, artifactKeys.principalFrameKey),
-      _loadArtifact(api, artifactKeys.curvatureKey),
-      _loadArtifact(api, artifactKeys.directionalFieldKey)
+    const _dfInline = msg.directionalFieldInline ?? null;
+    const _dfArt = _dfInline
+      ? { data: {
+            field:    _dfInline.field,
+            coherence: (_dfInline.coherence instanceof Float32Array)
+              ? { perPixel: _dfInline.coherence }
+              : (_dfInline.coherence ?? null)
+          }}
+      : null;
+    const [directionalArt, principalFrameArt, curvatureArt] = await Promise.all([
+      _dfArt ? Promise.resolve(_dfArt) : _loadArtifact(api, artifactKeys.directionalFieldKey),
+      dgInline ? null : _loadArtifact(api, artifactKeys.principalFrameKey),
+      dgInline ? null : _loadArtifact(api, artifactKeys.curvatureKey)
     ]);
 
     // directnessArt and penumbraArt come from stage1Inline — not IDB.
@@ -206,47 +245,94 @@ async function _handleAmbiAnalyze(msg) {
           }}
       : null;
 
-    // ── Unpack Group A ─────────────────────────────────────────────────────
-    const phiMin         = phiMinArt.data.phi;
-    const narrowBandMask = phiMinArt.data.narrowBandMask
-                           ?? _buildNarrowBandFromPhi(phiMin, artifactKeys.resolution ?? 512);
-    const zeroCurve      = zeroCurveArt.data;
-    const ends           = primeEndsArt.data.ends ?? [];
-    const topologyMap    = new Int32Array(topologyMapArt.data.map ?? topologyMapArt.data);
+    // ── Unpack Group A — from minimizerInline and topoInline ──────────────
+    // Downsample phiMin to topoResolution when there is a mismatch.
+    // AmbiAnamorph then runs entirely at topoResolution — all arrays are
+    // consistent, OOB reads on topology arrays are eliminated, and peak
+    // memory is 4× lower than running at minimizerResolution (1024²).
+    const phiMin         = resolutionMismatch
+      ? _downsampleScalar(minimizerInline.phiMin, minimizerResolution, topoResolution)
+      : minimizerInline.phiMin;
+    const narrowBandMask = _buildNarrowBandFromPhi(phiMin, topoResolution);
+    // Scale zeroCurve pixel coordinates from minimizerResolution → topoResolution.
+    // zeroCurve.loops[].points[].{x,y} are produced by the minimizer at 1024²;
+    // ambi runs at 512². Unscaled coordinates map outside the grid → zero BFS seeds.
+    const _zcScale  = resolutionMismatch ? (topoResolution / minimizerResolution) : 1;
+    const zeroCurve = (minimizerInline.zeroCurve && _zcScale !== 1)
+      ? {
+          ...minimizerInline.zeroCurve,
+          loops: (minimizerInline.zeroCurve.loops ?? []).map(loop => ({
+            ...loop,
+            points: (loop.points ?? []).map(pt => ({
+              ...pt,
+              x: pt.x * _zcScale,
+              y: pt.y * _zcScale
+            }))
+          }))
+        }
+      : (minimizerInline.zeroCurve ?? null);
+    const ends           = topoInline?.primeEnds ?? [];
+    const topologyMap    = topoInline.topologyMap instanceof Int32Array
+                           ? topoInline.topologyMap
+                           : new Int32Array(topoInline.topologyMap);
     const minimizerDiagnostics = {
-      maxAreaErr:    constrainedMinimizerArt.data?.diagnostics?.maxAreaErr    ?? 0,
-      finalBandWidth: constrainedMinimizerArt.data?.diagnostics?.finalBandWidth ?? 6
+      maxAreaErr:     minimizerInline.diagnostics?.maxAreaErr     ?? 0,
+      finalBandWidth: minimizerInline.diagnostics?.finalBandWidth ?? 6
     };
 
-    const resolution = artifactKeys.resolution ?? 512;
-    const b0 = (stage4a?.betti?.b0 ?? msg.b0) ?? 1;
-    const b1 = (stage4a?.betti?.b1 ?? msg.b1) ?? 0;
+    // ambi runs at topoResolution — keeps all arrays consistent.
+    const resolution = topoResolution;
+    const b0 = (topoInline?.betti?.b0 ?? stage4a?.betti?.b0 ?? msg.b0) ?? 1;
+    const b1 = (topoInline?.betti?.b1 ?? stage4a?.betti?.b1 ?? msg.b1) ?? 0;
 
-    // ── Unpack Group B ─────────────────────────────────────────────────────
-    const componentMap = componentMapArt?.data?.map
-      ? new Int32Array(componentMapArt.data.map)
-      : null;
+    // ── Unpack Group B — from topoInline and dgInline ─────────────────────
+    const componentMap = topoInline?.componentMap instanceof Int32Array
+      ? topoInline.componentMap
+      : (topoInline?.componentMap ? new Int32Array(topoInline.componentMap) : null);
 
     if (!componentMap) {
       console.warn('[ambi.worker] componentMap absent — proceeding in degraded mode');
     }
 
-    const lipschitzEnds = lipschitzEndsArt?.data?.ends ?? [];
+    const lipschitzEnds = topoInline?.lipschitzEnds ?? [];
 
-    const motionMaps = motionMapsArt?.data
+    const motionMaps = topoInline?.motionMaps
       ? {
-          motionMagnitude: motionMapsArt.data.motionMagnitude ?? null,
-          saliencyMap:     motionMapsArt.data.saliencyMap     ?? null,
-          rotationalMap:   motionMapsArt.data.rotationalMap   ?? null
+          motionMagnitude: topoInline.motionMaps.motionMagnitude ?? null,
+          saliencyMap:     topoInline.motionMaps.saliencyMap     ?? null,
+          rotationalMap:   topoInline.motionMaps.rotationalMap   ?? null
         }
       : { motionMagnitude: null, saliencyMap: null, rotationalMap: null };
 
     // principalFrame and curvatureField from dgInline — no IDB read needed
-    const principalFrame = dgInline
+    // principalFrame — from dgInline at minimizerResolution (reconstructionResolution).
+    // dgInline format: { e1: Float32Array stride-2, e2: Float32Array stride-2 }.
+    // IDB fallback format: Float32Array stride-4 (e1x,e1y,e2x,e2y per pixel).
+    // buildWarpField seeds BFS using these vectors — wrong resolution → wrong
+    // edge weights on every pixel in the warp field.
+    const _pfRaw = dgInline
       ? { e1: dgInline.principalE1, e2: dgInline.principalE2 }
       : (principalFrameArt?.data?.frame ?? principalFrameArt?.data?.principalFrame ?? null);
+    let principalFrame = _pfRaw;
+    if (resolutionMismatch && _pfRaw) {
+      if (_pfRaw.e1 && _pfRaw.e2) {
+        // dgInline format: stride-2 xy-pair arrays
+        principalFrame = {
+          e1: _downsampleField(_pfRaw.e1, minimizerResolution, topoResolution, 2),
+          e2: _downsampleField(_pfRaw.e2, minimizerResolution, topoResolution, 2)
+        };
+      } else if (_pfRaw instanceof Float32Array) {
+        // IDB format: stride-4 flat array
+        principalFrame = _downsampleField(_pfRaw, minimizerResolution, topoResolution, 4);
+      }
+    }
 
-    const curvatureField = dgInline?.kH ?? curvatureArt?.data?.kH ?? null;
+    // curvatureField (kH) — scalar Float32Array at minimizerResolution.
+    // Used in integration weight computation (topoStab) and feature vectors (meanKH).
+    const _kHRaw     = dgInline?.kH ?? curvatureArt?.data?.kH ?? null;
+    const curvatureField = (resolutionMismatch && _kHRaw)
+      ? _downsampleScalar(_kHRaw, minimizerResolution, topoResolution)
+      : _kHRaw;
 
     if (dgInline) {
       console.log('[ambi.worker] DG fields from dgInline:', {
@@ -256,19 +342,51 @@ async function _handleAmbiAnalyze(msg) {
       });
     }
 
-    // Defensive coherence extraction (Issue 4)
-    const coherencePerPixel = _extractCoherence(directionalArt);
+    // Defensive coherence extraction — then downsample to topoResolution.
+    // directionalFieldInline is at minimizerResolution (reconstructionResolution).
+    // Undownsampled: _computeIntegrationWeights reads coherence[0..262143]
+    // which is the top-left quarter of the 1024² array, not a proper sample.
+    const _cohRaw = _extractCoherence(directionalArt);
+    const coherencePerPixel = (resolutionMismatch && _cohRaw)
+      ? _downsampleScalar(_cohRaw, minimizerResolution, topoResolution)
+      : _cohRaw;
     if (!coherencePerPixel) {
       console.warn('[ambi.worker] directional_field: coherence.perPixel absent — integration weights degraded');
     }
 
+    // directnessField.fMap — from stage1Inline at reconstructionResolution (1024²).
+    // Used in _computeIntegrationWeights (fMap exponent) and
+    // _computeFeatureVectorInputs (meanFMap). Undownsampled: reads top-left
+    // quarter of the 1024² array on every pixel loop iteration.
+    const _fMapRaw = directnessArt?.data?.fMap ?? directnessArt?.data?.directnessMap ?? null;
     const directnessField = directnessArt?.data
-      ? { fMap: directnessArt.data.fMap ?? directnessArt.data.directnessMap ?? null }
+      ? { fMap: (resolutionMismatch && _fMapRaw)
+              ? _downsampleScalar(_fMapRaw, minimizerResolution, topoResolution)
+              : _fMapRaw }
       : null;
 
+    // penumbraField.edgeMask — from stage1Inline at reconstructionResolution (1024²).
+    // Uint8Array — _downsampleScalar uses src.constructor so the type is preserved.
+    // Used in _computeFeatureVectorInputs (penumbraFraction).
+    const _edgeMaskRaw = penumbraArt?.data?.edgeMask ?? penumbraArt?.data?.edge_mask ?? null;
     const penumbraField = penumbraArt?.data
-      ? { edgeMask: penumbraArt.data.edgeMask ?? penumbraArt.data.edge_mask ?? null }
+      ? { edgeMask: (resolutionMismatch && _edgeMaskRaw)
+                ? _downsampleScalar(_edgeMaskRaw, minimizerResolution, topoResolution)
+                : _edgeMaskRaw }
       : null;
+
+    if (resolutionMismatch) {
+      console.log('[ambi.worker] Resolution reconciliation complete — all reconstruction-resolution inputs downsampled to topoResolution:', {
+        from:            minimizerResolution,
+        to:              topoResolution,
+        zeroCurveScaled: _zcScale !== 1 && !!zeroCurve,
+        principalFrameDs: !!principalFrame,
+        kHDownsampled:   !!curvatureField,
+        coherenceDs:     !!coherencePerPixel,
+        fMapDs:          !!directnessField?.fMap,
+        edgeMaskDs:      !!penumbraField?.edgeMask
+      });
+    }
 
     // ── Construct and run AmbiAnamorph ─────────────────────────────────────
     const ambi = new AmbiAnamorph({
@@ -313,85 +431,19 @@ async function _handleAmbiAnalyze(msg) {
       telemetry
     } = result;
 
-    // ── Persist artifacts ──────────────────────────────────────────────────
-    const store = _buildStore(sw);
-    const TTL   = PersistenceHelper.TTL?.PINNED ?? 300_000;
-
-    const persistMeta = {
-      sourceMetaKey: metaKey,
-      resolution,
-      structureId,
-      isKeyframe,
-      legibilityScore,
-      degradedMode,
-      b0, b1,
-      computedAt: Date.now()
-    };
-
-    // world_frame_map (Int32Array — convert to regular array for storage)
-    const worldFrameMapResult = await PersistenceHelper.persist(store, {
-      type:    'world_frame_map',
-      data:    { map: Array.from(worldFrameMap), width: resolution, height: resolution },
-      meta:    { ...persistMeta },
-      ttl:     TTL,
-      pinType: PersistenceHelper.PIN?.SOFT ?? 'soft'
-    });
-
-    // warp_field
-    const warpFieldResult = await PersistenceHelper.persist(store, {
-      type:    'warp_field',
-      data:    { field: Array.from(warpField), width: resolution, height: resolution },
-      meta:    { ...persistMeta },
-      ttl:     TTL,
-      pinType: PersistenceHelper.PIN?.SOFT ?? 'soft'
-    });
-
-    // integration_weights
-    const integrationWeightsResult = await PersistenceHelper.persist(store, {
-      type:    'integration_weights',
-      data:    { weights: Array.from(integrationWeights), width: resolution, height: resolution },
-      meta:    { ...persistMeta, ...diagnostics.integration },
-      ttl:     TTL,
-      pinType: PersistenceHelper.PIN?.SOFT ?? 'soft'
-    });
-
-    // surface_param (metadata + diagnostics)
-    const surfaceParamResult = await PersistenceHelper.persist(store, {
-      type:    'surface_param',
-      data:    {
-        surfaceParamMeta,
-        structureId,
-        legibilityScore,
-        viewManifoldComponent: componentId,
-        diagnostics
-      },
-      meta:    { ...persistMeta },
-      ttl:     TTL,
-      pinType: PersistenceHelper.PIN?.SOFT ?? 'soft'
-    });
-
-    // ambi_anamorph_telemetry (debug only)
-    let telemetryResult = null;
-    if (_flags.ambiDebug && telemetry) {
-      telemetryResult = await PersistenceHelper.persist(store, {
-        type:    'ambi_anamorph_telemetry',
-        data:    telemetry,
-        meta:    { ...persistMeta },
-        ttl:     PersistenceHelper.TTL?.DEBUG ?? 30_000,
-        pinType: PersistenceHelper.PIN?.SOFT ?? 'soft'
-      });
-    }
-
-    // ── Broadcast AMBI_DONE ────────────────────────────────────────────────
+    // ── Broadcast AMBI_DONE immediately with inline data ──────────────────
+    // IDB persistence runs fire-and-forget below so Stage 6/7 are unblocked
+    // immediately. Keys in broadcast are null — all consumers use inline data.
     _bcPost({
       event:                 'AMBI_DONE',
       metaKey,
       jobId,
-      worldFrameMapKey:      worldFrameMapResult?.metaKey       ?? null,
-      warpFieldKey:          warpFieldResult?.metaKey           ?? null,
-      integrationWeightsKey: integrationWeightsResult?.metaKey  ?? null,
-      surfaceParamKey:       surfaceParamResult?.metaKey        ?? null,
-      telemetryKey:          telemetryResult?.metaKey           ?? null,
+      // Keys null — set asynchronously by background persistence (not needed by consumers)
+      worldFrameMapKey:      null,
+      warpFieldKey:          null,
+      integrationWeightsKey: null,
+      surfaceParamKey:       null,
+      telemetryKey:          null,
       containerUpdate: {
         ambiFrame: {
           worldFrameId:          structureId,
@@ -401,14 +453,76 @@ async function _handleAmbiAnalyze(msg) {
           sharedStructureId:     structureId
         }
       },
-      // Forwarded so main.js stores them in stage5 for kem.worker's
-      // AMBI_REFINE residual computation
       meanMotionMagnitude: diagnostics.featureVector?.meanMotionMagnitude ?? null,
       meanLQESpeed:        diagnostics.featureVector?.meanLQESpeed        ?? null,
       degradedMode,
       isKeyframe,
-      processingMs: Date.now() - startMs
+      processingMs: Date.now() - startMs,
+      // ── Inline payloads for Stage 6/7 — no IDB read needed ───────────────
+      warpFieldInline:          { field: warpField,          width: resolution, height: resolution },
+      worldFrameMapInline:      { map:   worldFrameMap,       width: resolution, height: resolution },
+      integrationWeightsInline: { weights: integrationWeights, width: resolution, height: resolution },
+      surfaceParamInline: {
+        surfaceParamMeta,
+        structureId,
+        legibilityScore,
+        viewManifoldComponent: componentId,
+        degradedMode,
+        diagnostics
+      }
     });
+
+    // ── Fire-and-forget IDB persistence ───────────────────────────────────
+    // Stage 6/7 receive everything inline above. Persistence is for
+    // durability / debugging only. Failures are non-fatal.
+    (async () => {
+      try {
+        const store = _buildStore(sw);
+        const TTL   = PersistenceHelper.TTL?.PINNED ?? 300_000;
+        const persistMeta = {
+          sourceMetaKey: metaKey, resolution, structureId,
+          isKeyframe, legibilityScore, degradedMode, b0, b1,
+          computedAt: Date.now()
+        };
+        await PersistenceHelper.persist(store, {
+          type:    'world_frame_map',
+          data:    { map: worldFrameMap, width: resolution, height: resolution },
+          meta:    { ...persistMeta },
+          ttl:     TTL, pinType: PersistenceHelper.PIN?.SOFT ?? 'soft'
+        });
+        await PersistenceHelper.persist(store, {
+          type:    'warp_field',
+          data:    { field: warpField, width: resolution, height: resolution },
+          meta:    { ...persistMeta },
+          ttl:     TTL, pinType: PersistenceHelper.PIN?.SOFT ?? 'soft'
+        });
+        await PersistenceHelper.persist(store, {
+          type:    'integration_weights',
+          data:    { weights: integrationWeights, width: resolution, height: resolution },
+          meta:    { ...persistMeta, ...diagnostics.integration },
+          ttl:     TTL, pinType: PersistenceHelper.PIN?.SOFT ?? 'soft'
+        });
+        await PersistenceHelper.persist(store, {
+          type:    'surface_param',
+          data:    { surfaceParamMeta, structureId, legibilityScore,
+                     viewManifoldComponent: componentId, diagnostics },
+          meta:    { ...persistMeta },
+          ttl:     TTL, pinType: PersistenceHelper.PIN?.SOFT ?? 'soft'
+        });
+        if (_flags.ambiDebug && telemetry) {
+          await PersistenceHelper.persist(store, {
+            type:    'ambi_anamorph_telemetry',
+            data:    telemetry,
+            meta:    { ...persistMeta },
+            ttl:     PersistenceHelper.TTL?.DEBUG ?? 30_000,
+            pinType: PersistenceHelper.PIN?.SOFT ?? 'soft'
+          });
+        }
+        console.log('[ambi.worker] Background persistence complete');
+      } catch (e) {
+        console.warn('[ambi.worker] Background persistence failed (non-fatal):', e.message);
+      }
+    })();
 
     console.log('[ambi.worker] AMBI_DONE broadcast', {
       metaKey,
@@ -493,6 +607,45 @@ function _buildNarrowBandFromPhi(phi, resolution) {
     mask[i] = Math.abs(phi[i]) < thresh ? 1 : 0;
   }
   return mask;
+}
+
+// ── Nearest-neighbour scalar downsample ───────────────────────────────────
+// Used to reconcile minimizerResolution (1024) → topoResolution (512) when
+// topology.worker downsampled its inputs and ambi must match.
+// Preserves input constructor (Float32Array, Uint8Array, etc.).
+function _downsampleScalar(src, srcRes, dstRes) {
+  if (!src || srcRes === dstRes) return src;
+  const scale = srcRes / dstRes;
+  const N     = dstRes * dstRes;
+  const out   = new src.constructor(N);
+  for (let y = 0; y < dstRes; y++) {
+    for (let x = 0; x < dstRes; x++) {
+      const sy = Math.min(srcRes - 1, Math.floor(y * scale));
+      const sx = Math.min(srcRes - 1, Math.floor(x * scale));
+      out[y * dstRes + x] = src[sy * srcRes + sx];
+    }
+  }
+  return out;
+}
+
+// ── Nearest-neighbour multi-channel downsample ────────────────────────────
+// Extends _downsampleScalar to stride > 1. Always returns Float32Array.
+//   stride = 2: xy-pair arrays (principalE1, principalE2 from dgInline)
+//   stride = 4: RGBA / e1x,e1y,e2x,e2y flat arrays (IDB principalFrame format)
+function _downsampleField(src, srcRes, dstRes, stride) {
+  if (!src || srcRes === dstRes) return src;
+  const scale = srcRes / dstRes;
+  const out   = new Float32Array(dstRes * dstRes * stride);
+  for (let y = 0; y < dstRes; y++) {
+    for (let x = 0; x < dstRes; x++) {
+      const sy = Math.min(srcRes - 1, Math.floor(y * scale));
+      const sx = Math.min(srcRes - 1, Math.floor(x * scale));
+      const si = (sy * srcRes + sx) * stride;
+      const di = (y  * dstRes + x ) * stride;
+      for (let s = 0; s < stride; s++) out[di + s] = src[si + s];
+    }
+  }
+  return out;
 }
 
 // ── BC listener: flags sync + AMBI_REFINE from kem.worker ────────────────

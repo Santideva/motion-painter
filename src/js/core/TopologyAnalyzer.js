@@ -59,8 +59,16 @@ import LipschitzQuaternionEnds from './LipschitzQuaternionEnds.js';
 
   // Check if `name` is already declared in the method body (const/let/var/function).
   // If it is, injecting would cause a duplicate-declaration SyntaxError.
+  // Match any declaration form that binds `name`:
+  //   const/let/var name = ...           direct
+  //   const/let/var { name, ... } = ...  object destructuring
+  //   const/let/var [ name, ... ] = ...  array destructuring
+  //   function name(...) { }             function declaration
   const alreadyDeclared = (name, body) =>
-    new RegExp(`\\b(const|let|var)\\s+${name}\\b|\\bfunction\\s+${name}\\s*\\(`).test(body);
+    new RegExp(
+      `\\b(const|let|var)\\b[^;]*\\b${name}\\b` +
+      `|\\bfunction\\s+${name}\\s*\\(`
+    ).test(body);
 
   // Check if `name` appears at all — skip injection if not referenced.
   const isReferenced = (name, body) =>
@@ -250,29 +258,29 @@ export class TopologyAnalyzer {
       }
     }
 
-    // ── Assemble topoInline — consumed directly by minimizer and ambi ──────
-    // All topology outputs travel inline. IDB persistence is fire-and-forget
-    // so TOPOLOGY_DONE broadcasts immediately after computation completes,
-    // matching the pattern used by DG (dgInline), SDF (sdfInline), etc.
-
-    // ── Build component map inline ─────────────────────────────────────────
-    // -1 outside narrow band, ≥0 = component index
+    // ── Build componentMap (hoisted from block scope for topoInline) ─────────
     const componentMap = new Int32Array(w * h).fill(-1);
-
     for (let ni = 0; ni < G.nodeCount; ni++) {
       componentMap[G.nodeToPixel(ni)] = G.componentOf(ni);
     }
 
+    const processingMs = performance.now() - t0;
+
+    // ── Assemble topoInline — consumed directly by minimizer and ambi ────────
+    // All topology outputs travel inline. IDB persistence is fire-and-forget
+    // so TOPOLOGY_DONE broadcasts immediately after computation completes,
+    // matching the pattern used by DG (dgInline), SDF (sdfInline), etc.
     const topoInline = {
-      componentMap,                           // Int32Array w×h
-      topologyMap:     peResult?.topologyMap      ?? null,
-      boundaryParam:   peResult?.boundaryParam    ?? null,
-      homologySummary: peResult?.homologySummary  ?? null,
-      primeEnds:       peResult?.ends             ?? [],
-      lipschitzEnds:   lqeResult?.ends            ?? [],
-      quaternionField: lqeResult?.quaternionField ?? null,
-      motionMaps:      lqeResult?.motionMaps      ?? null,
-      nodeEndMap:      peResult?.nodeEndMap       ?? null,
+      topoResolution:  Math.max(w, h),                       // native resolution of all topo arrays below
+      componentMap,                                          // Int32Array  res²
+      topologyMap:     peResult?.topologyMap    ?? null,     // Int32Array  res²
+      boundaryParam:   peResult?.boundaryParam  ?? null,     // small object
+      homologySummary: peResult?.homologySummary ?? null,    // small object
+      primeEnds:       peResult?.ends            ?? [],      // End[]
+      lipschitzEnds:   lqeResult?.ends           ?? [],      // End[]
+      quaternionField: lqeResult?.quaternionField ?? null,   // Float32Array res²×4
+      motionMaps:      lqeResult?.motionMaps      ?? null,   // object
+      nodeEndMap:      peResult?.nodeEndMap        ?? null,
       betti,
       endCount: {
         primeEnds: peResult  ? peResult.ends.length  : 0,
@@ -280,160 +288,75 @@ export class TopologyAnalyzer {
       }
     };
 
-    const processingMs = performance.now() - t0;
-
-    // ── Fire-and-forget IDB persistence ───────────────────────────────────
-    // Keys remain null on return — consumers use topoInline directly.
-    (async () => {
-
-      const TTL_FINAL = 300_000; // 5 min
-
-      const persistMeta = {
-        sourceMetaKey,
-        cameraId,
-        resolution,
-        width: w,
-        height: h,
-        frameIndex
-      };
-
+    // ── Fire-and-forget IDB persistence ──────────────────────────────────────
+    // Gated on persistTopologyArtifacts (default false) — skip entirely in
+    // normal operation; enable only for cold-start recovery / debugging.
+    // Keys will be null on return — all consumers use topoInline instead.
+    if (flags.persistTopologyArtifacts) (async () => {
+      const TTL_FINAL   = 300_000;  // 5 min
+      const persistMeta = { sourceMetaKey, cameraId, resolution, width: w, height: h, frameIndex };
       try {
-
         if (peResult) {
-
           await PersistenceHelper.persist(store, {
             type: 'prime_ends',
-            data: {
-              ends: this._serialiseEnds(peResult.ends),
-              topologyMap: peResult.topologyMap,
-              boundaryParam: peResult.boundaryParam,
-              homologySummary: peResult.homologySummary
-            },
-            meta: {
-              ...persistMeta,
-              endCount: peResult.ends.length,
-              betti,
-              diagnostics: peResult.diagnostics,
-              computedAt: Date.now()
-            },
-            ttl: TTL_FINAL,
-            pinType: 'soft'
+            data: { ends: this._serialiseEnds(peResult.ends), topologyMap: peResult.topologyMap,
+                    boundaryParam: peResult.boundaryParam, homologySummary: peResult.homologySummary },
+            meta: { ...persistMeta, endCount: peResult.ends.length, betti, computedAt: Date.now() },
+            ttl: TTL_FINAL, pinType: 'soft'
           });
-
           await PersistenceHelper.persist(store, {
             type: 'topology_map',
-            data: {
-              map: peResult.topologyMap,
-              width: w,
-              height: h
-            },
-            meta: {
-              ...persistMeta,
-              computedAt: Date.now()
-            },
-            ttl: TTL_FINAL,
-            pinType: 'soft'
+            data: { map: new Int16Array(peResult.topologyMap), width: w, height: h },
+            meta: { ...persistMeta, computedAt: Date.now() },
+            ttl: TTL_FINAL, pinType: 'soft'
           });
-
           await PersistenceHelper.persist(store, {
             type: 'component_map',
-            data: {
-              map: componentMap,
-              width: w,
-              height: h
-            },
-            meta: {
-              ...persistMeta,
-              b0: G.componentCount,
-              computedAt: Date.now()
-            },
-            ttl: TTL_FINAL,
-            pinType: 'soft'
+            data: { map: new Int16Array(componentMap), width: w, height: h },
+            meta: { ...persistMeta, b0: G.componentCount, computedAt: Date.now() },
+            ttl: TTL_FINAL, pinType: 'soft'
           });
-
           await PersistenceHelper.persist(store, {
             type: 'homology_summary',
             data: peResult.homologySummary,
-            meta: {
-              ...persistMeta,
-              computedAt: Date.now()
-            },
-            ttl: TTL_FINAL,
-            pinType: 'soft'
+            meta: { ...persistMeta, computedAt: Date.now() },
+            ttl: TTL_FINAL, pinType: 'soft'
           });
-
           await PersistenceHelper.persist(store, {
             type: 'boundary_param',
             data: peResult.boundaryParam,
-            meta: {
-              ...persistMeta,
-              computedAt: Date.now()
-            },
-            ttl: TTL_FINAL,
-            pinType: 'soft'
+            meta: { ...persistMeta, computedAt: Date.now() },
+            ttl: TTL_FINAL, pinType: 'soft'
           });
         }
-
         if (lqeResult) {
-
           await PersistenceHelper.persist(store, {
             type: 'lipschitz_ends',
-            data: {
-              ends: this._serialiseEnds(lqeResult.ends),
-              seedMask: lqeResult.seedMask
-            },
-            meta: {
-              ...persistMeta,
-              endCount: lqeResult.ends.length,
-              diagnostics: lqeResult.diagnostics,
-              computedAt: Date.now()
-            },
-            ttl: TTL_FINAL,
-            pinType: 'soft'
+            data: { ends: this._serialiseEnds(lqeResult.ends), seedMask: lqeResult.seedMask },
+            meta: { ...persistMeta, endCount: lqeResult.ends.length, computedAt: Date.now() },
+            ttl: TTL_FINAL, pinType: 'soft'
           });
-
           await PersistenceHelper.persist(store, {
             type: 'quaternion_field',
-            data: {
-              field: lqeResult.quaternionField,
-              width: w,
-              height: h
-            },
-            meta: {
-              ...persistMeta,
-              computedAt: Date.now()
-            },
-            ttl: TTL_FINAL,
-            pinType: 'soft'
+            data: { field: lqeResult.quaternionField, width: w, height: h },
+            meta: { ...persistMeta, computedAt: Date.now() },
+            ttl: TTL_FINAL, pinType: 'soft'
           });
-
           await PersistenceHelper.persist(store, {
             type: 'motion_maps',
             data: lqeResult.motionMaps,
-            meta: {
-              ...persistMeta,
-              computedAt: Date.now()
-            },
-            ttl: TTL_FINAL,
-            pinType: 'soft'
+            meta: { ...persistMeta, computedAt: Date.now() },
+            ttl: TTL_FINAL, pinType: 'soft'
           });
         }
-
         console.log('[TopologyAnalyzer] Background persistence complete');
-
       } catch (e) {
-
-        console.warn(
-          '[TopologyAnalyzer] Background persistence failed (non-fatal):',
-          e.message
-        );
+        console.warn('[TopologyAnalyzer] Background persistence failed (non-fatal):', e.message);
       }
-
     })();
 
     return {
-
-      // Consumers now use topoInline directly
+      // All keys are null — consumers use topoInline
       primeEndsKey:       null,
       topologyMapKey:     null,
       homologySummaryKey: null,
@@ -442,13 +365,10 @@ export class TopologyAnalyzer {
       quaternionFieldKey: null,
       motionMapsKey:      null,
       componentMapKey:    null,
-
+      // Inline payload for immediate consumption
       topoInline,
-
       betti,
-
-      endCount: topoInline.endCount,
-
+      endCount:     topoInline.endCount,
       processingMs
     };
   }

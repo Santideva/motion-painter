@@ -2402,6 +2402,7 @@ async function _computeDepthNormalsFlux(frameBitmap, calibData, options = {}) {
   let doaModalResult = null;
   let penumbraResult = null;
   let directionalFieldArtResult = null;
+  let directionalFieldInline    = null;  // set inside try after DirectionalLifting
   let flowField      = null;   // ← must be function-scope, not try-scope
 
   try {
@@ -2660,6 +2661,13 @@ async function _computeDepthNormalsFlux(frameBitmap, calibData, options = {}) {
         telemetry.stages.directional_ms      = performance.now() - telemetry.stages.directional_start;
         telemetry.coherenceMean              = liftResult.coherence?.mean;
         telemetry.modules.directionalLifting = liftResult.telemetry || null;
+
+        // Inline payload — set here while liftResult and directionalField are in scope.
+        // The return statement is outside the try block so they can't be accessed there.
+        directionalFieldInline = {
+          field:     directionalField,            // Float32Array res²×4
+          coherence: liftResult.coherence ?? null // { perPixel: Float32Array } or null
+        };
 
       } catch (liftErr) {
         telemetry.warnings.push(`DirectionalLifting failed: ${liftErr.message}, using tetra field`);
@@ -3421,7 +3429,10 @@ if (depthMap && _flags.enableFMapRouteA !== false) {
     // Stage 3 prerequisite
     flowField,
     // Stage 4A prerequisite
-    directionalFieldArtResult
+    directionalFieldArtResult,
+    // derivatives excluded — unused by topology.worker and ambi.worker.
+    directionalFieldInline,   // null if DirectionalLifting failed or was disabled
+    flowFieldInline: flowField ? { u: flowField.u, v: flowField.v } : null
   };
 }
 
@@ -3854,7 +3865,11 @@ console.log('[STAGE4] Final calibData state before depth computation:', {
       // Stage 3 prerequisite
       flowField,
       // Stage 4A prerequisite
-      directionalFieldArtResult
+      directionalFieldArtResult,
+      // directional_field inline
+      directionalFieldInline,
+      // flow field inline for KEM
+      flowFieldInline
     } = computeResult;
 
     // Normalise telemetry — _fallbackDepthEstimation returns a minimal stub
@@ -4725,6 +4740,13 @@ console.log('[STAGE4] Final calibData state before depth computation:', {
         directionalFieldKey:  directionalFieldArtResult?.metaKey  ?? null
       },
 
+      // Inline directional_field — field + coherence forwarded directly.
+      // topology.worker and ambi.worker use this instead of reading from IDB.
+      // The 4-part 16MB IDB read was permanently blocked by preprocessor.worker
+      // write locks. Pattern identical to sdfInline, dgInline, stage1Inline.
+      directionalFieldInline: directionalFieldInline ?? null,
+      flowFieldInline:        flowFieldInline        ?? null,
+
       // Stage 4 — IDB keys (persisted for durability)
       stage4: {
         curvatureKey:      diffGeoResult?.curvatureKey      ?? null,
@@ -4835,7 +4857,11 @@ console.log('[STAGE4] Final calibData state before depth computation:', {
       sdfFieldKey:          replyPayload.stage2?.sdfFieldKey               ?? null,
       diskSeedsKey:         replyPayload.stage2?.diskSeedsKey              ?? null,
       fluxFieldKey:         null,
-      derivedKeyCount:      replyPayload.derivedKeys?.length               ?? 0
+      derivedKeyCount:            replyPayload.derivedKeys?.length                    ?? 0,
+      hasDirectionalFieldInline:  !!replyPayload.directionalFieldInline,
+      directionalFieldLength:     replyPayload.directionalFieldInline?.field?.length  ?? 0,
+      hasFlowFieldInline:         !!replyPayload.flowFieldInline,
+      flowULength:                replyPayload.flowFieldInline?.u?.length             ?? 0
     });
 
     // MotionWorkerWrapper only needs job metadata — strip the inline arrays.
