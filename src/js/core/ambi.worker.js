@@ -23,7 +23,6 @@
 //   - BC listener uses addEventListener
 
 import { AmbiAnamorph }        from './AmbiAnimorph.js';
-import PersistenceHelper        from './PersistenceHelper.js';
 import { createViewManifold,
          refineNode }           from './ViewManifold.js';
 
@@ -35,7 +34,6 @@ function _bcPost(p) { if (_bc) try { _bc.postMessage(p); } catch(e) {} }
 function _safeErr(e) { return { message: e?.message ?? String(e), stack: e?.stack ?? null }; }
 
 // ── Module-level state ────────────────────────────────────────────────────
-let _storageAPI = null;
 let _flags      = {};
 
 // Session state — mutated by assignWorldFrameIds across calls
@@ -48,80 +46,6 @@ let _sessionState = {
 
 // View manifold — mutated by updateViewManifold and refineNode across calls
 let _manifold = createViewManifold();
-
-// ── Storage ───────────────────────────────────────────────────────────────
-async function _loadStorageAPI() {
-  if (_storageAPI) return _storageAPI;
-  const mod = await import('./storage.js');
-  _storageAPI = mod.default ?? mod.storageAPI ?? mod;
-  return _storageAPI;
-}
-
-async function _retryable(fn, attempts = 3, delay = 80) {
-  let last;
-  for (let i = 1; i <= attempts; i++) {
-    try { return await fn(); } catch(e) {
-      last = e;
-      const transient = e?.name === 'InvalidStateError' ||
-                        e?.message?.includes('transaction');
-      if (!transient || i === attempts) throw e;
-      await new Promise(r => setTimeout(r, delay * i));
-    }
-  }
-  throw last;
-}
-
-function _wrapStorage(api) {
-  return {
-    putArtifact: art => _retryable(() => api.putInboundArtifact(art)),
-    raw:         api
-  };
-}
-
-// ── Store adapter ─────────────────────────────────────────────────────────
-function _buildStore(sw) {
-  return {
-    persistAndPin: async (type, data, meta, ttlMs, pinType) => {
-      const artifact = { type, data, meta };
-
-      let putResult;
-      try {
-        putResult = await sw.putArtifact(artifact);
-      } catch (e) {
-        throw new Error(`ambi.worker: putArtifact failed for ${type}: ${e.message}`);
-      }
-
-      if (!putResult?.ok || !putResult.metaKey) {
-        throw new Error(`ambi.worker: no metaKey returned for ${type}`);
-      }
-
-      const pinFn = sw.raw?.pinArtifact ??
-        (typeof self.pinArtifact === 'function' ? self.pinArtifact : null);
-      if (typeof pinFn === 'function') {
-        try {
-          await pinFn(putResult.metaKey, {
-            owner:  'ambi.worker',
-            type:   pinType ?? 'soft',
-            ttlMs:  ttlMs > 0 ? ttlMs : null
-          });
-        } catch (e) {
-          console.warn(
-            `[ambi.worker] pin failed for ${putResult.metaKey.slice(0,20)}... (non-fatal):`,
-            e.message
-          );
-        }
-      }
-
-      return putResult;
-    }
-  };
-}
-
-// ── Artifact loading ───────────────────────────────────────────────────────
-async function _loadArtifact(api, key) {
-  if (!key) return null;
-  return _retryable(() => api.getArtifact(key));
-}
 
 // ── Unpack helpers ────────────────────────────────────────────────────────
 
@@ -206,14 +130,11 @@ async function _handleAmbiAnalyze(msg) {
       );
     }
 
-    // ── Load only what cannot travel inline ───────────────────────────────
-    // directionalArt: needed for coherencePerPixel only.
-    // principalFrameArt + curvatureArt: fallback only when dgInline absent.
-    const api = await _loadStorageAPI();
-    const sw  = _wrapStorage(api);
-
+    // ── Resolve inline sources — no IDB reads ─────────────────────────────
+    // All inputs arrive inline; IDB fallbacks removed since every caller
+    // now sends the full inline payload.
     const _dfInline = msg.directionalFieldInline ?? null;
-    const _dfArt = _dfInline
+    const directionalArt = _dfInline
       ? { data: {
             field:    _dfInline.field,
             coherence: (_dfInline.coherence instanceof Float32Array)
@@ -221,11 +142,8 @@ async function _handleAmbiAnalyze(msg) {
               : (_dfInline.coherence ?? null)
           }}
       : null;
-    const [directionalArt, principalFrameArt, curvatureArt] = await Promise.all([
-      _dfArt ? Promise.resolve(_dfArt) : _loadArtifact(api, artifactKeys.directionalFieldKey),
-      dgInline ? null : _loadArtifact(api, artifactKeys.principalFrameKey),
-      dgInline ? null : _loadArtifact(api, artifactKeys.curvatureKey)
-    ]);
+    const principalFrameArt = null;   // always superseded by dgInline
+    const curvatureArt      = null;   // always superseded by dgInline
 
     // directnessArt and penumbraArt come from stage1Inline — not IDB.
     // Reconstruct the same shape that getArtifact would have returned.
@@ -257,17 +175,20 @@ async function _handleAmbiAnalyze(msg) {
     // Scale zeroCurve pixel coordinates from minimizerResolution → topoResolution.
     // zeroCurve.loops[].points[].{x,y} are produced by the minimizer at 1024²;
     // ambi runs at 512². Unscaled coordinates map outside the grid → zero BFS seeds.
+    // zeroCurve.loops[].points is a flat numeric array [x0,y0,x1,y1,...] — NOT
+    // an array of {x,y} objects. Scale every element uniformly (both x and y
+    // multiply by the same scalar since _zcScale applies to both axes equally).
     const _zcScale  = resolutionMismatch ? (topoResolution / minimizerResolution) : 1;
     const zeroCurve = (minimizerInline.zeroCurve && _zcScale !== 1)
       ? {
           ...minimizerInline.zeroCurve,
           loops: (minimizerInline.zeroCurve.loops ?? []).map(loop => ({
             ...loop,
-            points: (loop.points ?? []).map(pt => ({
-              ...pt,
-              x: pt.x * _zcScale,
-              y: pt.y * _zcScale
-            }))
+            points: (loop.points ?? []).map(v => v * _zcScale)
+          })),
+          arcs: (minimizerInline.zeroCurve.arcs ?? []).map(arc => ({
+            ...arc,
+            points: (arc.points ?? []).map(v => v * _zcScale)
           }))
         }
       : (minimizerInline.zeroCurve ?? null);
@@ -305,25 +226,35 @@ async function _handleAmbiAnalyze(msg) {
       : { motionMagnitude: null, saliencyMap: null, rotationalMap: null };
 
     // principalFrame and curvatureField from dgInline — no IDB read needed
-    // principalFrame — from dgInline at minimizerResolution (reconstructionResolution).
-    // dgInline format: { e1: Float32Array stride-2, e2: Float32Array stride-2 }.
-    // IDB fallback format: Float32Array stride-4 (e1x,e1y,e2x,e2y per pixel).
-    // buildWarpField seeds BFS using these vectors — wrong resolution → wrong
-    // edge weights on every pixel in the warp field.
+    // principalFrame — SurfaceParam.js requires flat stride-4 Float32Array
+    // (e1x,e1y,e2x,e2y per pixel). dgInline format is {e1, e2} stride-2 xy-pairs.
+    // Always: downsample to topoResolution if needed, then interleave into stride-4.
     const _pfRaw = dgInline
       ? { e1: dgInline.principalE1, e2: dgInline.principalE2 }
       : (principalFrameArt?.data?.frame ?? principalFrameArt?.data?.principalFrame ?? null);
-    let principalFrame = _pfRaw;
-    if (resolutionMismatch && _pfRaw) {
+    let principalFrame = null;
+    if (_pfRaw) {
       if (_pfRaw.e1 && _pfRaw.e2) {
-        // dgInline format: stride-2 xy-pair arrays
-        principalFrame = {
-          e1: _downsampleField(_pfRaw.e1, minimizerResolution, topoResolution, 2),
-          e2: _downsampleField(_pfRaw.e2, minimizerResolution, topoResolution, 2)
-        };
+        let e1 = _pfRaw.e1, e2 = _pfRaw.e2;
+        const e1Res = Math.round(Math.sqrt(e1.length / 2));  // stride-2
+        if (e1Res !== topoResolution) {
+          e1 = _downsampleField(e1, e1Res, topoResolution, 2);
+          e2 = _downsampleField(e2, e1Res, topoResolution, 2);
+        }
+        // Interleave into flat e1x,e1y,e2x,e2y stride-4 (SurfaceParam.js layout)
+        const nPx = topoResolution * topoResolution;
+        principalFrame = new Float32Array(nPx * 4);
+        for (let i = 0; i < nPx; i++) {
+          principalFrame[i * 4]     = e1[i * 2];
+          principalFrame[i * 4 + 1] = e1[i * 2 + 1];
+          principalFrame[i * 4 + 2] = e2[i * 2];
+          principalFrame[i * 4 + 3] = e2[i * 2 + 1];
+        }
       } else if (_pfRaw instanceof Float32Array) {
-        // IDB format: stride-4 flat array
-        principalFrame = _downsampleField(_pfRaw, minimizerResolution, topoResolution, 4);
+        const pfRes = Math.round(Math.sqrt(_pfRaw.length / 4));  // stride-4
+        principalFrame = pfRes !== topoResolution
+          ? _downsampleField(_pfRaw, pfRes, topoResolution, 4)
+          : _pfRaw;
       }
     }
 
@@ -471,58 +402,6 @@ async function _handleAmbiAnalyze(msg) {
         diagnostics
       }
     });
-
-    // ── Fire-and-forget IDB persistence ───────────────────────────────────
-    // Stage 6/7 receive everything inline above. Persistence is for
-    // durability / debugging only. Failures are non-fatal.
-    (async () => {
-      try {
-        const store = _buildStore(sw);
-        const TTL   = PersistenceHelper.TTL?.PINNED ?? 300_000;
-        const persistMeta = {
-          sourceMetaKey: metaKey, resolution, structureId,
-          isKeyframe, legibilityScore, degradedMode, b0, b1,
-          computedAt: Date.now()
-        };
-        await PersistenceHelper.persist(store, {
-          type:    'world_frame_map',
-          data:    { map: worldFrameMap, width: resolution, height: resolution },
-          meta:    { ...persistMeta },
-          ttl:     TTL, pinType: PersistenceHelper.PIN?.SOFT ?? 'soft'
-        });
-        await PersistenceHelper.persist(store, {
-          type:    'warp_field',
-          data:    { field: warpField, width: resolution, height: resolution },
-          meta:    { ...persistMeta },
-          ttl:     TTL, pinType: PersistenceHelper.PIN?.SOFT ?? 'soft'
-        });
-        await PersistenceHelper.persist(store, {
-          type:    'integration_weights',
-          data:    { weights: integrationWeights, width: resolution, height: resolution },
-          meta:    { ...persistMeta, ...diagnostics.integration },
-          ttl:     TTL, pinType: PersistenceHelper.PIN?.SOFT ?? 'soft'
-        });
-        await PersistenceHelper.persist(store, {
-          type:    'surface_param',
-          data:    { surfaceParamMeta, structureId, legibilityScore,
-                     viewManifoldComponent: componentId, diagnostics },
-          meta:    { ...persistMeta },
-          ttl:     TTL, pinType: PersistenceHelper.PIN?.SOFT ?? 'soft'
-        });
-        if (_flags.ambiDebug && telemetry) {
-          await PersistenceHelper.persist(store, {
-            type:    'ambi_anamorph_telemetry',
-            data:    telemetry,
-            meta:    { ...persistMeta },
-            ttl:     PersistenceHelper.TTL?.DEBUG ?? 30_000,
-            pinType: PersistenceHelper.PIN?.SOFT ?? 'soft'
-          });
-        }
-        console.log('[ambi.worker] Background persistence complete');
-      } catch (e) {
-        console.warn('[ambi.worker] Background persistence failed (non-fatal):', e.message);
-      }
-    })();
 
     console.log('[ambi.worker] AMBI_DONE broadcast', {
       metaKey,

@@ -507,7 +507,7 @@ export function refineNode({
   for (let i = 0; i < base + 3; i++) newArr[i] = oldArr[i];
 
   // Insert meanKEM_n at [base+3]
-  newArr[base + 3] = (meanKEM ?? 0) / SCALE_KEM;
+  newArr[base + 3] = (Number.isFinite(meanKEM) ? meanKEM : 0) / SCALE_KEM;
 
   // Copy cosDir, sinDir, meanKH_n, curvPeaks_n from [base+5..base+8]
   // into [base+4..base+7] — shift left by 1

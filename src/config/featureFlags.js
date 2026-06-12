@@ -174,6 +174,12 @@ const DEFAULTS = {
     // false = skip entirely (normal path; data travels inline via topoInline).
     // true  = persist prime_ends, topology_map etc. for cold-start recovery.
     persistTopologyArtifacts: false,
+    // When false (default): artifacts that already travel inline are NOT written
+    // to IDB. Eliminates ~28MB of fire-and-forget writes per frame
+    // (directional_field 16MB + flow_field 8MB + phi_min 4MB + KEM ~3MB)
+    // that cause memory pressure and OOM under sustained load.
+    // Set true only for crash-recovery testing or cold-start validation.
+    persistInlineArtifacts:   false,
     // PixelGraph gradient fusion weights (must sum to 1.0)
     topoGradWeightDir:       0.6,    // directional field weight
     topoGradWeightKH:        0.3,    // |kH| curvature weight
@@ -718,7 +724,8 @@ function _coerceOrWarn(key, value) {
     // ============================================================================
     // ✅ NEW: Artifact persistence flags (boolean)
     // ============================================================================
-    if (['persistIntermediates', 'persistDebugArtifacts', 'MOTION_UNPIN_ON_CLAIM'].includes(key)) {
+    if (['persistIntermediates', 'persistDebugArtifacts', 'MOTION_UNPIN_ON_CLAIM',
+         'persistInlineArtifacts'].includes(key)) {
       if (value === 'true' || value === true) return true;
       if (value === 'false' || value === false) return false;
       return DEFAULTS[key];

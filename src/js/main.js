@@ -1169,6 +1169,9 @@ class MotionPainter {
                     meanMotionMagnitude: cc.stage5?.meanMotionMagnitude ?? null,
                     meanLQESpeed:        cc.stage5?.meanLQESpeed        ?? null,
                     // ── Inline data — eliminates all KEM IDB reads ────────────
+                    // principalE1/E2 and flow are at reconstructionResolution (1024²).
+                    // kem.worker detects source resolution and downsamples each
+                    // input to topoResolution before computing KEMModule.
                     principalFrameInline: cc.dgInline
                       ? { e1: cc.dgInline.principalE1 ?? null,
                           e2: cc.dgInline.principalE2 ?? null }
@@ -1188,8 +1191,11 @@ class MotionPainter {
                       motionMapsKey:       null,
                       narrowBandKey:       null,
                       surfaceParamKey:     null,
-                      resolution: cc.differentialGeometry?.reconstructionResolution
-                                  ?? cc.reconstructionResolution ?? 512,
+                      // Must be topoResolution (512), NOT reconstructionResolution (1024).
+                      // motionMaps (motionMagnitude, motionEndsMap) come from topology at 512².
+                      // kem.worker uses this as the target N = resolution² for all arrays.
+                      // principalFrame/flow/coherence are downsampled from 1024² → 512² inside kem.worker.
+                      resolution: cc.stage67Inputs?._topoResolution ?? 512,
                       cameraId:   cc.cameraId ?? 'default'
                     }
                   });
@@ -1209,6 +1215,10 @@ class MotionPainter {
                     cameraId: cc.cameraId ?? 'default',
                     flags:    this._currentFlags ?? {},
                     // ── Inline data — eliminates all Correspondence IDB reads ─
+                    // warpField (512²×2), worldFrameMap (512²), topologyMap (512²)
+                    // are all at topoResolution from ambi/topology. phiMinInline
+                    // is at minimizerResolution (1024²) and is downsampled inside
+                    // correspondence.worker to match resolution below.
                     warpFieldInline:     cc.stage5Inline?.warpFieldInline     ?? null,
                     worldFrameMapInline: cc.stage5Inline?.worldFrameMapInline ?? null,
                     primeEndsInline:     cc.stage67Inputs?.primeEnds          ?? null,
@@ -1223,8 +1233,11 @@ class MotionPainter {
                       primeEndsKey:     null,
                       topologyMapKey:   null,
                       phiMinKey:        null,
-                      resolution: cc.differentialGeometry?.reconstructionResolution
-                                  ?? cc.reconstructionResolution ?? 512,
+                      // Must be topoResolution (512), NOT reconstructionResolution (1024).
+                      // warpField, worldFrameMap, topologyMap and primeEnd anchor pixels
+                      // are all in 512² coordinate space. correspondence.worker uses
+                      // this to set N = resolution² and downsample phiMin to match.
+                      resolution: cc.stage67Inputs?._topoResolution ?? 512,
                       cameraId:   cc.cameraId ?? 'default'
                     }
                   });
@@ -1232,6 +1245,30 @@ class MotionPainter {
                 } catch (corrErr) {
                   console.warn('[Stage7] main.js: correspondence.worker dispatch failed', corrErr);
                 }
+              }
+
+              // ── Release large inline arrays now that KEM and Correspondence ─
+              // have been dispatched via structured clone. These hold ~70MB of
+              // typed arrays that are dead weight for the rest of the frame.
+              // Clearing here allows GC to reclaim memory before the next
+              // reconstruction cycle begins.
+              try {
+                this._updateCameraContainer({
+                  passThrough: {
+                    // Stage 3 inline — KEM consumed principalE1/E2, coherence, flowU/V
+                    dgInline:               null,   // ~32MB (kH + e1/e2 + curls × 1024²)
+                    directionalFieldInline: null,   // ~20MB (field + coherence × 1024²)
+                    flowFieldInline:        null,   // ~8MB  (u + v × 1024²)
+                    // Stage 4 fragments — KEM + Correspondence consumed phiMin,
+                    // motionMaps, topologyMap, primeEnds
+                    stage67Inputs:          null,   // ~7MB  (topologyMap + motionMaps + phiMin)
+                    // Stage 5 outputs — Correspondence consumed warpField, worldFrameMap
+                    stage5Inline:           null    // ~3MB  (warpField + worldFrameMap)
+                  }
+                });
+                console.log('[Stage678] main.js: ~70MB of inline arrays released after KEM+Correspondence dispatch');
+              } catch (e) {
+                console.warn('[Stage678] main.js: failed to release inline arrays post-dispatch', e);
               }
 
               // STAGE5_DONE broadcast for any other BC consumers
@@ -2608,6 +2645,29 @@ _ensureMotionWorker() {
         }
       }
       this._stage678State = null;
+
+      // ── Safety-net: release any inline typed arrays still on cameraContainer ─
+      // Fix 2 (AMBI_DONE handler) clears most of these immediately after dispatch.
+      // This catch-all runs after all three stage-678 workers have confirmed done,
+      // ensuring nothing survives into the next reconstruction cycle.
+      // Each field is guarded — if already null this is a no-op.
+      try {
+        this._updateCameraContainer({
+          passThrough: {
+            dgInline:               null,   // principalE1/E2 + kH + curls (~32MB)
+            directionalFieldInline: null,   // directional field + coherence (~20MB)
+            flowFieldInline:        null,   // Horn-Schunck u/v (~8MB)
+            stage1Inline:           null,   // fMap + edgeMask (~5MB)
+            fluxInline:             null,   // solver matrix (~5MB)
+            stage67Inputs:          null,   // topologyMap + motionMaps + phiMin (~7MB)
+            stage5Inline:           null,   // warpField + worldFrameMap (~3MB)
+            diskSeedsForMinimizer:  null    // seed objects (small)
+          }
+        });
+        console.log('[Stage678] main.js: Inline array safety-net release complete after STAGE678_DONE');
+      } catch (e) {
+        console.warn('[Stage678] main.js: Safety-net inline release failed (non-fatal)', e);
+      }
     }
   }
 
@@ -2643,21 +2703,26 @@ _ensureMotionWorker() {
             this._updateCameraContainer({
               passThrough: {
                 stage67Inputs: {
-                  primeEnds:   _t?.primeEnds   ?? null,  // Correspondence — array of PrimeEnd
-                  topologyMap: _t?.topologyMap ?? null,  // Correspondence — Int32Array res²
-                  motionMaps:  _t?.motionMaps  ?? null,  // KEM — { motionMagnitude, motionEndsMap }
-                  phiMin:      _m?.phiMin      ?? null   // KEM + Correspondence — Float32Array res²
+                  primeEnds:       _t?.primeEnds       ?? null,  // Correspondence — array of PrimeEnd
+                  topologyMap:     _t?.topologyMap     ?? null,  // Correspondence — Int32Array res²
+                  motionMaps:      _t?.motionMaps      ?? null,  // KEM — { motionMagnitude, motionEndsMap }
+                  phiMin:          _m?.phiMin          ?? null,  // KEM + Correspondence — Float32Array res²
+                  _topoResolution: _t?.topoResolution  ?? null   // KEM + Correspondence — target resolution
+                                                                  // for all downsampling (always 512 when
+                                                                  // topoMaxResolution=512). Both workers
+                                                                  // use this to set N = _topoResolution².
                 }
               }
             });
             console.log('[Stage67] main.js: stage67Inputs stored on cameraContainer:', {
-              hasPrimeEnds:   !!(_t?.primeEnds),
-              hasTopologyMap: !!(_t?.topologyMap),
-              hasMotionMaps:  !!(_t?.motionMaps),
-              hasPhiMin:      !!(_m?.phiMin),
-              primeEndsCount: _t?.primeEnds?.length    ?? 0,
-              topologyMapLen: _t?.topologyMap?.length  ?? 0,
-              phiMinLen:      _m?.phiMin?.length       ?? 0
+              hasPrimeEnds:    !!(_t?.primeEnds),
+              hasTopologyMap:  !!(_t?.topologyMap),
+              hasMotionMaps:   !!(_t?.motionMaps),
+              hasPhiMin:       !!(_m?.phiMin),
+              topoResolution:  _t?.topoResolution  ?? null,
+              primeEndsCount:  _t?.primeEnds?.length   ?? 0,
+              topologyMapLen:  _t?.topologyMap?.length ?? 0,
+              phiMinLen:       _m?.phiMin?.length      ?? 0
             });
           } catch (e) {
             console.warn('[Stage67] main.js: stage67Inputs writeback failed', e);
@@ -2719,6 +2784,23 @@ _ensureMotionWorker() {
       // flow_field) are complete. Keeping it paused longer risks quota overflow.
       try { storageAPI.startEvictorLoop(); } catch(e) {
         console.warn('[Stage4] main.js: failed to resume evictor', e);
+      }
+
+      // ── Release stage1Inline and fluxInline ───────────────────────────────
+      // ambi.worker received both via structured clone in postMessage above.
+      // Clearing here frees ~10MB immediately rather than waiting for GC.
+      // diskSeedsForMinimizer is tiny but cleared for completeness.
+      try {
+        this._updateCameraContainer({
+          passThrough: {
+            stage1Inline:          null,   // fMap (4MB) + edgeMask (1MB) — ambi consumed
+            fluxInline:            null,   // A_coo, b, init_h (~5MB) — minimizer consumed
+            diskSeedsForMinimizer: null    // small seed objects — minimizer consumed
+          }
+        });
+        console.log('[Stage5] main.js: stage1Inline / fluxInline released after ambi dispatch');
+      } catch (e) {
+        console.warn('[Stage5] main.js: failed to release stage1Inline/fluxInline', e);
       }
     }
   }

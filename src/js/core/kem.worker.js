@@ -122,7 +122,39 @@ function _extractCoherence(art) {
   return null;
 }
 
-// ── velocityManifold serialisation ────────────────────────────────────────
+// ── Resolution downsampling helpers ──────────────────────────────────────
+// All dgInline/flowField/coherence inputs arrive at reconstructionResolution
+// (1024²). motionMaps come from topology at topoResolution (512²).
+// Every input must be downsampled to match before KEMModule sees them.
+function _downsampleScalar(src, srcRes, dstRes) {
+  if (!src || srcRes === dstRes) return src;
+  const scale = srcRes / dstRes;
+  const out   = new src.constructor(dstRes * dstRes);
+  for (let y = 0; y < dstRes; y++) {
+    for (let x = 0; x < dstRes; x++) {
+      const sy = Math.min(srcRes - 1, Math.floor(y * scale));
+      const sx = Math.min(srcRes - 1, Math.floor(x * scale));
+      out[y * dstRes + x] = src[sy * srcRes + sx];
+    }
+  }
+  return out;
+}
+
+function _downsampleField(src, srcRes, dstRes, stride) {
+  if (!src || srcRes === dstRes) return src;
+  const scale = srcRes / dstRes;
+  const out   = new Float32Array(dstRes * dstRes * stride);
+  for (let y = 0; y < dstRes; y++) {
+    for (let x = 0; x < dstRes; x++) {
+      const sy = Math.min(srcRes - 1, Math.floor(y * scale));
+      const sx = Math.min(srcRes - 1, Math.floor(x * scale));
+      const si = (sy * srcRes + sx) * stride;
+      const di = (y  * dstRes + x ) * stride;
+      for (let s = 0; s < stride; s++) out[di + s] = src[si + s];
+    }
+  }
+  return out;
+}
 // KEMModule returns Int32Array pixel index arrays per clade.
 // Storage requires plain JSON-serialisable values — convert typed arrays.
 function _serialiseVelocityManifold(vm) {
@@ -156,17 +188,24 @@ async function _handleKEMAnalyze(msg) {
   const startMs = Date.now();
 
   try {
-    const api = await _loadStorageAPI();
-    const sw  = _wrapStorage(api);
-
-    // ── Resolve all inputs — inline-first, IDB fallback ──────────────────
+    // ── Resolve all inputs — inline-first (IDB never needed, all keys null) ─
+    // api/sw are only opened inside the fire-and-forget IIFE below.
     const resolution = artifactKeys.resolution ?? 512;
     const N          = resolution * resolution;
 
     // principalFrame — from principalFrameInline (dgInline e1/e2 interleaved) or IDB
     let principalFrame = null;
     if (msg.principalFrameInline?.e1 && msg.principalFrameInline?.e2) {
-      const { e1, e2 } = msg.principalFrameInline;
+      let { e1, e2 } = msg.principalFrameInline;
+      // Downsample from native resolution (1024²) to topoResolution (512²) first.
+      // Accessing flat 1024² stride-2 arrays with 512² indices reads only the
+      // top-left quarter of the image — not a proper downsampled representation.
+      const e1Res = Math.round(Math.sqrt(e1.length / 2));  // stride-2 → pixel count
+      if (e1Res !== resolution) {
+        e1 = _downsampleField(e1, e1Res, resolution, 2);
+        e2 = _downsampleField(e2, e1Res, resolution, 2);
+        console.log(`[kem.worker] principalFrame e1/e2 downsampled ${e1Res}² → ${resolution}²`);
+      }
       // Interleave xy-pairs → e1x,e1y,e2x,e2y per pixel (KEMModule layout)
       principalFrame = new Float32Array(N * 4);
       for (let i = 0; i < N; i++) {
@@ -187,10 +226,18 @@ async function _handleKEMAnalyze(msg) {
     // flowU / flowV — from flowFieldInline or IDB
     let flowU = null, flowV = null;
     if (msg.flowFieldInline?.u && msg.flowFieldInline?.v) {
-      flowU = msg.flowFieldInline.u instanceof Float32Array
+      let fU = msg.flowFieldInline.u instanceof Float32Array
         ? msg.flowFieldInline.u : new Float32Array(msg.flowFieldInline.u);
-      flowV = msg.flowFieldInline.v instanceof Float32Array
+      let fV = msg.flowFieldInline.v instanceof Float32Array
         ? msg.flowFieldInline.v : new Float32Array(msg.flowFieldInline.v);
+      const flowRes = Math.round(Math.sqrt(fU.length));
+      if (flowRes !== resolution) {
+        fU = _downsampleScalar(fU, flowRes, resolution);
+        fV = _downsampleScalar(fV, flowRes, resolution);
+        console.log(`[kem.worker] flowU/V downsampled ${flowRes}² → ${resolution}²`);
+      }
+      flowU = fU;
+      flowV = fV;
       console.log('[kem.worker] flowU/V from inline');
     } else {
       const ffArt = await _loadArtifact(api, artifactKeys.flowFieldKey);
@@ -225,8 +272,15 @@ async function _handleKEMAnalyze(msg) {
     // coherencePerPixel — from coherenceInline or directionalField IDB
     let coherencePerPixel = null;
     if (msg.coherenceInline instanceof Float32Array) {
-      coherencePerPixel = msg.coherenceInline;
-      console.log('[kem.worker] coherencePerPixel from inline');
+      const cohRes = Math.round(Math.sqrt(msg.coherenceInline.length));
+      coherencePerPixel = cohRes !== resolution
+        ? _downsampleScalar(msg.coherenceInline, cohRes, resolution)
+        : msg.coherenceInline;
+      if (cohRes !== resolution) {
+        console.log(`[kem.worker] coherencePerPixel downsampled ${cohRes}² → ${resolution}²`);
+      } else {
+        console.log('[kem.worker] coherencePerPixel from inline');
+      }
     } else {
       const dArt    = await _loadArtifact(api, artifactKeys.directionalFieldKey);
       coherencePerPixel = _extractCoherence(dArt);
@@ -236,10 +290,19 @@ async function _handleKEMAnalyze(msg) {
     // narrowBandMask — reconstruct from phiMinInline or IDB phi artifact
     let narrowBandMask = null;
     if (msg.phiMinInline instanceof Float32Array) {
+      // phiMinInline is at minimizerResolution (1024²). Direct indexing with i < N = 512²
+      // reads only the top-left quarter. Downsample first.
+      const phiMinRes = Math.round(Math.sqrt(msg.phiMinInline.length));
+      const phiDS = phiMinRes !== resolution
+        ? _downsampleScalar(msg.phiMinInline, phiMinRes, resolution)
+        : msg.phiMinInline;
       const thresh = 12 / resolution;
       narrowBandMask = new Float32Array(N);
-      for (let i = 0; i < N; i++) narrowBandMask[i] = Math.abs(msg.phiMinInline[i]) < thresh ? 1 : 0;
-      console.log('[kem.worker] narrowBandMask reconstructed from phiMinInline');
+      for (let i = 0; i < N; i++) narrowBandMask[i] = Math.abs(phiDS[i]) < thresh ? 1 : 0;
+      const bandPx = narrowBandMask.reduce((s, v) => s + v, 0);
+      console.log('[kem.worker] narrowBandMask reconstructed from phiMinInline', {
+        phiMinRes, resolution, downsampled: phiMinRes !== resolution, bandPx
+      });
     } else {
       const phiArt = await _loadArtifact(api, artifactKeys.narrowBandKey);
       if (phiArt?.data?.phi) {
@@ -308,86 +371,19 @@ async function _handleKEMAnalyze(msg) {
       meanLQESpeed
     });
 
-    // ── Persist artifacts ──────────────────────────────────────────────────
-    const store = _buildStore(sw);
-    const TTL   = PersistenceHelper.TTL?.PINNED ?? 300_000;
-
-    const persistMeta = {
-      sourceMetaKey:    metaKey,
-      resolution,
-      meanKEM,
-      cladeCount,
-      stage5Degraded,
-      stage5Legibility,
-      degeneratePixels: diagnostics.degeneratePixels,
-      splitCount:       diagnostics.splitCount,
-      computedAt:       Date.now()
-    };
-
-    // kem_map — Float32Array res²
-    const kemMapResult = await PersistenceHelper.persist(store, {
-      type:    'kem_map',
-      data:    { map: Array.from(kemField), width: resolution, height: resolution },
-      meta:    { ...persistMeta },
-      ttl:     TTL,
-      pinType: PersistenceHelper.PIN?.SOFT ?? 'soft'
-    });
-
-    // clade_map — Int32Array res²
-    const cladeMapResult = await PersistenceHelper.persist(store, {
-      type:    'clade_map',
-      data:    { map: Array.from(cladeMap), width: resolution, height: resolution },
-      meta:    { ...persistMeta, cladeCount },
-      ttl:     TTL,
-      pinType: PersistenceHelper.PIN?.SOFT ?? 'soft'
-    });
-
-    // tension_field — Float32Array res²
-    const tensionResult = await PersistenceHelper.persist(store, {
-      type:    'tension_field',
-      data:    { field: Array.from(tensionField), width: resolution, height: resolution },
-      meta:    { ...persistMeta },
-      ttl:     TTL,
-      pinType: PersistenceHelper.PIN?.SOFT ?? 'soft'
-    });
-
-    // velocity_manifold — serialised per-clade object
-    const vmResult = await PersistenceHelper.persist(store, {
-      type:    'velocity_manifold',
-      data:    _serialiseVelocityManifold(velocityManifold),
-      meta:    { ...persistMeta },
-      ttl:     TTL,
-      pinType: PersistenceHelper.PIN?.SOFT ?? 'soft'
-    });
-
-    // kem_summary — metadata + diagnostics
-    const summaryResult = await PersistenceHelper.persist(store, {
-      type:    'kem_summary',
-      data:    {
-        meanKEM,
-        cladeCount,
-        kemRange:      diagnostics.kemRange,
-        degeneratePixels: diagnostics.degeneratePixels,
-        splitCount:    diagnostics.splitCount,
-        totalClades:   diagnostics.totalClades,
-        stage5Degraded,
-        stage5Legibility
-      },
-      meta:    { ...persistMeta },
-      ttl:     TTL,
-      pinType: PersistenceHelper.PIN?.SOFT ?? 'soft'
-    });
-
-    // ── Broadcast KEM_DONE ─────────────────────────────────────────────────
+    // ── Broadcast KEM_DONE immediately — no IDB round-trip ────────────────
+    // kemField, cladeMap, tensionField have no downstream IDB consumer.
+    // Only meanKEM and cladeCount are needed by STAGE678_DONE.
+    // Keys are null; fire-and-forget persistence runs behind persistInlineArtifacts.
     _bcPost({
       event:               'KEM_DONE',
       metaKey,
       jobId,
-      kemMapKey:           kemMapResult?.metaKey    ?? null,
-      cladeMapKey:         cladeMapResult?.metaKey  ?? null,
-      tensionFieldKey:     tensionResult?.metaKey   ?? null,
-      velocityManifoldKey: vmResult?.metaKey        ?? null,
-      kemSummaryKey:       summaryResult?.metaKey   ?? null,
+      kemMapKey:           null,
+      cladeMapKey:         null,
+      tensionFieldKey:     null,
+      velocityManifoldKey: null,
+      kemSummaryKey:       null,
       meanKEM,
       cladeCount,
       processingMs: Date.now() - startMs
@@ -399,6 +395,73 @@ async function _handleKEMAnalyze(msg) {
       cladeCount,
       processingMs: Date.now() - startMs
     });
+
+    // ── Fire-and-forget IDB persistence — gated behind persistInlineArtifacts ──
+    // kemField (1MB), cladeMap (1MB), tensionField (1MB): no downstream reader.
+    // velocityManifold: large nested object, no downstream reader.
+    // Persisting unconditionally creates ~3MB of unnecessary IDB writes per frame.
+    if (_flags.persistInlineArtifacts) (async () => {
+      try {
+        const store = _buildStore(sw);
+        const TTL   = PersistenceHelper.TTL?.PINNED ?? 300_000;
+        const persistMeta = {
+          sourceMetaKey:    metaKey,
+          resolution,
+          meanKEM,
+          cladeCount,
+          stage5Degraded,
+          stage5Legibility,
+          degeneratePixels: diagnostics.degeneratePixels,
+          splitCount:       diagnostics.splitCount,
+          computedAt:       Date.now()
+        };
+        await PersistenceHelper.persist(store, {
+          type:    'kem_map',
+          data:    { map: Array.from(kemField), width: resolution, height: resolution },
+          meta:    { ...persistMeta },
+          ttl:     TTL,
+          pinType: PersistenceHelper.PIN?.SOFT ?? 'soft'
+        });
+        await PersistenceHelper.persist(store, {
+          type:    'clade_map',
+          data:    { map: Array.from(cladeMap), width: resolution, height: resolution },
+          meta:    { ...persistMeta, cladeCount },
+          ttl:     TTL,
+          pinType: PersistenceHelper.PIN?.SOFT ?? 'soft'
+        });
+        await PersistenceHelper.persist(store, {
+          type:    'tension_field',
+          data:    { field: Array.from(tensionField), width: resolution, height: resolution },
+          meta:    { ...persistMeta },
+          ttl:     TTL,
+          pinType: PersistenceHelper.PIN?.SOFT ?? 'soft'
+        });
+        await PersistenceHelper.persist(store, {
+          type:    'velocity_manifold',
+          data:    _serialiseVelocityManifold(velocityManifold),
+          meta:    { ...persistMeta },
+          ttl:     TTL,
+          pinType: PersistenceHelper.PIN?.SOFT ?? 'soft'
+        });
+        await PersistenceHelper.persist(store, {
+          type:    'kem_summary',
+          data:    {
+            meanKEM, cladeCount,
+            kemRange:         diagnostics.kemRange,
+            degeneratePixels: diagnostics.degeneratePixels,
+            splitCount:       diagnostics.splitCount,
+            totalClades:      diagnostics.totalClades,
+            stage5Degraded,   stage5Legibility
+          },
+          meta:    { ...persistMeta },
+          ttl:     TTL,
+          pinType: PersistenceHelper.PIN?.SOFT ?? 'soft'
+        });
+        console.log('[kem.worker] Background persistence complete');
+      } catch (e) {
+        console.warn('[kem.worker] Background persistence failed (non-fatal):', e.message);
+      }
+    })();
 
   } catch (err) {
     console.error('[kem.worker] KEM_ANALYZE failed:', err);

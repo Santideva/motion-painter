@@ -108,6 +108,23 @@ async function _loadArtifact(api, key) {
   return _retryable(() => api.getArtifact(key));
 }
 
+// ── Resolution downsampling helper ───────────────────────────────────────
+// phiMinInline arrives at minimizerResolution (1024²); correspondence runs
+// at topoResolution (512²). Direct indexing reads the top-left quarter only.
+function _downsampleScalar(src, srcRes, dstRes) {
+  if (!src || srcRes === dstRes) return src;
+  const scale = srcRes / dstRes;
+  const out   = new src.constructor(dstRes * dstRes);
+  for (let y = 0; y < dstRes; y++) {
+    for (let x = 0; x < dstRes; x++) {
+      const sy = Math.min(srcRes - 1, Math.floor(y * scale));
+      const sx = Math.min(srcRes - 1, Math.floor(x * scale));
+      out[y * dstRes + x] = src[sy * srcRes + sx];
+    }
+  }
+  return out;
+}
+
 // ── Narrow band reconstruction (consistent with ambi.worker / kem.worker) ─
 function _narrowBandFromPhi(phi, resolution) {
   const N     = resolution * resolution;
@@ -125,10 +142,8 @@ async function _handleCorrespondenceAnalyze(msg) {
   const startMs = Date.now();
 
   try {
-    const api = await _loadStorageAPI();
-    const sw  = _wrapStorage(api);
-
-    // ── Resolve all inputs — inline-first, IDB fallback ──────────────────
+    // ── Resolve all inputs — inline-first (IDB never needed, all keys null) ─
+    // api/sw are only opened inside the fire-and-forget IIFE below.
     const resolution = artifactKeys.resolution ?? 512;
     const N          = resolution * resolution;
 
@@ -190,11 +205,19 @@ async function _handleCorrespondenceAnalyze(msg) {
       }
     }
 
-    // narrowBandMask — reconstruct from phiMinInline or IDB phi artifact
+    // narrowBandMask — reconstruct from phiMinInline.
+    // phiMinInline is at minimizerResolution (1024²); downsample to topoResolution
+    // before thresholding — direct indexing reads the top-left quarter only.
     let narrowBandMask;
     if (msg.phiMinInline instanceof Float32Array) {
-      narrowBandMask = _narrowBandFromPhi(msg.phiMinInline, resolution);
-      console.log('[correspondence.worker] narrowBandMask reconstructed from phiMinInline');
+      const phiMinRes = Math.round(Math.sqrt(msg.phiMinInline.length));
+      const phiDS     = phiMinRes !== resolution
+        ? _downsampleScalar(msg.phiMinInline, phiMinRes, resolution)
+        : msg.phiMinInline;
+      narrowBandMask = _narrowBandFromPhi(phiDS, resolution);
+      console.log('[correspondence.worker] narrowBandMask reconstructed from phiMinInline', {
+        phiMinRes, resolution, downsampled: phiMinRes !== resolution
+      });
     } else {
       const phiArt = await _loadArtifact(api, artifactKeys.phiMinKey);
       if (phiArt?.data?.phi) {
@@ -243,85 +266,19 @@ async function _handleCorrespondenceAnalyze(msg) {
       diagnostics
     } = result;
 
-    // ── Persist ────────────────────────────────────────────────────────────
-    const store = _buildStore(sw);
-    const TTL   = PersistenceHelper.TTL?.PINNED ?? 300_000;
-
-    const persistMeta = {
-      sourceMetaKey:            metaKey,
-      resolution,
-      symmetryMismatchScore,
-      geometricAsymmetry,
-      reconstructionConsistency,
-      symmetryAxisAngle,
-      thetaAxis,
-      degradedSymmetryAxis,
-      unmatchedFraction,
-      legibilityScore,
-      unreliableScore:          diagnostics.unreliableScore,
-      crossBoundaryPixels:      diagnostics.crossBoundaryPixels,
-      topologyMapPresent:       !!topologyMap,
-      computedAt:               Date.now()
-    };
-
-    const corrMapResult = await PersistenceHelper.persist(store, {
-      type:    'correspondence_map',
-      data:    { map: Array.from(correspondenceMap), width: resolution, height: resolution },
-      meta:    { ...persistMeta },
-      ttl:     TTL,
-      pinType: PersistenceHelper.PIN?.SOFT ?? 'soft'
-    });
-
-    const confMapResult = await PersistenceHelper.persist(store, {
-      type:    'confidence_map',
-      data:    { map: Array.from(confidenceMap), width: resolution, height: resolution },
-      meta:    { ...persistMeta },
-      ttl:     TTL,
-      pinType: PersistenceHelper.PIN?.SOFT ?? 'soft'
-    });
-
-    const bilateralResult = await PersistenceHelper.persist(store, {
-      type:    'bilateral_consistency_map',
-      data:    { map: Array.from(bilateralConsistencyMap), width: resolution, height: resolution },
-      meta:    { ...persistMeta },
-      ttl:     TTL,
-      pinType: PersistenceHelper.PIN?.SOFT ?? 'soft'
-    });
-
-    const summaryResult = await PersistenceHelper.persist(store, {
-      type:    'correspondence_summary',
-      data:    {
-        symmetryMismatchScore,
-        geometricAsymmetry,
-        reconstructionConsistency,
-        symmetryAxisAngle,
-        thetaAxis,
-        degradedSymmetryAxis,
-        unmatchedFraction,
-        unreliableScore:        diagnostics.unreliableScore,
-        crossBoundaryPixels:    diagnostics.crossBoundaryPixels,
-        matchedPixels:          diagnostics.matchedPixels,
-        unmatchedPixels:        diagnostics.unmatchedPixels,
-        totalNarrowBand:        diagnostics.totalNarrowBand,
-        meanGeometricError:     diagnostics.meanGeometricError,
-        meanConfidence:         diagnostics.meanConfidence,
-        topologyMapPresent:     !!topologyMap,
-        legibilityScore
-      },
-      meta:    { ...persistMeta },
-      ttl:     TTL,
-      pinType: PersistenceHelper.PIN?.SOFT ?? 'soft'
-    });
-
-    // ── Broadcast CORRESPONDENCE_DONE ─────────────────────────────────────
+    // ── Broadcast CORRESPONDENCE_DONE immediately — no IDB round-trip ─────
+    // correspondence_map (Int32Array 512²), confidence_map (Float32Array 512²),
+    // bilateral_consistency_map (Uint8Array 512²): no downstream IDB consumer.
+    // Array.from() on 262144-element typed arrays + JSON serialization = 6-15MB
+    // of transient allocations that reliably OOM the worker under load.
     _bcPost({
       event:                      'CORRESPONDENCE_DONE',
       metaKey,
       jobId,
-      correspondenceMapKey:       corrMapResult?.metaKey    ?? null,
-      confidenceMapKey:           confMapResult?.metaKey    ?? null,
-      bilateralConsistencyMapKey: bilateralResult?.metaKey  ?? null,
-      correspondenceSummaryKey:   summaryResult?.metaKey    ?? null,
+      correspondenceMapKey:       null,
+      confidenceMapKey:           null,
+      bilateralConsistencyMapKey: null,
+      correspondenceSummaryKey:   null,
       symmetryMismatchScore,
       geometricAsymmetry,
       reconstructionConsistency,
@@ -333,13 +290,68 @@ async function _handleCorrespondenceAnalyze(msg) {
 
     console.log('[correspondence.worker] CORRESPONDENCE_DONE broadcast', {
       metaKey,
-      symmetryMismatchScore:    symmetryMismatchScore.toFixed(3),
-      geometricAsymmetry:       geometricAsymmetry.toFixed(3),
+      symmetryMismatchScore:     symmetryMismatchScore.toFixed(3),
+      geometricAsymmetry:        geometricAsymmetry.toFixed(3),
       reconstructionConsistency: reconstructionConsistency.toFixed(3),
-      unmatchedFraction:        unmatchedFraction.toFixed(3),
-      crossBoundaryPixels:      diagnostics.crossBoundaryPixels,
-      processingMs:             Date.now() - startMs
+      unmatchedFraction:         unmatchedFraction.toFixed(3),
+      crossBoundaryPixels:       diagnostics.crossBoundaryPixels,
+      processingMs:              Date.now() - startMs
     });
+
+    // ── Fire-and-forget IDB persistence — gated behind persistInlineArtifacts ──
+    if (_flags.persistInlineArtifacts) (async () => {
+      try {
+        const api   = await _loadStorageAPI();
+        const sw    = _wrapStorage(api);
+        const store = _buildStore(sw);
+        const TTL   = PersistenceHelper.TTL?.PINNED ?? 300_000;
+        const persistMeta = {
+          sourceMetaKey: metaKey, resolution,
+          symmetryMismatchScore, geometricAsymmetry, reconstructionConsistency,
+          symmetryAxisAngle, thetaAxis, degradedSymmetryAxis, unmatchedFraction,
+          legibilityScore,
+          unreliableScore:     diagnostics.unreliableScore,
+          crossBoundaryPixels: diagnostics.crossBoundaryPixels,
+          topologyMapPresent:  !!topologyMap,
+          computedAt:          Date.now()
+        };
+        await PersistenceHelper.persist(store, {
+          type:    'correspondence_map',
+          data:    { map: Array.from(correspondenceMap), width: resolution, height: resolution },
+          meta:    { ...persistMeta }, ttl: TTL, pinType: PersistenceHelper.PIN?.SOFT ?? 'soft'
+        });
+        await PersistenceHelper.persist(store, {
+          type:    'confidence_map',
+          data:    { map: Array.from(confidenceMap), width: resolution, height: resolution },
+          meta:    { ...persistMeta }, ttl: TTL, pinType: PersistenceHelper.PIN?.SOFT ?? 'soft'
+        });
+        await PersistenceHelper.persist(store, {
+          type:    'bilateral_consistency_map',
+          data:    { map: Array.from(bilateralConsistencyMap), width: resolution, height: resolution },
+          meta:    { ...persistMeta }, ttl: TTL, pinType: PersistenceHelper.PIN?.SOFT ?? 'soft'
+        });
+        await PersistenceHelper.persist(store, {
+          type:    'correspondence_summary',
+          data:    {
+            symmetryMismatchScore, geometricAsymmetry, reconstructionConsistency,
+            symmetryAxisAngle, thetaAxis, degradedSymmetryAxis, unmatchedFraction,
+            unreliableScore:     diagnostics.unreliableScore,
+            crossBoundaryPixels: diagnostics.crossBoundaryPixels,
+            matchedPixels:       diagnostics.matchedPixels,
+            unmatchedPixels:     diagnostics.unmatchedPixels,
+            totalNarrowBand:     diagnostics.totalNarrowBand,
+            meanGeometricError:  diagnostics.meanGeometricError,
+            meanConfidence:      diagnostics.meanConfidence,
+            topologyMapPresent:  !!topologyMap,
+            legibilityScore
+          },
+          meta:    { ...persistMeta }, ttl: TTL, pinType: PersistenceHelper.PIN?.SOFT ?? 'soft'
+        });
+        console.log('[correspondence.worker] Background persistence complete');
+      } catch (e) {
+        console.warn('[correspondence.worker] Background persistence failed (non-fatal):', e.message);
+      }
+    })();
 
   } catch (err) {
     console.error('[correspondence.worker] CORRESPONDENCE_ANALYZE failed:', err);

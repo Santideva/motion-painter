@@ -243,8 +243,10 @@ async function _runPhaseB(job, topoData) {
       processingMs:            Date.now() - startMs
     });
 
-    // ── Fire-and-forget IDB persistence (cold-start recovery only) ────────
-    (async () => {
+    // ── Fire-and-forget IDB persistence — gated behind persistInlineArtifacts ──
+    // phi_min (4MB) and zero_curve travel inline via minimizerInline to ambi,
+    // kem, and correspondence. IDB writes are unnecessary in normal operation.
+    if (_flags.persistInlineArtifacts) (async () => {
       const persistMeta = {
         sourceMetaKey:      metaKey,
         resolution,

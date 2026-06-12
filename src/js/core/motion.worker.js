@@ -2629,33 +2629,35 @@ async function _computeDepthNormalsFlux(frameBitmap, calibData, options = {}) {
         validateResolution(gridSize, liftResult.resolution, 'DirectionalLifting');
         validateBuffer(directionalField, gridSize * gridSize * 4, 'directionalField');
 
-// Always persist directional_field — topology.worker (Stage 4A) requires it
-        // unconditionally. Derivatives and coherence are packed into the same artifact
-        // so topology.worker needs only one storage key.
-        try {
-          directionalFieldArtResult = await _persistAndPin(options.storageWrapper, {
-            type: 'directional_field',
-            data: {
-              field:       directionalField,
-              coherence:   liftResult.coherence   ?? null,
-              derivatives: liftResult.derivatives
-                ? { field: liftResult.derivatives.field,
-                    dt:    liftResult.derivatives.dt,
-                    meanAbsDerivative: liftResult.derivatives.meanAbsDerivative }
-                : null
-            },
-            meta: {
-              sourceMetaKey:  metaKey,
-              cameraId,
-              resolution:     gridSize,
-              coherenceMean:  liftResult.coherence?.mean ?? null,
-              hasDerivatives: !!(liftResult.derivatives),
-              computedAt:     Date.now()
-            },
-            createdAt: new Date().toISOString()
-          }, { owner: 'motion.worker', ttlMs: INTERMEDIATE_TTL_MS, pinType: 'soft' });
-        } catch (e) {
-          console.warn('[PERSIST] directional_field non-fatal:', e.message);
+        // directional_field — gated behind persistInlineArtifacts (default false).
+        // topology.worker and ambi.worker both receive this data via directionalFieldInline.
+        // IDB write (16MB) is unnecessary in normal operation and causes memory pressure.
+        if (_flags.persistInlineArtifacts) {
+          try {
+            directionalFieldArtResult = await _persistAndPin(options.storageWrapper, {
+              type: 'directional_field',
+              data: {
+                field:       directionalField,
+                coherence:   liftResult.coherence   ?? null,
+                derivatives: liftResult.derivatives
+                  ? { field: liftResult.derivatives.field,
+                      dt:    liftResult.derivatives.dt,
+                      meanAbsDerivative: liftResult.derivatives.meanAbsDerivative }
+                  : null
+              },
+              meta: {
+                sourceMetaKey:  metaKey,
+                cameraId,
+                resolution:     gridSize,
+                coherenceMean:  liftResult.coherence?.mean ?? null,
+                hasDerivatives: !!(liftResult.derivatives),
+                computedAt:     Date.now()
+              },
+              createdAt: new Date().toISOString()
+            }, { owner: 'motion.worker', ttlMs: INTERMEDIATE_TTL_MS, pinType: 'soft' });
+          } catch (e) {
+            console.warn('[PERSIST] directional_field non-fatal:', e.message);
+          }
         }
 
         telemetry.stages.directional_ms      = performance.now() - telemetry.stages.directional_start;
@@ -4203,7 +4205,7 @@ console.log('[STAGE4] Final calibData state before depth computation:', {
         // ── Persist disk_seeds ─────────────────────────────────────────────
         // Serialised via PackingSDF.serialize() for compact binary transfer.
         // Stage 4B (ConstrainedMinimizer) reads this via PackingSDF.deserialize().
-        try {
+        if (_flags.persistInlineArtifacts) try {
           const { header: seedHeader, payload: seedPayload } =
             _getPackingSDF().serialize(sdfResult, { includeMetStress: false });
 
@@ -4275,8 +4277,11 @@ console.log('[STAGE4] Final calibData state before depth computation:', {
     // Produced by Horn-Schunck in _computeDepthNormalsFlux.
     // null when enableOpticalFlow=false OR when H-S failed.
     // DifferentialGeometry reads this key and computes flow_divergence / flow_curl.
+    // flow_field — gated behind persistInlineArtifacts (default false).
+    // kem.worker receives flowU/V via flowFieldInline. IDB write (8MB) is
+    // unnecessary in normal operation.
     let flowFieldResult = null;
-    if (flowField) {
+    if (flowField && _flags.persistInlineArtifacts) {
       try {
         flowFieldResult = await _persistAndPin(
           storageWrapper,
@@ -4306,7 +4311,7 @@ console.log('[STAGE4] Final calibData state before depth computation:', {
       } catch (e) {
         console.warn('[PERSIST] flow_field failed (non-fatal):', e.message);
       }
-    }    
+    }  
 
     let selectorResult = null;
     if (selectorArtifact && _flags.bssPersistSelector) {
