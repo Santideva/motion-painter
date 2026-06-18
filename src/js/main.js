@@ -24,6 +24,10 @@ import { MediaInput } from './ui/MediaInput.js';
 // Import utilities
 import { CONFIG, validateBufferSize } from './utils/MathUtils.js';
 
+// Artifact visualization system (standalone — no pipeline dependencies)
+import ArtifactRenderer from './core/ArtifactRenderer.js';
+import ArtifactPanel    from './ui/ArtifactPanel.js';
+
 // Import storage API (main may still use storageAPI for other needs)
 import storageAPI from './core/storage.js';
 
@@ -59,6 +63,10 @@ class MotionPainter {
     this._pendingMinimizerInline = null;
     // BroadcastChannel used for cross-worker signaling (listen for release_request etc.)
     this._bc = null;
+
+    // Artifact visualization system
+    this.artifactRenderer = null;  // GPU texture registry + visualization shaders
+    this.artifactPanel    = null;  // Floating "Scene Analysis" toggle panel
 
     // IMPORTANT: main no longer keeps calibration artifacts or bias arrays.
     // The canonical persisted metaKey and tokens are owned/pinned by the preprocessor.worker.
@@ -100,7 +108,81 @@ class MotionPainter {
 
       // DIAGNOSTICS: attach FrameBuffer diagnostics (wrap upload + validation)
       addFrameBufferDiagnostics(this.frameBuffer, { devMode: true });
-      
+
+      // ── Artifact renderer ─────────────────────────────────────────────
+      // Shares the WebGL2 context. Must be created before ArtifactPanel so
+      // the panel's list() call has a valid registry to query.
+      try {
+        this.artifactRenderer = new ArtifactRenderer(this.webglRenderer.gl);
+        console.log('[ArtifactRenderer] Initialized');
+      } catch (arErr) {
+        console.warn('[ArtifactRenderer] Initialization failed (non-fatal):', arErr);
+        this.artifactRenderer = null;
+      }
+
+      // ── Artifact panel ────────────────────────────────────────────────
+      if (this.artifactRenderer) {
+        try {
+          this.artifactPanel = new ArtifactPanel({
+            artifactRenderer: this.artifactRenderer,
+            onActivate: (name, mode, params) => {
+              if (this.artifactRenderer) {
+                this.artifactRenderer.setActive(name, mode, params);
+              }
+            },
+            onClear: () => {
+              if (this.artifactRenderer) {
+                this.artifactRenderer.clearActive();
+              }
+            }
+          });
+          console.log('[ArtifactPanel] Initialized');
+        } catch (panelErr) {
+          console.warn('[ArtifactPanel] Initialization failed (non-fatal):', panelErr);
+          this.artifactPanel = null;
+        }
+      }
+
+      // ── Composite drawer toggle ───────────────────────────────────────
+      // Wires the top-bar "⊞ Composite" button to the temporal composite
+      // settings drawer (the slide-in panel with the old sidebar controls).
+      // Amber accent (⊞ Composite) vs Blue accent (⬡ Scene Analysis) —
+      // the two systems are visually and semantically separate.
+      try {
+        const compositeToggle = document.getElementById('compositeToggle');
+        const compositeDrawer = document.getElementById('compositeDrawer');
+        const compositeClose  = document.getElementById('compositeClose');
+
+        if (compositeToggle && compositeDrawer) {
+          compositeToggle.addEventListener('click', () => {
+            const isOpen = compositeDrawer.getAttribute('aria-hidden') === 'false';
+            compositeDrawer.setAttribute('aria-hidden', isOpen ? 'true' : 'false');
+            compositeToggle.classList.toggle('active', !isOpen);
+          });
+        }
+
+        if (compositeClose && compositeDrawer) {
+          compositeClose.addEventListener('click', () => {
+            compositeDrawer.setAttribute('aria-hidden', 'true');
+            const btn = document.getElementById('compositeToggle');
+            if (btn) btn.classList.remove('active');
+          });
+        }
+
+        // Mirror the top-bar status text into the drawer status span
+        const statusEl  = document.getElementById('status');
+        const status2El = document.getElementById('status2');
+        if (statusEl && status2El) {
+          new MutationObserver(() => {
+            status2El.textContent = statusEl.textContent;
+          }).observe(statusEl, { childList: true, characterData: true, subtree: true });
+        }
+
+        console.log('[CompositeDrawer] Toggle wired');
+      } catch (drawerErr) {
+        console.warn('[CompositeDrawer] Wire failed (non-fatal):', drawerErr);
+      }
+
       // --- set up preprocessor + eviction hook AFTER FrameBuffer exists ---
       try {
         // create wrapper; the wrapper implementation resolves promises on calibration ready.
@@ -1054,6 +1136,35 @@ class MotionPainter {
                 console.warn('[Stage4A] main.js: TOPOLOGY_DONE writeback failed', e);
               }
             }
+            // ── Artifact upload: Stage 4A topology fields ─────────────────
+            // Placed after all pipeline logic. Isolated try/catch — a failure
+            // here cannot affect the return or any subsequent handler.
+            // Field names confirmed from pipeline logs:
+            //   msg.topoInline.topologyMap  → Int32Array, 262144 (512²)
+            //   msg.topoInline.componentMap → Int32Array, 262144 (512²)
+            //   msg.topoInline.topoResolution → 512
+            try {
+              if (this.artifactRenderer && msg.topoInline) {
+                const topoRes = msg.topoInline.topoResolution ?? 512;
+                if (msg.topoInline.topologyMap) {
+                  this.artifactRenderer.uploadLabel(
+                    'topologyMap',
+                    msg.topoInline.topologyMap,
+                    topoRes, topoRes
+                  );
+                }
+                if (msg.topoInline.componentMap) {
+                  this.artifactRenderer.uploadLabel(
+                    'componentMap',
+                    msg.topoInline.componentMap,
+                    topoRes, topoRes
+                  );
+                }
+              }
+            } catch (arErr) {
+              console.warn('[ArtifactRenderer] TOPOLOGY_DONE upload failed (non-fatal):', arErr);
+            }
+
             return;
           }
 
@@ -1091,10 +1202,51 @@ class MotionPainter {
                 console.warn('[Stage4B] main.js: MINIMIZER_DONE writeback failed', e);
               }
             }
+            // ── Artifact upload: phiMin ───────────────────────────────────
+            // Field name confirmed from kem.worker.js log:
+            //   msg.minimizerInline.phiMin → Float32Array, 1048576 (1024²)
+            //   (phiMin is at minimizerResolution = 1024², not topoResolution)
+            try {
+              if (this.artifactRenderer && msg.minimizerInline?.phiMin) {
+                const phi     = msg.minimizerInline.phiMin;
+                const phiSide = Math.round(Math.sqrt(phi.length));
+                this.artifactRenderer.uploadScalar(
+                  'phiMin', phi, phiSide, phiSide
+                );
+              }
+            } catch (arErr) {
+              console.warn('[ArtifactRenderer] MINIMIZER_DONE upload failed (non-fatal):', arErr);
+            }
+
+            // ── Artifact upload: Stage 5 warp and world frame fields ──────
+            // Field names confirmed from correspondence.worker.js log:
+            //   msg.warpFieldInline.field    → Float32Array, 524288 (512²×2, interleaved r,θ)
+            //   msg.worldFrameMapInline.map  → Int32Array,   262144 (512²)
+            try {
+              if (this.artifactRenderer) {
+                const ambiRes = this.cameraContainer?.stage67Inputs?._topoResolution ?? 512;
+                if (msg.warpFieldInline?.field) {
+                  this.artifactRenderer.uploadFlowInterleaved(
+                    'warpField',
+                    msg.warpFieldInline.field,
+                    ambiRes, ambiRes
+                  );
+                }
+                if (msg.worldFrameMapInline?.map) {
+                  this.artifactRenderer.uploadLabel(
+                    'worldFrameMap',
+                    msg.worldFrameMapInline.map,
+                    ambiRes, ambiRes
+                  );
+                }
+              }
+            } catch (arErr) {
+              console.warn('[ArtifactRenderer] AMBI_DONE upload failed (non-fatal):', arErr);
+            }
+
             return;
           }
-
-          // ── AMBI_DONE handler (Stage 5) ────────────────────────────────
+          // ── AMBI_REFINED handler (Stage 5 — post Stage 6 refinement) ──
           if (msg && msg.event === 'AMBI_DONE') {
             const ambiMetaKey = msg.metaKey;
             if (!ambiMetaKey || !this.cameraContainer) return;
@@ -1975,8 +2127,22 @@ displayHardwareLimitations() {
 
     if (!this.isPaused && this.mediaInput.isVideoReady()) {
       try {
-        // Await processing of current video frame (upload + buffer management + render)
+        // Await processing of current video frame (upload + buffer management + render).
+        // After this call the temporal composite is on the default framebuffer.
         await this.compositeRenderer.processFrame(this.video);
+
+        // Render the active pipeline artifact AFTER the composite is on screen.
+        // If no artifact is active this is a complete no-op.
+        // A thrown error here must NOT stop the camera composite from rendering
+        // on the next frame, hence the isolated try/catch.
+        if (this.artifactRenderer && this.artifactRenderer.hasActive()) {
+          try {
+            this.artifactRenderer.renderActiveIfAny();
+          } catch (arErr) {
+            console.warn('[ArtifactRenderer] renderActiveIfAny error (non-fatal):', arErr);
+          }
+        }
+
       } catch (error) {
         console.error('Render error:', error);
         this.controls.updateStatus('Render error: ' + error.message);
@@ -3146,6 +3312,26 @@ verifyDispatcherConnection() {
   // ------------------ end MotionDetector calibration orchestration ------------------
    destroy() {
     this.stopRendering();
+
+    // Tear down artifact panel first (removes DOM, stops timer)
+    if (this.artifactPanel) {
+      try {
+        this.artifactPanel.destroy();
+      } catch (e) {
+        console.warn('[ArtifactPanel] destroy failed:', e);
+      }
+      this.artifactPanel = null;
+    }
+
+    // Tear down artifact renderer (deletes all GPU textures and shaders)
+    if (this.artifactRenderer) {
+      try {
+        this.artifactRenderer.destroy();
+      } catch (e) {
+        console.warn('[ArtifactRenderer] destroy failed:', e);
+      }
+      this.artifactRenderer = null;
+    }
 
     if (Array.isArray(this._flagUnsubs)) {
       try {

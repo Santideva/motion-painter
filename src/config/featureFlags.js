@@ -322,7 +322,7 @@ const DEFAULTS = {
   // HFH (Hybrid Fresnel Harvester) controls (NEW)
   enableHFH: true,
   // When an annular-derived score exceeds this (0..1) HFH can route heavy paths
-  hfhHeavyPathThreshold: 0.85,
+  hfhHeavyPathThreshold: 0.00,
   // Per-camera HFH cooldown (ms)
   hfhCooldownMs: 30000,
   // If true, HFH will only annotate during eviction; otherwise eviction may escalate

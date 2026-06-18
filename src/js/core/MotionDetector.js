@@ -261,7 +261,10 @@ export class MotionDetector {
 
     this._schedulerConfig = Object.assign({
       maxInFlight: 2,
-      cooldownMs: 60000,
+      // Lowered from 60000 — allows a new reconstruction every ~10s.
+      // The pipeline itself takes 10–30s so the practical rate is
+      // one run per completion cycle, not one every 10s wall-clock.
+      cooldownMs: 10000,
       maxQueuePerCamera: 10,
       intentExpiryMs: 60000,
       priorities: {
@@ -272,7 +275,7 @@ export class MotionDetector {
       },
       defaultCameraConfig: {
         concurrency: 1,
-        cooldownMs: 60000,
+        cooldownMs: 10000,
         weight: 1.0,
         penaltyDecayRate: 0.95,
         decayIntervalMs: 60000
