@@ -81,11 +81,22 @@ const DEFAULTS = {
    */
   MOTION_UNPIN_ON_CLAIM: false,
 
+  /**
+   * enableLegacyFluxManifest: Controls motion.worker's legacy _computeFluxFromCalibration
+   * path, which runs on every 'calibration:ready' BC broadcast and produces a
+   * 'flux-manifest' artifact type that NO downstream worker (topology, minimizer,
+   * ambi, kem, correspondence) reads. Confirmed dead output. Disabled by default
+   * to stop duplicate GPU/CPU work and IDB writes on every calibration cycle.
+   * Set true only if external tooling still depends on flux-manifest artifacts.
+   */
+  enableLegacyFluxManifest: false,
+
   // ✅ NEW: Module debug flags
   calibDebug: false,                   // CalibratedFieldProducer debug logging
   tetraDebug: false,                   // Tetrachromacy debug logging
   dirLiftDebug: false,                 // DirectionalLifting debug logging
   heartbeatDebug: false,               // Heartbeat success/failure logging
+  gpuContextDebug: false,              // Log WebGL context loss/restore + _gpuCapabilities cache resets
 
   // ✅ NEW: DirectionalLifting buffer management
   dirLiftBufferSize: null,            // Manual buffer size override (null = auto)
@@ -107,7 +118,7 @@ const DEFAULTS = {
   // Stage 1: f_map (visible-fraction field)
   enableFMapRouteA: true,             // true  → Route A (depth MC) runs after GPU branch
                                       // false → always use Route B (temporal proxy)
-  fMapDebug: false,                   // log Route A source position + timing per frame
+  fMapDebug: true,                   // log Route A source position + timing per frame
   fMapDirectThresh: 0.9,              // f >= this  →  DIRECT   modal label (2)
   fMapUmbraThresh: 0.1,               // f <= this  →  UMBRA    modal label (0)
                                       // in between →  PENUMBRA modal label (1)
@@ -115,6 +126,22 @@ const DEFAULTS = {
   fMapOcclusionBias: 0.04,            // depth tolerance preventing self-occlusion
                                       // from quantisation noise; normalised [0,1]
   fMapMarchSteps: 8,                  // intermediate depth-march steps per ray
+  fMapCoarseMaxSide: 256,             // Route A hybrid: coarse-pass grid cap used only
+                                      // to flag which pixels need exact full-res
+                                      // refinement (see _computeFMapRouteAHybrid). The
+                                      // final DIRECT/PENUMBRA/UMBRA boundary is always
+                                      // computed exactly, never from this coarse pass.
+  fresnelDerivedBlurRadiusPx: 12,     // box-blur radius (px) used to derive a Fresnel
+                                      // density fallback from PenumbraAnalyzer's edgeMask
+                                      // when no upstream fresnelKey artifact exists (see
+                                      // _deriveFresnelDensityFromPenumbra). Overridden per-
+                                      // frame by PenumbraAnalyzer's own mean penumbra width
+                                      // when available.
+  fMapRefineMargin: 0.05,             // extra margin around [umbraThresh, directThresh]
+                                      // that still triggers exact refinement
+  fMapRefineGradientThresh: 0.1,      // local |Δ| in upsampled coarse fMap that triggers
+                                      // exact refinement even outside the threshold band
+  fMapRefineDilatePx: 1,              // dilation radius (px) applied to the refine mask
 
   // Stage 1: DOA + modal decomposition
   doaKappaThreshold: 3.0,             // angular concentration (kappa) above which a
@@ -216,6 +243,18 @@ const DEFAULTS = {
     minimizerContactAlpha:   0.3,    // contact angle enforcement blend weight
     minimizerBandWidth:      6,      // narrow band initial width (pixels)
     minimizerDt:             null,   // PDE time step (null = auto: 0.2/resolution)
+
+    /**
+     * strictInlineOnlyWorkers: When true (default), Stage 6/7 workers (kem.worker,
+     * correspondence.worker) never attempt the undefined storage-fallback branches
+     * for inputs that should always arrive inline (flowFieldInline, warpFieldInline,
+     * worldFrameMapInline, primeEndsInline, topologyMapInline, phiMinInline,
+     * surfaceParamInline). Missing inline data degrades to null inputs with a
+     * console.warn instead of throwing `ReferenceError: api is not defined`.
+     *
+     * Set false only after a real storageWrapper is wired into those branches.
+     */
+    strictInlineOnlyWorkers: true,
 
     // ── Stage 6: KEM ──────────────────────────────────────────────────────
   kemSplitThreshold:               2.0,   // KEM ratio above end-mean to split a clade
@@ -329,6 +368,134 @@ const DEFAULTS = {
   hfhAnnotateOnlyDuringEviction: true,
   // Who decides escalation: 'worker' (motion.worker) or 'eviction' (frame-eviction hook)
   hfhDecisionAuthority: 'worker',
+
+  // ── Storage layer controls (NEW) ─────────────────────────────────────────
+  /**
+   * storageEvictorAuthority: Which execution context may run the periodic
+   * IndexedDB evictor loop (storage.js startEvictorLoop). Multiple contexts
+   * each calling initStorage({startEvictor:true}) with different quota values
+   * (main.js=2GB, preprocessor.worker=500MB, others default 1GB) produces
+   * uncoordinated evictors racing on the same IDB counters.
+   *
+   * 'main' — only main.js starts/stops the evictor (recommended)
+   * 'none' — no periodic evictor anywhere; eviction only via checkQuotaAndEvict
+   *          triggered directly by critical-pressure writes
+   *
+   * Worker contexts must check this flag before passing startEvictor:true.
+   */
+  storageEvictorAuthority: 'main',
+
+  /**
+   * storageQuotaCheckOnWrite: putInboundArtifact currently opens an extra
+   * readonly transaction after EVERY write to log/decide eviction scheduling.
+   * This duplicates the periodic evictor and is the source of the
+   * "NORMAL quota pressure" log spam on every frame. Default false — routine
+   * maintenance is left to the periodic evictor loop; only critical-pressure
+   * writes (>storageCriticalQuotaThreshold) should still check inline.
+   */
+  storageQuotaCheckOnWrite: false,
+  storageHighQuotaThreshold: 0.85,
+  storageCriticalQuotaThreshold: 0.95,
+
+  /**
+   * exposeLegacyPinRefApi: Controls whether storage.js attaches the legacy
+   * pinRef/unpinRef/getPinRef counter functions to the exported storageAPI.
+   * They write a `.value` field to the same `pinref:<key>` counter record that
+   * the modern pinArtifact/unpinArtifact system writes as `.count` — using both
+   * on the same key silently corrupts refcounting. Default false; use
+   * pinArtifact/unpinArtifact/getPinRefCount instead.
+   */
+  exposeLegacyPinRefApi: false,
+
+  /**
+   * reconStatusMaxAgeMs / reconStatusCleanupIntervalMs: govern periodic pruning
+   * of the reconStatus IndexedDB store via storage.clearOldReconStatus(). This
+   * function exists but is currently never invoked anywhere — done/failed
+   * records accumulate forever. main.js's existing reaper timer should call it
+   * every reconStatusCleanupIntervalMs.
+   */
+  reconStatusMaxAgeMs: 604800000,        // 7 days
+  reconStatusCleanupIntervalMs: 3600000, // 1 hour
+
+  /**
+   * enableWorkerAdvisoryTTLTimers: When true (legacy default), producer workers
+   * (motion.worker, preprocessor.worker) schedule an additional JS-side
+   * setTimeout per pinned artifact, duplicating the authoritative storage-level
+   * pin TTL. At sustained frame rates this is 3+ live timers per frame for zero
+   * correctness benefit — storage-level TTL (pinArtifact ttlMs + getPins()
+   * expiry filtering) is already sufficient. Set false to eliminate the timer churn.
+   */
+  enableWorkerAdvisoryTTLTimers: false,
+
+  /**
+   * storageQuotaBytes: Single shared IndexedDB budget (bytes) used by whichever
+   * context holds storageEvictorAuthority. Previously hardcoded inconsistently —
+   * preprocessor.worker.js used 500MB while main.js used 2GB — against the SAME
+   * physical IndexedDB totalBytes counter (storage.js module state is per-context,
+   * but the underlying IDB data is shared). This guaranteed permanent "CRITICAL
+   * quota pressure" (observed: 305%, 1525MB/500MB) once the full pipeline's
+   * legitimate working set exceeded the smallest configured ceiling — the data
+   * wasn't leaked, it was just being judged against the wrong number. All
+   * initStorage({quota}) call sites should read this value instead of hardcoding
+   * their own.
+   */
+  storageQuotaBytes: 2 * 1024 * 1024 * 1024, // 2GB — sized for the full pipeline, not one stage
+
+  /**
+   * storageCriticalPinOverrideMs: Under sustained CRITICAL quota pressure
+   * (> storageCriticalQuotaThreshold), soft-pinned artifacts older than this
+   * age (ms) become eligible for forced eviction even if their TTL has not
+   * expired yet. Without this, eviction has no escape valve: a live multi-stage
+   * pipeline keeps nearly everything soft-pinned at all times, so critical
+   * pressure can persist indefinitely, with each pass reclaiming only scraps
+   * (already-expired pins) while re-logging "CRITICAL quota pressure" and adding
+   * IDB transaction contention every cycle. HARD pins (e.g. calibration.meta)
+   * are never subject to this override — only soft pins age out early.
+   */
+  storageCriticalPinOverrideMs: 30000, // 30s grace period, only under sustained critical pressure
+
+  /**
+   * calibrationRequestTimeoutMs: Timeout for PreprocessorWorker.requestCalibration's
+   * wrapper promise (previously hardcoded to 120000 in PreprocessorWorker.js).
+   * On timeout, the wrapper promise rejects and removes its message listener,
+   * but — without calibrationAbortOnTimeout — the worker-side computation keeps
+   * running to completion and still persists 4 soft-pinned artifacts plus a
+   * HARD-pinned (never auto-expiring) calibration.meta, orphaned because nothing
+   * calls invalidateCalibration() on a request the caller already gave up on.
+   * Raised default from 120s to 180s to tolerate transient IDB contention while
+   * the underlying quota/eviction fixes take effect.
+   */
+  calibrationRequestTimeoutMs: 180000,
+
+  /**
+   * calibrationAbortOnTimeout: When true, a timed-out requestCalibration() call
+   * posts an explicit abort message to preprocessor.worker so any in-flight (or
+   * just-completed) calibration artifacts — including the hard-pinned meta — are
+   * unpinned and cleaned up immediately instead of being silently orphaned,
+   * preventing them from accumulating across repeated failed attempts.
+   */
+  calibrationAbortOnTimeout: true,
+
+  /**
+   * pauseFrameIngestDuringCalibration: While a calibration computation is in
+   * flight (CALIB.busy === true), ordinary per-frame processing (thumbnail +
+   * phash + manifest persistence) competes with calibration's own writes for
+   * the same IndexedDB readwrite lock on [artifacts, counters, pins]. At any
+   * sustained frame rate this can starve calibration's sequential persist
+   * calls indefinitely — not a crash, just permanent queue starvation that
+   * eventually trips calibrationRequestTimeoutMs regardless of its value.
+   * When true, incoming frames are queued (not dropped) during calibration
+   * and drained immediately once it completes, succeeds, fails, or aborts.
+   */
+  pauseFrameIngestDuringCalibration: true,
+
+  /**
+   * calibrationDeferredFrameQueueMaxSize: Ceiling on frames queued while
+   * pauseFrameIngestDuringCalibration is active. Oldest frames are dropped
+   * (bitmap closed) past this limit to bound memory during a slow/starved
+   * calibration rather than growing unbounded.
+   */
+  calibrationDeferredFrameQueueMaxSize: 60,
 
   // Safety / scaffolding
   featureFlagsVersion: FEATURE_FLAGS_VERSION
@@ -657,10 +824,70 @@ function _coerceOrWarn(key, value) {
       return DEFAULTS.maxWorkerMemoryBytes;
     }
 
+    if (key === 'exposeLegacyPinRefApi' || key === 'enableWorkerAdvisoryTTLTimers') {
+      if (value === 'true' || value === true) return true;
+      if (value === 'false' || value === false) return false;
+      return DEFAULTS[key];
+    }
+
+    if (key === 'reconStatusMaxAgeMs' || key === 'reconStatusCleanupIntervalMs') {
+      const n = Number(value);
+      if (Number.isFinite(n) && n > 0) return Math.max(60000, Math.floor(n)); // min 1 minute
+      return DEFAULTS[key];
+    }
+
+    if (key === 'storageQuotaBytes') {
+      const n = Number(value);
+      if (Number.isFinite(n) && n > 0) return Math.max(64 * 1024 * 1024, Math.floor(n)); // min 64MB
+      return DEFAULTS.storageQuotaBytes;
+    }
+
+    if (key === 'storageCriticalPinOverrideMs') {
+      const n = Number(value);
+      if (Number.isFinite(n) && n >= 0) return Math.floor(n);
+      return DEFAULTS.storageCriticalPinOverrideMs;
+    }
+
+    if (key === 'calibrationRequestTimeoutMs') {
+      const n = Number(value);
+      if (Number.isFinite(n) && n > 0) return Math.max(10000, Math.floor(n)); // min 10s
+      return DEFAULTS.calibrationRequestTimeoutMs;
+    }
+
+    if (key === 'calibrationAbortOnTimeout') {
+      if (value === 'true' || value === true) return true;
+      if (value === 'false' || value === false) return false;
+      return DEFAULTS.calibrationAbortOnTimeout;
+    }
+
+    if (key === 'pauseFrameIngestDuringCalibration') {
+      if (value === 'true' || value === true) return true;
+      if (value === 'false' || value === false) return false;
+      return DEFAULTS.pauseFrameIngestDuringCalibration;
+    }
+
+    if (key === 'calibrationDeferredFrameQueueMaxSize') {
+      const n = Math.floor(Number(value));
+      if (Number.isFinite(n) && n > 0) return Math.min(500, n);
+      return DEFAULTS.calibrationDeferredFrameQueueMaxSize;
+    }
+
     if (key === 'overhangCosineThresh') {
       const n = Number(value);
       if (Number.isFinite(n)) return clamp(n, 0.0, 1.0);
       return DEFAULTS.overhangCosineThresh;
+    }
+
+    if (key === 'storageQuotaCheckOnWrite') {
+      if (value === 'true' || value === true) return true;
+      if (value === 'false' || value === false) return false;
+      return DEFAULTS.storageQuotaCheckOnWrite;
+    }
+
+    if (key === 'storageHighQuotaThreshold' || key === 'storageCriticalQuotaThreshold') {
+      const n = Number(value);
+      if (Number.isFinite(n)) return clamp(n, 0.5, 0.999);
+      return DEFAULTS[key];
     }
 
     if (['depthKL', 'depthKD', 'depthBase', 'depthScale'].includes(key)) {
@@ -715,7 +942,7 @@ function _coerceOrWarn(key, value) {
     }
 
     // ✅ NEW: Debug flags (boolean)
-    if (['calibDebug', 'tetraDebug', 'dirLiftDebug', 'heartbeatDebug'].includes(key)) {
+    if (['calibDebug', 'tetraDebug', 'dirLiftDebug', 'heartbeatDebug', 'gpuContextDebug'].includes(key)) {
       if (value === 'true' || value === true) return true;
       if (value === 'false' || value === false) return false;
       return DEFAULTS[key];
@@ -725,7 +952,7 @@ function _coerceOrWarn(key, value) {
     // ✅ NEW: Artifact persistence flags (boolean)
     // ============================================================================
     if (['persistIntermediates', 'persistDebugArtifacts', 'MOTION_UNPIN_ON_CLAIM',
-         'persistInlineArtifacts'].includes(key)) {
+         'persistInlineArtifacts', 'enableLegacyFluxManifest'].includes(key)) {
       if (value === 'true' || value === true) return true;
       if (value === 'false' || value === false) return false;
       return DEFAULTS[key];
@@ -998,6 +1225,12 @@ function _coerceOrWarn(key, value) {
       return DEFAULTS.ambiDebug;
     }
 
+    if (key === 'strictInlineOnlyWorkers') {
+      if (value === 'true'  || value === true)  return true;
+      if (value === 'false' || value === false) return false;
+      return DEFAULTS.strictInlineOnlyWorkers;
+    }
+
     if ([
       'topoLambda',
       'topoGradWeightDir',
@@ -1159,6 +1392,15 @@ function _coerceOrWarn(key, value) {
       const n = Number(value);
       if (Number.isFinite(n)) return clamp(n, 0.0, 1.0);
       return DEFAULTS.hfhHeavyPathThreshold;
+    }
+
+    if (key === 'storageEvictorAuthority') {
+      if (typeof value === 'string') {
+        const v = value.toLowerCase();
+        if (v === 'main' || v === 'none') return v;
+      }
+      console.warn(`[featureFlags] invalid storageEvictorAuthority "${value}", falling back to "${DEFAULTS.storageEvictorAuthority}"`);
+      return DEFAULTS.storageEvictorAuthority;
     }
 
     // overhangPolicyMode: allowed values 'off' | 'annotate' | 'constraints'

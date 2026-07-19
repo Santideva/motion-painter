@@ -129,6 +129,16 @@ const DEFAULT_CONFIG = {
      *  the fallback selects exactly this fraction of pixels by gradient magnitude rank. */
     fallbackSurfaceFrac: 0.005,
 
+    /** Morphological closing radius (px) applied to the zero-level-set candidate
+     *  mask before the EDT — bridges small gaps left by per-pixel-independent
+     *  thresholding on an otherwise-continuous edge. 0 disables. */
+    surfaceMaskCloseRadiusPx: 1,
+
+    /** Minimum connected-component size (px, 8-connectivity) retained in the
+     *  zero-level-set candidate mask after closing — removes isolated noise
+     *  speckle that closing alone doesn't merge into anything real. 0 disables. */
+    surfaceMaskMinComponentPx: 4,
+
     /** Smooth fall-off exponent for the float narrow band mask
      *  (1 = linear, 2 = quadratic attenuation toward band edge). */
     bandFalloffExp: 2.0,
@@ -316,8 +326,6 @@ export class PackingSDF {
         const variance = new Float32Array(n);
         const depthScale = GPT_SQRT12; // Amplify depth axis relative to pixel-plane
 
-        let maxVar = 0;
-
         for (let y = 0; y < height - 1; y++) {
             for (let x = 0; x < width - 1; x++) {
                 const i = y * width + x;
@@ -339,16 +347,151 @@ export class PackingSDF {
                                (3 * (mean * mean + eps));
 
                 variance[i] = varVal;
-                if (varVal > maxVar) maxVar = varVal;
             }
         }
 
-        // Normalise to [0,1] for gating
-        if (maxVar > 0) {
-            for (let i = 0; i < n; i++) variance[i] /= maxVar;
+        // Normalise by the 95th percentile rather than the true max. A single
+        // outlier pixel (sensor artifact, silhouette edge against far
+        // background) doesn't need to be huge in absolute terms — it just
+        // needs to be several times larger than the "normal" edge variance
+        // elsewhere in the frame to dominate maxVar. Dividing by that one
+        // pixel then pushes every genuine edge below scaleneVarianceGate
+        // (0.25), silently defeating the primary detector on any scene with
+        // a wide dynamic range of edge strengths — i.e. most scenes. A high
+        // percentile is a far more stable reference: the top ~5% of pixels
+        // simply saturate to 1.0 (harmless — they clearly pass the gate)
+        // without letting one extreme value collapse everything else.
+        const p95 = this._percentile(variance, n, 0.95);
+        if (p95 > 0) {
+            for (let i = 0; i < n; i++) {
+                variance[i] = Math.min(1.0, variance[i] / p95);
+            }
         }
 
         return variance;
+    }
+
+    /**
+     * Shared histogram builder for the two percentile-style helpers below.
+     * Both _percentile (bottom-up) and _topPercentileThreshold (top-down,
+     * used by _detectZeroLevelSet's fallback) need the same min/max scan and
+     * bin-fill pass — this factors that out so the only difference between
+     * the two call sites is which direction they walk the histogram and
+     * whether zero-valued entries are excluded from binning.
+     *
+     * @param {Float32Array} arr
+     * @param {number} n — length to scan (may exceed the number of pixels
+     *   actually considered, when positiveOnly filters some out)
+     * @param {boolean} positiveOnly — if true, only arr[i] > 0 contributes to
+     *   min/max/binning (matches the fallback's exclusion of non-edge pixels)
+     * @param {number} bins
+     * @returns {{ mn: number, mx: number, range: number, hist: Int32Array, consideredCount: number } | null}
+     *   null if no values were considered (degenerate input)
+     */
+    _buildPercentileHistogram(arr, n, positiveOnly, bins = 1000) {
+        let mn = Infinity, mx = -Infinity, consideredCount = 0;
+        for (let i = 0; i < n; i++) {
+            const v = arr[i];
+            if (positiveOnly && !(v > 0)) continue;
+            if (v < mn) mn = v;
+            if (v > mx) mx = v;
+            consideredCount++;
+        }
+        if (consideredCount === 0) return null;
+
+        const range = Math.max(mx - mn, 1e-8);
+        const hist = new Int32Array(bins);
+        for (let i = 0; i < n; i++) {
+            const v = arr[i];
+            if (positiveOnly && !(v > 0)) continue;
+            const b = Math.min(bins - 1, ((v - mn) / range * bins) | 0);
+            hist[b]++;
+        }
+        return { mn, mx, range, hist, consideredCount };
+    }
+
+    /**
+     * Bottom-up percentile: the value below which `pct` of entries fall.
+     * Used by _computeScaleneVariance for the p95 gate normalisation.
+     *
+     * @param {Float32Array} arr
+     * @param {number} count
+     * @param {number} pct — fraction in [0,1], e.g. 0.95 for the 95th percentile
+     * @returns {number}
+     */
+    _percentile(arr, count, pct) {
+        const h = this._buildPercentileHistogram(arr, count, false);
+        if (!h) return 0;
+        if (h.mx === h.mn) return Math.max(h.mx, 1e-6);
+
+        const target = h.consideredCount * pct;
+        let cum = 0;
+        for (let b = 0; b < h.hist.length; b++) {
+            cum += h.hist[b];
+            if (cum >= target) return h.mn + (b + 1) / h.hist.length * h.range;
+        }
+        return h.mx;
+    }
+
+    /**
+     * Top-down threshold: the value above which approximately `targetFrac` of
+     * the population falls. Used by _detectZeroLevelSet's fallback, where the
+     * population denominator is the FULL pixel count (n) even though only
+     * nonzero gradient values are considered for binning.
+     *
+     * TWO-SIDED FORMULATION (mirrors this file's posEDT/negEDT signed-distance
+     * pattern): targetFrac and cutTarget = 1 - targetFrac describe the same
+     * level from opposite sides — the "above threshold" mass and the "at or
+     * below threshold" mass, which must sum to the full population by
+     * construction. Values excluded from binning by positiveOnly (e.g.
+     * zero-gradient pixels) are unconditionally on the "below" side — they
+     * can never be selected as an edge pixel regardless of threshold — so
+     * walking bottom-up and seeding the cumulative count with those excluded
+     * entries up front means the "below" mass can always legitimately reach
+     * the full population. That guarantees cutTarget (≤ population, since
+     * targetFrac ∈ [0,1]) is always reachable.
+     *
+     * The previous implementation walked top-down using only targetFrac
+     * against the full population, but the reachable cumulative count from
+     * that direction was bounded by consideredCount (the nonzero-valued
+     * entries only) — on a scene flat enough that consideredCount fell short
+     * of population * targetFrac, the loop silently ran out of bins and fell
+     * through to h.mx, selecting only the single highest-gradient pixel(s)
+     * instead of the intended ~targetFrac share of the image. Walking from
+     * the always-well-defined "below" side removes that failure mode
+     * entirely rather than relying on the scene not being too flat.
+     *
+     * @param {Float32Array} arr
+     * @param {number} n — array length to scan
+     * @param {number} targetFrac
+     * @param {boolean} positiveOnly
+     * @param {number} [populationSize] — denominator for targetFrac/cutTarget,
+     *   if different from the count of values actually considered (defaults
+     *   to consideredCount)
+     * @returns {number}
+     */
+    _topPercentileThreshold(arr, n, targetFrac, positiveOnly, populationSize = null) {
+        const h = this._buildPercentileHistogram(arr, n, positiveOnly);
+        if (!h) return 0;
+        if (h.mx === h.mn) return Math.max(h.mx, 1e-6);
+
+        const population    = populationSize != null ? populationSize : h.consideredCount;
+        const excludedCount = Math.max(0, population - h.consideredCount);
+        const cutTarget      = population * (1 - targetFrac);
+
+        // Seed with the mass that is unconditionally "below" any positive
+        // threshold (entries excluded from binning by positiveOnly), then
+        // walk bins from lowest to highest until the below-or-at-threshold
+        // mass reaches cutTarget. The bin at which that happens is the level
+        // separating the bottom (1 - targetFrac) share from the top
+        // targetFrac share — i.e. the same threshold the old top-down walk
+        // was after, but reached from the side that's always well-defined.
+        let cum = excludedCount;
+        for (let b = 0; b < h.hist.length; b++) {
+            cum += h.hist[b];
+            if (cum >= cutTarget) return h.mn + (b + 1) / h.hist.length * h.range;
+        }
+        return h.mx;
     }
 
     // =========================================================================
@@ -407,6 +550,12 @@ export class PackingSDF {
         let edgeCount = 0;
         for (let i = 0; i < n; i++) edgeCount += mask[i];
 
+        console.log(
+            `[PackingSDF] _detectZeroLevelSet primary pass: ${edgeCount}/${n} pixels ` +
+            `(${(100 * edgeCount / n).toFixed(3)}%) — ` +
+            `${edgeCount < n * 0.0005 ? 'FALLBACK will fire' : 'primary detector retained'}`
+        );
+
         if (edgeCount < n * 0.0005) {
             // Smooth-depth scene — primary detector found essentially nothing.
             // Select exactly fallbackSurfaceFrac of pixels by gradient magnitude rank
@@ -430,31 +579,10 @@ export class PackingSDF {
                 }
             }
 
-            // Histogram-based percentile threshold (avoids O(n log n) sort)
-            const nBins = 1000;
-            let gMin = Infinity, gMax = -Infinity;
-            for (let i = 0; i < n; i++) {
-                if (grads[i] > 0) {
-                    if (grads[i] < gMin) gMin = grads[i];
-                    if (grads[i] > gMax) gMax = grads[i];
-                }
-            }
-            const hist = new Int32Array(nBins);
-            const gRange = Math.max(gMax - gMin, 1e-8);
-            for (let i = 0; i < n; i++) {
-                if (grads[i] > 0)
-                    hist[Math.min(nBins - 1, ((grads[i] - gMin) / gRange * nBins) | 0)]++;
-            }
-            // Walk histogram from top to find the (1-targetFrac) cumulative threshold
-            const cutTarget = n * (1 - targetFrac);
-            let cum = 0, gradThresh = gMax;
-            for (let b = nBins - 1; b >= 0; b--) {
-                cum += hist[b];
-                if (cum >= n * targetFrac) {
-                    gradThresh = gMin + b / nBins * gRange;
-                    break;
-                }
-            }
+            // Top-X% threshold relative to the full pixel population (n),
+            // over the nonzero-gradient subset only — now delegates to the
+            // shared helper above instead of duplicating the histogram logic.
+            const gradThresh = this._topPercentileThreshold(grads, n, targetFrac, true, n);
 
             // Apply threshold
             for (let i = 0; i < n; i++) {
@@ -468,7 +596,157 @@ export class PackingSDF {
             );
         }
 
+        console.log(
+            `[PackingSDF] _detectZeroLevelSet final mask (pre-cleanup): ` +
+            `${this._countMaskPixels(mask)}/${n} pixels, source=${edgeCount < n * 0.0005 ? 'fallback' : 'primary'}`
+        );
+
+        // ── Connectivity cleanup ────────────────────────────────────────────
+        // Even when the primary detector fires correctly (no fallback warning
+        // above), per-pixel independent thresholding produces a SPECKLED mask,
+        // not a coherent curve — two adjacent true-edge pixels can pass/fail
+        // independently based on local noise in maxDiff/scaleneVariance. This
+        // speckle propagates unchanged through the EDT into signedSdf's
+        // zero-crossing structure, and from there into PixelGraph's component
+        // count — confirmed via [topology.worker] logs showing 350 disconnected
+        // components in a single reconstruction's narrow band, which cannot be
+        // fixed by tuning band WIDTH (bandBase/bandScale) since that only
+        // controls how far from the (already-jagged) zero-crossing the band
+        // extends, not the zero-crossing's shape.
+        //
+        // Standard remedy (same idea as Canny's post-threshold cleanup):
+        //   1. Morphological closing (dilate then erode) — bridges small gaps
+        //      left by pixels that failed the per-pixel gate by chance despite
+        //      being on a real, otherwise-continuous edge.
+        //   2. Remove connected components below minComponentSize — isolated
+        //      noise speckle that closing alone won't merge into anything real.
+        this._cleanupSurfaceMaskConnectivity(mask, width, height);
+
         return mask;
+    }
+
+    /**
+     * In-place connectivity cleanup for the zero-level-set candidate mask.
+     * Closes small gaps (dilate radius closeRadiusPx, then erode by the same
+     * radius) and removes connected components smaller than minComponentSize.
+     * Operates on the SAME Uint8Array convention _detectZeroLevelSet already
+     * uses (1 = candidate edge pixel), so downstream EDT/signedSdf code is
+     * unaffected — this only changes which pixels are 1 vs 0 going in.
+     */
+    _cleanupSurfaceMaskConnectivity(mask, width, height) {
+        const closeRadiusPx    = this._cfg.surfaceMaskCloseRadiusPx    ?? 1;
+        const minComponentSize = this._cfg.surfaceMaskMinComponentPx  ?? 4;
+
+        // Unconditional (not gated behind enableDebug) — this is exactly the
+        // instrumentation needed to confirm whether this cleanup pass is
+        // actually running and what it's doing, without depending on flag
+        // propagation timing (which has separately been a source of confusion
+        // for fMapDebug — see motion.worker's Route A hybrid audit).
+        const beforePixels     = this._countMaskPixels(mask);
+        const beforeComponents = this._countComponents(mask, width, height);
+
+        if (closeRadiusPx > 0) {
+            const dilated = this.dilateNarrowBand(mask, width, height, closeRadiusPx);
+            const closed  = this.erodeNarrowBand(dilated, width, height, closeRadiusPx);
+            mask.set(closed);
+        }
+
+        const afterClosePixels     = this._countMaskPixels(mask);
+        const afterCloseComponents = this._countComponents(mask, width, height);
+
+        let afterPrunePixels     = afterClosePixels;
+        let afterPruneComponents = afterCloseComponents;
+
+        if (minComponentSize > 0) {
+            this._pruneSmallComponents(mask, width, height, minComponentSize);
+            afterPrunePixels     = this._countMaskPixels(mask);
+            afterPruneComponents = this._countComponents(mask, width, height);
+        }
+
+        console.log(
+            `[PackingSDF] surfaceMask connectivity cleanup — ` +
+            `pixels: ${beforePixels} → ${afterClosePixels} (closed) → ${afterPrunePixels} (pruned); ` +
+            `components: ${beforeComponents} → ${afterCloseComponents} (closed) → ${afterPruneComponents} (pruned) ` +
+            `[closeRadiusPx=${closeRadiusPx}, minComponentSize=${minComponentSize}]`
+        );
+    }
+
+    /**
+     * Label connected components (8-connectivity) in a binary mask.
+     * Shared by _pruneSmallComponents and the diagnostic counts above so both
+     * use identical connectivity logic and neither silently drifts from the
+     * other. Flood-fill via explicit stack — avoids recursion depth issues on
+     * large connected regions.
+     *
+     * @returns {{ labels: Int32Array, count: number, sizes: number[] }}
+     *   labels[i] = component id of pixel i, or -1 if not in the mask.
+     *   sizes[c]  = pixel count of component c.
+     */
+    _labelComponents(mask, width, height) {
+        const n = width * height;
+        const labels = new Int32Array(n).fill(-1);
+        const stack = new Int32Array(n);
+        const sizes = [];
+        let nextLabel = 0;
+
+        for (let start = 0; start < n; start++) {
+            if (!mask[start] || labels[start] >= 0) continue;
+
+            let sp = 0;
+            stack[sp++] = start;
+            labels[start] = nextLabel;
+            let size = 1;
+
+            while (sp > 0) {
+                const px = stack[--sp];
+                const x = px % width, y = (px / width) | 0;
+                for (let dy = -1; dy <= 1; dy++) {
+                    for (let dx = -1; dx <= 1; dx++) {
+                        if (dx === 0 && dy === 0) continue;
+                        const nx = x + dx, ny = y + dy;
+                        if (nx < 0 || nx >= width || ny < 0 || ny >= height) continue;
+                        const npx = ny * width + nx;
+                        if (mask[npx] && labels[npx] < 0) {
+                            labels[npx] = nextLabel;
+                            stack[sp++] = npx;
+                            size++;
+                        }
+                    }
+                }
+            }
+
+            sizes.push(size);
+            nextLabel++;
+        }
+
+        return { labels, count: nextLabel, sizes };
+    }
+
+    /** Total nonzero pixel count in a binary mask. */
+    _countMaskPixels(mask) {
+        let count = 0;
+        for (let i = 0; i < mask.length; i++) if (mask[i]) count++;
+        return count;
+    }
+
+    /** Connected-component count (8-connectivity) in a binary mask. */
+    _countComponents(mask, width, height) {
+        return this._labelComponents(mask, width, height).count;
+    }
+
+    /**
+     * Removes connected components (8-connectivity) smaller than minSize from
+     * a binary Uint8Array mask, in place. Uses the shared _labelComponents
+     * pass rather than its own separate flood-fill, so this and the
+     * before/after diagnostic counts in _cleanupSurfaceMaskConnectivity can
+     * never disagree about what "a component" means.
+     */
+    _pruneSmallComponents(mask, width, height, minSize) {
+        const { labels, count, sizes } = this._labelComponents(mask, width, height);
+        for (let i = 0; i < mask.length; i++) {
+            const c = labels[i];
+            if (c >= 0 && sizes[c] < minSize) mask[i] = 0;
+        }
     }
 
     // =========================================================================

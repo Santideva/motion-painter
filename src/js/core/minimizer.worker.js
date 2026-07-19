@@ -163,6 +163,19 @@ function extractSOCs(fluxArt, resolution) {
 // ── Phase B: run solve, persist, broadcast ────────────────────────────────
 async function _runPhaseB(job, topoData) {
   const { jobId, metaKey, module, startMs, sw } = job;
+
+  // Cancel the fallback "waiting for TOPOLOGY_DONE" timer now that Phase B is
+  // actually starting — whether that's because topology arrived normally or
+  // because the timeout itself fired with topoData=null. Without this the
+  // timer keeps counting down after a normal, on-time completion and fires
+  // ~180-210s later with a stale "TOPOLOGY_DONE timeout fired" warning even
+  // though the job finished successfully long before (harmless today only
+  // because _pendingJob is already null by then and the jobMatch guard no-ops).
+  if (job.topoTimeoutHandle) {
+    clearTimeout(job.topoTimeoutHandle);
+    job.topoTimeoutHandle = null;
+  }
+
   const store = _buildStore(sw);
 
   console.log('[minimizer.worker] Phase B starting', {
@@ -364,6 +377,14 @@ if (_bc) {
 async function _loadTopoAndRunPhaseB(topoMsg) {
   const job = _pendingJob;
   if (!job) return;
+
+  // Cancel the fallback timer as soon as we know topology has genuinely
+  // arrived — even before Phase B itself starts (IDB fallback load below can
+  // still take time). Prevents a race where the timer fires mid-load.
+  if (job.topoTimeoutHandle) {
+    clearTimeout(job.topoTimeoutHandle);
+    job.topoTimeoutHandle = null;
+  }
 
   // Fast path: componentMap travels inline — skip IDB entirely.
   let componentMap = topoMsg.topoInline?.componentMap ?? null;
@@ -609,7 +630,10 @@ self.onmessage = async (evt) => {
         // minimizer must wait the full duration before falling back to null topology.
         const timeoutMs = 180_000 * Math.pow(Math.max(_topoRes, 512) / 512, 2) + 30_000;
         console.log(`[minimizer.worker] Waiting up to ${(timeoutMs/1000).toFixed(0)}s for TOPOLOGY_DONE (topoRes=${_topoRes})`);
-        setTimeout(() => {
+        // Handle stored on _pendingJob itself (not a local variable) so
+        // _runPhaseB — reached via the BC/direct-message TOPOLOGY_DONE path,
+        // which has no visibility into this closure — can find and cancel it.
+        _pendingJob.topoTimeoutHandle = setTimeout(() => {
           const jobMatch = _pendingJob?.jobId === jobId;
           console.warn('[minimizer.worker] TOPOLOGY_DONE timeout fired', {
             jobId,

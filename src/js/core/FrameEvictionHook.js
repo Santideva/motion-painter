@@ -456,6 +456,19 @@ export class FrameEvictionHook {
     const frames = this.calibrationBuffer.map(e => e.bitmap);
     const metas = this.calibrationBuffer.map(e => e.meta);
 
+    // Clear capture state BEFORE awaiting the callback.
+    // The callback invokes preprocessor.requestCalibration() which takes 30-120s
+    // for IDB persist under quota pressure. Keeping captureCalibration=true during
+    // that window causes every subsequent eviction (~30fps × 120s = ~3600 calls)
+    // to hit the hard limit and log a warning. frames[] is already a separate
+    // array extracted above — clearing calibrationBuffer here is safe.
+    this.calibrationBuffer = [];
+    this.captureCalibration = false;
+    if (this._calibrationTimer) {
+      clearTimeout(this._calibrationTimer);
+      this._calibrationTimer = null;
+    }
+
     const callbacks = Array.from(this._calibrationCallbacks);
     if (callbacks.length > 1) {
       console.warn('FrameEvictionHook: Multiple calibration callbacks registered. Delivering to first only.');
@@ -471,13 +484,6 @@ export class FrameEvictionHook {
     } catch (err) {
       console.warn('FrameEvictionHook: calibration callback threw', err);
       callbackClaimedOwnership = false;
-    }
-
-    this.calibrationBuffer = [];
-    this.captureCalibration = false;
-    if (this._calibrationTimer) {
-      clearTimeout(this._calibrationTimer);
-      this._calibrationTimer = null;
     }
 
     if (!callbackClaimedOwnership) {

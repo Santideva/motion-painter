@@ -2,6 +2,8 @@
 // Enhanced version with backpressure, improved queue management, calibration support,
 // and HFH / camera-container integration tracking.
 
+import featureFlags from '../../config/featureFlags.js';
+
 export class PreprocessorWorker {
   constructor(workerPath = null) {
     // Only log worker creation, not the verbose "Creating worker..." message
@@ -1193,11 +1195,39 @@ export class PreprocessorWorker {
 
       this.worker.addEventListener('message', handleResponse);
 
-      // Timeout guard
+      // Timeout guard.
+      // Duration sourced from calibrationRequestTimeoutMs (default 180s, raised from
+      // a hardcoded 120s to tolerate transient IDB contention). 16 frames × CALIB
+      // dark/flat classification + blob serialization + 4 × _persistAndPin writes
+      // normally completes in 30-60s; the timeout only matters under contention.
+      let _calibTimeoutMs = 180000;
+      try {
+        _calibTimeoutMs = featureFlags.getFlag('calibrationRequestTimeoutMs') ?? 180000;
+      } catch (e) { /* featureFlags unavailable — use default */ }
+
       timeout = setTimeout(() => {
         this.worker.removeEventListener('message', handleResponse);
+
+        // Without this, a timed-out request left the worker-side computation running
+        // to completion, which still persisted 4 soft-pinned artifacts plus a HARD-pinned
+        // (never auto-expiring) calibration.meta — orphaned because nothing calls
+        // invalidateCalibration() on a request the caller already gave up on.
+        let _abortOnTimeout = true;
+        try {
+          _abortOnTimeout = featureFlags.getFlag('calibrationAbortOnTimeout') ?? true;
+        } catch (e) { /* featureFlags unavailable — default to aborting */ }
+
+        if (_abortOnTimeout) {
+          try {
+            this.worker.postMessage({ op: 'abortCalibration', jobId });
+            console.warn(`PreprocessorWorker: calibration ${jobId} timed out — sent abortCalibration`);
+          } catch (abortErr) {
+            console.warn('PreprocessorWorker: failed to send abortCalibration', abortErr);
+          }
+        }
+
         reject(new Error('Calibration computation timeout'));
-      }, 60000); // 60s - keep same as before
+      }, _calibTimeoutMs);
 
       // Attempt to post frames (transfer)
       try {

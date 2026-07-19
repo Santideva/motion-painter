@@ -21,10 +21,21 @@ export class MotionWorkerWrapper {
     // Default job timeout remains reasonable for smaller jobs like computeFlux
     this.defaultJobTimeoutMs = typeof opts.defaultJobTimeoutMs === 'number' ? opts.defaultJobTimeoutMs : 120000;
 
-    // RECONSTRUCT_META is much heavier: GPU compute + large persistence + visibility waits
+    // RECONSTRUCT_META is much heavier: GPU compute + large persistence + visibility waits.
+    // Under the single-flight queue in motion.worker, a job may also wait a
+    // significant time before it even starts running. reconstructJobTimeoutMs
+    // is now used as a WATCHDOG timeout — it resets on any RECON_QUEUED
+    // heartbeat or 'progress' message for the job, rather than firing once at
+    // a fixed offset from submission. reconstructJobMaxTotalMs is a separate,
+    // non-resettable hard ceiling that still guards against a worker that
+    // keeps sending heartbeats forever without ever actually finishing.
     this.reconstructJobTimeoutMs = typeof opts.reconstructJobTimeoutMs === 'number'
       ? opts.reconstructJobTimeoutMs
-      : 300000; // 5 minutes
+      : 300000; // 5 minutes of silence tolerated before considering the job stuck
+
+    this.reconstructJobMaxTotalMs = typeof opts.reconstructJobMaxTotalMs === 'number'
+      ? opts.reconstructJobMaxTotalMs
+      : 1200000; // 20 minutes absolute cap, regardless of heartbeats
 
     this.config = Object.assign({}, opts);
     this._debug = !!opts.debug;
@@ -252,6 +263,33 @@ export class MotionWorkerWrapper {
       return;
     }
 
+    // Reconstruction queued behind another job in motion.worker's single-flight
+    // queue — proves the worker is alive and still tracking this job even
+    // though it hasn't started running yet. Resets the watchdog so queue wait
+    // time doesn't get mistaken for a stuck job.
+    if (data.event === 'RECON_QUEUED') {
+      if (!data.jobId) return;
+      this._armWatchdog(data.jobId);
+      if (this._debug) {
+        console.log('MotionWorkerWrapper: reconstruction queued', {
+          jobId: data.jobId,
+          metaKey: data.metaKey,
+          queuePosition: data.queuePosition,
+          heartbeat: !!data.heartbeat
+        });
+      }
+      return;
+    }
+
+    // Progress update from an actively-running job — also resets the
+    // watchdog. Long reconstructions legitimately take 60-100s+ per stage;
+    // without this a fixed timeout can't distinguish "still working" from
+    // "stuck".
+    if (data.event === 'progress' && data.jobId) {
+      this._armWatchdog(data.jobId);
+      return;
+    }
+
     // Metrics update
     if (data.op === 'metrics' && data.metrics) {
       try {
@@ -378,12 +416,72 @@ export class MotionWorkerWrapper {
   }
 
   /**
+   * Reset (or initially arm) the per-job watchdog timeout. Called whenever
+   * motion.worker signals it's still alive and tracking this job — via a
+   * queued-status heartbeat or a progress update — so a fixed fire-once
+   * timeout doesn't misfire on a legitimately long-queued or long-running
+   * reconstruction. The separate, non-resettable maxTimeout (see _submitJob)
+   * still guards against a truly stuck/dead worker that never stops sending
+   * heartbeats.
+   * @private
+   */
+  _armWatchdog(jobId) {
+    const entry = this.pending.get(jobId);
+    if (!entry) return;
+    if (entry.timeout) clearTimeout(entry.timeout);
+    entry.timeout = setTimeout(() => this._onWatchdogFired(jobId), entry.heartbeatMs);
+  }
+
+  /**
+   * Watchdog fired — no queued-heartbeat or progress message arrived within
+   * heartbeatMs. Reject as stuck.
+   * @private
+   */
+  _onWatchdogFired(jobId) {
+    const entry = this.pending.get(jobId);
+    if (!entry) return;
+    this.pending.delete(jobId);
+    if (entry.maxTimeout) clearTimeout(entry.maxTimeout);
+    this.metrics.jobsFailed++;
+    const msg = `${entry.kind} watchdog timeout — no activity for ${entry.heartbeatMs}ms`;
+    this.metrics.lastError = msg;
+    try {
+      entry.reject(new Error(msg));
+    } catch (err) {
+      console.warn('MotionWorkerWrapper: reject callback threw', err);
+    }
+  }
+
+  /**
+   * Hard deadline fired — the job has been outstanding for maxTotalMs total,
+   * regardless of how many heartbeats reset the watchdog along the way.
+   * Reject unconditionally; this is the backstop against a worker that keeps
+   * sending heartbeats forever without ever actually finishing.
+   * @private
+   */
+  _onMaxDeadlineFired(jobId) {
+    const entry = this.pending.get(jobId);
+    if (!entry) return;
+    this.pending.delete(jobId);
+    if (entry.timeout) clearTimeout(entry.timeout);
+    this.metrics.jobsFailed++;
+    const msg = `${entry.kind} exceeded max total wait (${entry.maxTotalMs}ms)`;
+    this.metrics.lastError = msg;
+    try {
+      entry.reject(new Error(msg));
+    } catch (err) {
+      console.warn('MotionWorkerWrapper: reject callback threw', err);
+    }
+  }
+
+  /**
    * Reject all pending jobs (called on worker death)
    * @private
    */
   _rejectAllPending(error) {
     for (const [jobId, entry] of this.pending.entries()) {
-      clearTimeout(entry.timeout);
+      if (entry.timeout) clearTimeout(entry.timeout);
+      if (entry.maxTimeout) clearTimeout(entry.maxTimeout);
       try {
         entry.reject(error);
       } catch (err) {
@@ -411,6 +509,7 @@ export class MotionWorkerWrapper {
     }
 
     clearTimeout(entry.timeout);
+    if (entry.maxTimeout) clearTimeout(entry.maxTimeout);
     this.pending.delete(jobId);
     this.metrics.jobsSucceeded++;
 
@@ -440,6 +539,7 @@ export class MotionWorkerWrapper {
     }
 
     clearTimeout(entry.timeout);
+    if (entry.maxTimeout) clearTimeout(entry.maxTimeout);
     const kind = entry.kind;
     this.pending.delete(jobId);
     this.metrics.jobsFailed++;
@@ -697,26 +797,37 @@ export class MotionWorkerWrapper {
 
     // Generate unique jobId
     const jobId = `${op}-${Date.now()}-${(this.jobCounter++).toString(36)}`;
-    const jobTimeout = typeof timeoutMs === 'number'
-  ? timeoutMs
-  : this.defaultJobTimeoutMs;
+
+    // heartbeatMs: resettable watchdog — fires only after this long WITHOUT
+    // any RECON_QUEUED or 'progress' message for this job. For RECONSTRUCT_META
+    // this absorbs arbitrary queue-wait time as long as the worker keeps
+    // signaling it's alive. For other ops (computeFlux, etc.) nothing currently
+    // resets it, so it behaves exactly like the old fixed timeout.
+    const heartbeatMs = typeof timeoutMs === 'number'
+      ? timeoutMs
+      : this.defaultJobTimeoutMs;
+
+    // maxTotalMs: hard, non-resettable ceiling. Only meaningfully different
+    // from heartbeatMs for RECONSTRUCT_META, where queueing can legitimately
+    // extend total wait well past a single heartbeat window.
+    const maxTotalMs = op === 'RECONSTRUCT_META'
+      ? this.reconstructJobMaxTotalMs
+      : heartbeatMs;
 
     this.metrics.jobsRequested++;
 
     return new Promise((resolve, reject) => {
-      // Install timeout guard
-      const timeout = setTimeout(() => {
-        this.pending.delete(jobId);
-        this.metrics.jobsFailed++;
-        this.metrics.lastError = `${op} timeout`;
-        reject(new Error(`${op} timeout (${jobTimeout}ms)`));
-      }, jobTimeout);
+      const timeout = setTimeout(() => this._onWatchdogFired(jobId), heartbeatMs);
+      const maxTimeout = setTimeout(() => this._onMaxDeadlineFired(jobId), maxTotalMs);
 
       // Store pending job entry
       this.pending.set(jobId, {
         resolve,
         reject,
         timeout,
+        maxTimeout,
+        heartbeatMs,
+        maxTotalMs,
         kind: op,
         startedAt: performance.now()
       });
@@ -730,6 +841,7 @@ export class MotionWorkerWrapper {
         });
       } catch (err) {
         clearTimeout(timeout);
+        clearTimeout(maxTimeout);
         this.pending.delete(jobId);
         this.metrics.jobsFailed++;
         this.metrics.lastError = `${op} postMessage failed`;

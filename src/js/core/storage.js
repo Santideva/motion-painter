@@ -1,6 +1,13 @@
 // storage.js
 // IndexedDB-backed, flux & calibration support, optimistic-versioning, robust eviction.
 
+// featureFlags provides shared configuration for quota sizing, evictor authority,
+// and critical-pressure eviction overrides. Guarded with try/catch at each call site
+// since storage.js runs in many worker contexts where featureFlags' own
+// localStorage/BroadcastChannel bootstrap falls back to in-memory defaults —
+// fine here, since these are advisory reads, not writes.
+import featureFlags from '../../config/featureFlags.js';
+
 const DB_NAME = 'motionPainterDB';
 const DB_VERSION = 7; // Incremented to add reconStatus store
 const ARTIFACTS_STORE = 'artifacts';
@@ -1340,10 +1347,35 @@ async function getPinRef(key) {
 
 // Initialization
 
-const initStorage = async ({ quota = DEFAULT_QUOTA_BYTES, startEvictor = true } = {}) => {
-  console.log('storage.js: Initializing storage with quota:', quota);
+const initStorage = async ({ quota, startEvictor = true } = {}) => {
+  // Resolve quota from explicit param → shared featureFlags value → hardcoded default.
+  // Previously each call site (main.js: 2GB, preprocessor.worker.js: 500MB) hardcoded
+  // its own value while writing to the SAME underlying IndexedDB totalBytes counter,
+  // guaranteeing a permanent false "CRITICAL quota pressure" once the full pipeline's
+  // legitimate working set exceeded the smallest configured ceiling.
+  let resolvedQuota = quota;
+  if (!Number.isFinite(resolvedQuota)) {
+    try {
+      resolvedQuota = featureFlags.getFlag('storageQuotaBytes') || DEFAULT_QUOTA_BYTES;
+    } catch (e) {
+      resolvedQuota = DEFAULT_QUOTA_BYTES;
+    }
+  }
+
+  // Respect storageEvictorAuthority: only the designated context (default 'main')
+  // runs the periodic evictor loop. Contexts that still pass startEvictor:true are
+  // silently downgraded to avoid uncoordinated evictors racing on shared IDB state.
+  let resolvedStartEvictor = startEvictor;
   try {
-    quotaBytes = quota;
+    const authority = featureFlags.getFlag('storageEvictorAuthority') ?? 'main';
+    if (authority === 'none') resolvedStartEvictor = false;
+  } catch (e) {
+    // featureFlags unavailable — fall back to caller's explicit value
+  }
+
+  console.log('storage.js: Initializing storage with quota:', resolvedQuota, 'startEvictor:', resolvedStartEvictor);
+  try {
+    quotaBytes = resolvedQuota;
     await openDB();
     ensureBroadcast();
 
@@ -1360,12 +1392,12 @@ const initStorage = async ({ quota = DEFAULT_QUOTA_BYTES, startEvictor = true } 
     return new Promise((resolve, reject) => {
       tx.oncomplete = () => {
         console.log('storage.js: Storage initialization completed');
-        if (startEvictor) startEvictorLoop();
+        if (resolvedStartEvictor) startEvictorLoop();
         resolve();
       };
       tx.onerror = () => {
         console.warn('storage.js: Counters init tx failed:', tx.error);
-        if (startEvictor) startEvictorLoop();
+        if (resolvedStartEvictor) startEvictorLoop();
         reject(tx.error);
       };
     });
@@ -1737,9 +1769,20 @@ const putInboundArtifact = async (artifact) => {
       // - NORMAL (<85%):   Skip immediate eviction, rely on periodic (every 10s)
       // - HIGH (85-95%):   Delayed eviction (100ms) - gives consumers time to claim
       // - CRITICAL (>95%): Immediate eviction - prevents quota overflow
+      //
+      // Gated behind storageQuotaCheckOnWrite (default false) — this check
+      // previously ran on EVERY artifact write (3 writes/frame in preprocessor.worker),
+      // opening an extra readonly transaction each time purely to log/decide, which
+      // duplicated the periodic evictor and was the source of the repeated
+      // "NORMAL quota pressure" log spam. Routine maintenance is left to the
+      // periodic evictor loop.
       // ============================================================================
-      
-      (async () => {
+      let _quotaCheckOnWrite = false;
+      try {
+        _quotaCheckOnWrite = !!featureFlags.getFlag('storageQuotaCheckOnWrite');
+      } catch (e) { /* featureFlags unavailable — default false, skip immediate check */ }
+
+      if (_quotaCheckOnWrite) (async () => {
         try {
           // Read current quota utilization (requires new read-only transaction)
           const readTx = db.transaction(['counters'], 'readonly');
@@ -3199,11 +3242,12 @@ const reapStaleRunning = async (maxRuntimeMs = 600000) => {
             : (now - record.startedAt) > maxRuntimeMs;
 
           if (isStale) {
-            // Mark as failed with stale indicator
+            // runtime was never declared in this scope — calculate it here.
+            const _stalledRuntimeMs = now - (record.startedAt || now);
             const updated = {
               ...record,
               state: 'failed',
-              lastError: `Stale job (runtime: ${runtime}ms)`,
+              lastError: `Stale job (runtime: ${_stalledRuntimeMs}ms)`,
               finishedAt: now,
               nextRetryAt: now + 300000 // 5 min backoff
             };
@@ -3421,6 +3465,30 @@ const checkQuotaAndEvict = async () => {
   const toEvict = [];
   let candidateFreed = 0;
 
+  // Critical-pressure override: a live multi-stage pipeline keeps nearly everything
+  // soft-pinned at all times, so eviction previously had no escape valve under
+  // sustained critical pressure — it could only reclaim already-expired pins
+  // (scraps) while re-logging "CRITICAL quota pressure" every cycle. Above
+  // storageCriticalQuotaThreshold, soft-pinned artifacts older than
+  // storageCriticalPinOverrideMs become eligible for forced eviction. HARD pins
+  // (e.g. calibration.meta) are never subject to this override.
+  const utilization = total / quotaBytes;
+  let criticalOverride = false;
+  let overrideAgeMs = 30000;
+  try {
+    const criticalThresh = featureFlags.getFlag('storageCriticalQuotaThreshold') ?? 0.95;
+    overrideAgeMs = featureFlags.getFlag('storageCriticalPinOverrideMs') ?? 30000;
+    criticalOverride = utilization > criticalThresh;
+  } catch (e) {
+    // featureFlags unavailable — no override, preserves prior conservative behavior
+  }
+  if (criticalOverride) {
+    console.warn(
+      `storage: critical-pressure pin override active (utilization=${(utilization * 100).toFixed(1)}%) — ` +
+      `soft pins older than ${(overrideAgeMs / 1000).toFixed(0)}s are now evictable`
+    );
+  }
+
   return new Promise((resolve) => {
     const scanTx = db.transaction([STREAMS_STORE, ARTIFACTS_STORE], 'readonly');
     const streams = scanTx.objectStore(STREAMS_STORE);
@@ -3452,10 +3520,19 @@ const checkQuotaAndEvict = async () => {
           const pinned = art.meta?.pinned || false;
           const promoted = art.meta?.promoted || false;
           const reservedUntil = art.meta?.reservedUntil || 0;
-          
-          if (!pinned && !promoted && (reservedUntil <= now)) {
+
+          // Under critical-pressure override, aged soft-pinned artifacts are also
+          // scan-eligible. The eviction phase still re-checks live pins and pin
+          // TYPE (hard vs soft) before actually deleting anything.
+          const artAgeMs = now - (art.meta?.timestamp || 0);
+          const overrideEligible = criticalOverride && pinned && artAgeMs >= overrideAgeMs;
+
+          if ((!pinned && !promoted && (reservedUntil <= now)) || overrideEligible) {
             const size = art.meta?.sizeBytes || 0;
-            toEvict.push({ key: entry.key, seq: entry.seq, size, artifactExists: true });
+            toEvict.push({
+              key: entry.key, seq: entry.seq, size, artifactExists: true,
+              overrideCandidate: overrideEligible
+            });
             candidateFreed += size;
           }
         }
@@ -3525,16 +3602,26 @@ const checkQuotaAndEvict = async () => {
               
               // Check for any non-expired pins
               const hasLivePins = pins.some(pin => !pin.expiresAt || pin.expiresAt > nowCheck);
+              // Hard pins are NEVER subject to the critical-pressure override —
+              // e.g. calibration.meta must survive regardless of quota pressure.
+              const hasHardPin = pins.some(pin => pin.type === 'hard');
               
               const promoted = art.meta?.promoted;
               const reservedUntil = art.meta?.reservedUntil || 0;
+
+              const overrideAllowsEviction = item.overrideCandidate && hasLivePins && !hasHardPin;
               
               // Skip eviction if any protection exists (small safety margin for reservations - 1000ms)
-              if (hasLivePins || promoted || reservedUntil > (nowLocal + 1000)) {
+              // unless the critical-pressure override explicitly permits overriding a soft pin.
+              if ((hasLivePins && !overrideAllowsEviction) || promoted || reservedUntil > (nowLocal + 1000)) {
                 // Skip eviction - artifact is protected
                 processed++;
                 checkComplete();
                 return;
+              }
+
+              if (overrideAllowsEviction) {
+                console.warn(`storage: critical-pressure override evicting aged soft-pinned artifact ${item.key}`);
               }
 
               // Safe to evict - perform deletion

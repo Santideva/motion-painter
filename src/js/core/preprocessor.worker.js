@@ -2,6 +2,13 @@
 // Module worker that receives ImageBitmap frames from the main thread wrapper,
 // generates thumbnail + quick phash + manifest, writes artifacts to storage, and notifies main thread.
 
+// featureFlags: shared quota sizing / evictor authority so this worker's storage
+// config no longer diverges from main.js's (previously hardcoded 500MB here vs
+// 2GB in main.js against the SAME underlying IndexedDB counters, which guaranteed
+// permanent false "CRITICAL quota pressure" once the full pipeline was running).
+import featureFlags from '/src/config/featureFlags.js';
+import StorageActivityCoordinator from '/src/config/StorageActivityCoordinator.js';
+
 // ============================================================================
 // CRITICAL: Enhanced Error Catching for Debugging
 // ============================================================================
@@ -62,6 +69,58 @@ self.addEventListener('unhandledrejection', (e) => {
 });
 
 console.log('[WORKER] Error handlers installed');
+
+// ── Log filter ───────────────────────────────────────────────────────────
+// Silences the high-frequency per-frame PIN lifecycle noise (claim/schedule/
+// expire/unpin — one triplet per frame at whatever fps the camera runs) so
+// calibration progress and any real warnings/errors are actually readable.
+// Anything mentioning calibration/CALIB/abort, or any console.error, is never
+// suppressed. self.restoreConsole() removes the filter at any time.
+function _installPreprocessorLogFilter() {
+  const _origLog   = console.log.bind(console);
+  const _origWarn  = console.warn.bind(console);
+  const _origDebug = (console.debug || console.log).bind(console);
+
+  self.restoreConsole = () => {
+    console.log = _origLog; console.warn = _origWarn; console.debug = _origDebug;
+    _origLog('[preprocessor.worker] Log filter removed');
+  };
+
+  const ALWAYS_ALLOW = ['CALIB', 'calibration', 'Calibration', 'abort', 'Abort'];
+
+  const LOG_BLOCK = [
+    '[PIN] ✓ Claimed artifact:thumbnail',
+    '[PIN] ✓ Claimed artifact:phash',
+    '[PIN] ✓ Claimed artifact:manifest',
+    '[PIN] ⏱️  Scheduled TTL for artifact:thumbnail',
+    '[PIN] ⏱️  Scheduled TTL for artifact:phash',
+    '[PIN] ⏱️  Scheduled TTL for artifact:manifest',
+    '[PIN] ⏰ TTL expired for artifact:thumbnail',
+    '[PIN] ⏰ TTL expired for artifact:phash',
+    '[PIN] ⏰ TTL expired for artifact:manifest',
+    '[PIN] ✓ Auto-unpinned artifact:thumbnail',
+    '[PIN] ✓ Auto-unpinned artifact:phash',
+    '[PIN] ✓ Auto-unpinned artifact:manifest',
+    '[PIN] 🚫 Cancelled TTL',
+    '[PIN] 🚫 TTL cancelled',
+  ];
+
+  const blocked = (list, args) => {
+    const s = typeof args[0] === 'string' ? args[0] : '';
+    if (ALWAYS_ALLOW.some(p => s.includes(p))) return false;
+    return list.some(p => s.includes(p));
+  };
+
+  console.log   = (...a) => { if (!blocked(LOG_BLOCK, a)) _origLog(...a);   };
+  console.debug = (...a) => { if (!blocked(LOG_BLOCK, a)) _origDebug(...a); };
+  // Warnings are never suppressed here — only routine per-frame logs are noisy;
+  // anything reaching console.warn already indicates something worth seeing.
+  console.warn  = (...a) => { _origWarn(...a); };
+  // console.error is never filtered.
+
+  _origLog('[preprocessor.worker] Log filter active — self.restoreConsole() to remove');
+}
+_installPreprocessorLogFilter();
 
 // ============================================================================
 // Original Worker Code with Enhanced Logging
@@ -163,8 +222,24 @@ let storageReady = false;
 let initializationStarted = false;
 const pendingFrames = [];
 
+// Frames arriving while CALIB.busy is true (a calibration computation is
+// in flight) are queued here instead of persisted immediately, when
+// pauseFrameIngestDuringCalibration is enabled. This prevents ordinary
+// per-frame thumbnail/phash/manifest writes from starving calibration's own
+// sequential IndexedDB writes on the same [artifacts, counters, pins] store
+// set — the root cause of calibration timing out under sustained frame rates
+// even when storage quota itself is healthy. Drained by
+// _drainCalibrationDeferredFrames() once calibration finishes.
+const calibrationDeferredFrames = [];
+
 // track per-job in-flight calibration usage (jobId -> metaKey)
 const inFlightCalibMap = new Map();
+
+// jobIds whose calibration request was abandoned by the caller (timeout).
+// Checked at the end of handleComputeCalibration so an orphaned hard-pinned
+// calibration.meta (no TTL, never auto-evicted) isn't left behind indefinitely
+// if the wrapper already gave up before the worker finished persisting.
+const abortedCalibrationJobs = new Set();
 
 // -- DYNAMIC IMPORT: ensures the worker's top-level logs run even if storage import fails --
 let storageAPI = null;
@@ -219,8 +294,15 @@ console.log('[WORKER] About to start dynamic import IIFE');
     // NOW initialize - storageAPI is available
     if (typeof storageAPI.initStorage === 'function') {
       console.log('[WORKER] calling storageAPI.initStorage...');
-      await storageAPI.initStorage({ quota: 500 * 1024 * 1024, startEvictor: true });
-      console.log('[WORKER] ✓ storageAPI.initStorage completed');
+      // Quota now comes from shared featureFlags rather than a hardcoded 500MB.
+      // startEvictor is always false here: main.js is the sole evictor authority
+      // (see storageEvictorAuthority flag) — this worker never runs a competing loop.
+      let _quota = 2 * 1024 * 1024 * 1024;
+      try {
+        _quota = featureFlags.getFlag('storageQuotaBytes') ?? _quota;
+      } catch (e) { /* featureFlags unavailable — use default shared quota */ }
+      await storageAPI.initStorage({ quota: _quota, startEvictor: false });
+      console.log('[WORKER] ✓ storageAPI.initStorage completed (quota=' + _quota + ')');
       
       // Bind methods to self
       console.log('[WORKER] binding storageAPI methods to self...');
@@ -845,6 +927,15 @@ if (bc) {
         console.log(`[CONFIG] PREPROCESSOR_UNPIN_ON_CLAIM = ${PREPROCESSOR_UNPIN_ON_CLAIM}`);
       }
     }
+    // Drain frames that were deferred purely because a reconstruction was
+    // active (not because CALIB.busy was true) as soon as that clears —
+    // otherwise they'd sit queued until the next unrelated calibration run.
+    if (data.event === 'coordinator:end' && data.kind === 'reconstruction') {
+      if (!CALIB.busy && calibrationDeferredFrames.length > 0) {
+        console.debug('preprocessor.worker: reconstruction cleared — draining deferred frames');
+        _drainCalibrationDeferredFrames();
+      }
+    }
   });
 }
 // ==================== UTILITY: Safe bitmap cloning ====================
@@ -1094,14 +1185,18 @@ const CALIB = {
   },
 
   // Compute calibration from multiple frames
+  //
+  // NOTE: this.busy is now set/cleared entirely by the CALLER
+  // (handleComputeCalibration), spanning the whole calibration attempt —
+  // frame averaging AND the subsequent persisting_artifacts phase. Setting
+  // it only around the averaging step (as this method previously did) let
+  // busy drop back to false before the 5 sequential dark/flat/bias/
+  // calibrated/meta persists even began — exactly the window where ordinary
+  // per-frame writes (thumbnail/phash/manifest, ~30/s) would then compete
+  // with calibration's writes for the same IDB transaction lock, causing
+  // calibration to stall past its timeout.
   async computeCalibration({ frames, framesNeeded = 10, resolution }) {
-    if (this.busy) {
-      throw new Error('Calibration computation already in progress');
-    }
-    
     try {
-      this.busy = true;
-      
       console.log(`CALIB: Computing calibration from ${frames.length}/${framesNeeded} frames`);
       
       if (frames.length < Math.min(3, framesNeeded)) {
@@ -1153,9 +1248,10 @@ const CALIB = {
       });
       
       throw err;
-    } finally {
-      this.busy = false;
     }
+    // busy is cleared by the caller (handleComputeCalibration), not here —
+    // see note above. On the error path, invalidateCalibration() (called
+    // just above) already resets this.busy = false.
   },
   
   // Apply calibration correction to an ImageBitmap
@@ -1329,7 +1425,13 @@ function initializeStorage() {
   console.warn('preprocessor.worker: initializeStorage() shim called — delegating to storageAPI.initStorage (module mode)');
   initializationStarted = true;
 
-  return storageAPI.initStorage({ quota: 500 * 1024 * 1024, startEvictor: true })
+  // Same shared-quota / no-local-evictor rationale as the primary init path above.
+  let _shimQuota = 2 * 1024 * 1024 * 1024;
+  try {
+    _shimQuota = featureFlags.getFlag('storageQuotaBytes') ?? _shimQuota;
+  } catch (e) { /* featureFlags unavailable — use default shared quota */ }
+
+  return storageAPI.initStorage({ quota: _shimQuota, startEvictor: false })
     .then(() => {
       clearTimeout(initTimeout);
       storageReady = true;
@@ -1431,6 +1533,29 @@ async function createThumbnailBlob(imageBitmap, maxSide = DEFAULT_THUMB_MAX_SIDE
     console.error('preprocessor.worker: createThumbnailBlob failed', err);
     throw err;
   }
+}
+
+/**
+ * _drainCalibrationDeferredFrames()
+ *
+ * Called once a calibration computation finishes (success, error, or abort).
+ * Processes every frame that was queued while CALIB.busy was true, in
+ * original arrival order, staggered slightly so the drain itself doesn't
+ * immediately re-create the same contention it was designed to avoid.
+ */
+function _drainCalibrationDeferredFrames() {
+  if (calibrationDeferredFrames.length === 0) return;
+
+  const queued = calibrationDeferredFrames.splice(0, calibrationDeferredFrames.length);
+  console.log(`preprocessor.worker: draining ${queued.length} frame(s) deferred during calibration`);
+
+  queued.forEach((frameMsg, index) => {
+    setTimeout(() => {
+      processFrame(frameMsg).catch(err => {
+        console.warn('preprocessor.worker: deferred frame processing failed', frameMsg.jobId, err);
+      });
+    }, index * 15); // small stagger — avoid re-flooding IDB the instant calibration frees up
+  });
 }
 
 /**
@@ -1754,6 +1879,21 @@ async function processFrame({ jobId, meta = {}, imageBitmap, options = {} }) {
       manifestArtifact.meta.sizeBytes = 0;
     }
 
+    // ── Refresh calibrationKey immediately before manifest persist ──────────
+    // Race condition: processFrame and handleComputeCalibration are both async
+    // and interleave at await points. The manifestArtifact object was built
+    // earlier when CALIB.metaKey may have been false. By the time we reach
+    // this point (after thumb+phash awaits), any interleaved
+    // handleComputeCalibration will have completed and set CALIB.metaKey.
+    // Re-reading here ensures the IDB record and readyData.meta both carry
+    // the correct calibration reference. Without this, motion.worker receives
+    // calibrationKey: undefined and falls back to CPU depth estimation.
+    if (CALIB && CALIB.metaKey) {
+      manifestArtifact.data.calibrationKey     = CALIB.metaKey;
+      manifestArtifact.data.calibrationApplied = CALIB.isCalibrated;
+      manifestArtifact.meta.calibrationKey     = CALIB.metaKey;
+    }
+
 // ============================================================================
     // ✅ CHANGE: Persist + Pin manifest (canonical frame metadata)
     // ============================================================================
@@ -1797,9 +1937,31 @@ async function processFrame({ jobId, meta = {}, imageBitmap, options = {} }) {
         producerVersion,
         hashVersion,
         cameraId: cameraContainer?.cameraId || meta.cameraId || 'unknown',
-        // crucial: forward HFH decision to listeners (motion.worker, MotionDetector)
         hfhDecision: hfhDecision,
-        type: 'frame-manifest'
+        type: 'frame-manifest',
+
+        // ── Annular luminance profile ──────────────────────────────────────
+        // hfhData.annular is the Float32Array from HFH.computeAnnular().
+        // main.js passes this to MotionDetector.handleAnnularEvent which runs
+        // spike detection, exposure-change detection, and the calibration
+        // stable-scene gate. Without it, handleAnnularEvent is never called,
+        // no reconstruction intents are created, and the intent system is
+        // permanently dead.
+        annular:     hfhData.annular ?? null,
+        avgLuma:     (hfhData.annularStats && typeof hfhData.annularStats.mean === 'number')
+                       ? hfhData.annularStats.mean
+                       : (typeof meta.avgLuma === 'number' ? meta.avgLuma : 0),
+        width:       imageBitmap.width,
+        height:      imageBitmap.height,
+        captureTime: meta.captureTime || meta.timestamp || timestamp,
+
+        // ── Calibration key ────────────────────────────────────────────────
+        // Refreshed immediately before manifest persist (Change A2) so this
+        // correctly reflects CALIB.metaKey even when handleComputeCalibration
+        // completed during one of the preceding awaits.
+        // main.js native dispatch reads this to guard against stale manifests
+        // that pre-date calibration completion.
+        calibrationKey: (CALIB && CALIB.metaKey) ? CALIB.metaKey : null
       },
       durationMs,
       processingMode: mode,
@@ -1973,7 +2135,36 @@ async function handleComputeCalibration({ jobId, frames, framesNeeded, resolutio
   let darkBitmapClone = null;
   let flatBitmapClone = null;
   let calibratedBitmap = null;
-  
+
+  // CALIB.busy now spans the ENTIRE calibration attempt (averaging +
+  // persisting_artifacts), not just the averaging step inside
+  // CALIB.computeCalibration(). This is what pauseFrameIngestDuringCalibration
+  // actually checks before deferring incoming camera frames — previously it
+  // was false during the whole persist phase, so frames were never deferred
+  // when it mattered.
+  if (CALIB.busy) {
+    postMessage({ event: 'calibration:error', jobId, error: 'Calibration already in progress', phase: 'busy_guard' });
+    return;
+  }
+  CALIB.busy = true;
+
+  // Cross-worker coordination: motion.worker may already be mid-reconstruction,
+  // running its own long sequence of IDB reads/writes against the same
+  // artifacts/pins/counters stores. Give it a window to finish before starting
+  // our own exclusive IDB campaign on top of it.
+  let _coordActivityId = null;
+  try {
+    const _waitResult = await StorageActivityCoordinator.waitForClear('reconstruction', { timeoutMs: 60000 });
+    if (!_waitResult.cleared) {
+      console.warn(`CALIB: proceeding without reconstruction clearing after ${_waitResult.waitedMs}ms wait — contention possible`);
+    } else if (_waitResult.waitedMs > 0) {
+      console.log(`CALIB: waited ${_waitResult.waitedMs}ms for in-flight reconstruction to clear before starting`);
+    }
+  } catch (e) {
+    console.warn('CALIB: StorageActivityCoordinator.waitForClear failed (non-fatal)', e);
+  }
+  _coordActivityId = StorageActivityCoordinator.begin('calibration', 'preprocessor.worker', { priority: 10 });
+
   try {
     postMessage({ event: 'progress', jobId, stage: 'calibration_start', frameCount: frames.length });
 
@@ -2230,6 +2421,57 @@ async function handleComputeCalibration({ jobId, frames, framesNeeded, resolutio
     
     console.log(`CALIB: Calibration persisted successfully. metaKey=${metaKey}, calibratedFrameKey=${calibratedKey}, childKeys=${CALIB.childKeys.length}`);
 
+    // ── Abort check ──────────────────────────────────────────────────────────
+    if (abortedCalibrationJobs.has(jobId)) {
+      abortedCalibrationJobs.delete(jobId);
+      console.warn(`CALIB: jobId ${jobId} was aborted by caller (timeout) — cleaning up freshly persisted calibration artifacts`);
+      try {
+        const unpinFn = self.unpinArtifact ||
+                       (typeof storageAPI !== 'undefined' && storageAPI.unpinArtifact);
+        if (typeof unpinFn === 'function') {
+          for (const childKey of CALIB.childKeys) {
+            try { await unpinFn(childKey, { owner: 'preprocessor' }); } catch (e) {}
+          }
+          try { await unpinFn(metaKey, { owner: 'preprocessor' }); } catch (e) {}
+        }
+      } catch (cleanupErr) {
+        console.warn('CALIB: abort cleanup failed (non-fatal):', cleanupErr);
+      }
+      CALIB.invalidateCalibration();
+      CALIB.metaKey = null;
+      CALIB.meta = null;
+      CALIB.childKeys = null;
+      postMessage({ event: 'calibration:aborted', jobId, metaKey });
+      return;
+    }
+
+    // ── Abort check ──────────────────────────────────────────────────────────
+    // If the requesting caller (PreprocessorWorker.requestCalibration) already
+    // timed out and gave up on this jobId, don't leave a hard-pinned, never-
+    // auto-expiring calibration.meta plus 4 soft-pinned children orphaned.
+    if (abortedCalibrationJobs.has(jobId)) {
+      abortedCalibrationJobs.delete(jobId);
+      console.warn(`CALIB: jobId ${jobId} was aborted by caller (timeout) — cleaning up freshly persisted calibration artifacts`);
+      try {
+        const unpinFn = self.unpinArtifact ||
+                       (typeof storageAPI !== 'undefined' && storageAPI.unpinArtifact);
+        if (typeof unpinFn === 'function') {
+          for (const childKey of CALIB.childKeys) {
+            try { await unpinFn(childKey, { owner: 'preprocessor' }); } catch (e) {}
+          }
+          try { await unpinFn(metaKey, { owner: 'preprocessor' }); } catch (e) {}
+        }
+      } catch (cleanupErr) {
+        console.warn('CALIB: abort cleanup failed (non-fatal):', cleanupErr);
+      }
+      CALIB.invalidateCalibration();
+      CALIB.metaKey = null;
+      CALIB.meta = null;
+      CALIB.childKeys = null;
+      postMessage({ event: 'calibration:aborted', jobId, metaKey });
+      return;
+    }
+
     // Generate release token
     let releaseToken = null;
     try {
@@ -2297,6 +2539,19 @@ async function handleComputeCalibration({ jobId, frames, framesNeeded, resolutio
     }
     
   } finally {
+    // Calibration attempt is over (success, error, or abort) — clear busy
+    // BEFORE draining, so any newly-arriving frames during/after drain are
+    // no longer deferred.
+    CALIB.busy = false;
+
+    // Release the cross-worker lock — motion.worker (or anything else waiting
+    // on StorageActivityCoordinator.waitForClear('calibration')) is unblocked
+    // immediately, regardless of how this attempt ended.
+    if (_coordActivityId) {
+      try { StorageActivityCoordinator.end(_coordActivityId); } catch (e) { /* ignore */ }
+      _coordActivityId = null;
+    }
+
     // Cleanup: Close all bitmap clones we created
     try {
       if (darkBitmapClone) darkBitmapClone.close();
@@ -2304,6 +2559,15 @@ async function handleComputeCalibration({ jobId, frames, framesNeeded, resolutio
       if (calibratedBitmap) calibratedBitmap.close();
     } catch (cleanupErr) {
       console.warn('Bitmap cleanup error (non-fatal):', cleanupErr);
+    }
+
+    // Always drain deferred frames here — this runs on success, on any thrown
+    // error, and after an abort — so frame ingestion never stays paused longer
+    // than the calibration attempt actually takes.
+    try {
+      _drainCalibrationDeferredFrames();
+    } catch (drainErr) {
+      console.warn('preprocessor.worker: failed to drain calibration-deferred frames', drainErr);
     }
   }
 }
@@ -2354,6 +2618,44 @@ self.onmessage = async (ev) => {
         console.debug('preprocessor.worker: storage not ready, queuing frame', jobId);
         return;
       }
+
+      // Defer ordinary frame persistence while a calibration computation is
+      // in flight, so calibration's own sequential IndexedDB writes aren't
+      // starved by the continuous stream of per-frame thumbnail/phash/manifest
+      // transactions on the same object stores. ALSO defer while a
+      // reconstruction job is active in motion.worker — confirmed via
+      // telemetry that a single calib:calibrated blob read there took ~50s
+      // with the evictor/reaper both already paused, meaning the remaining
+      // competing writes were ordinary steady-state frame ingestion here
+      // (~90 write transactions/sec at 30fps), which StorageActivityCoordinator
+      // was not previously asked to account for.
+      let _pauseForCalib = true;
+      try {
+        _pauseForCalib = featureFlags.getFlag('pauseFrameIngestDuringCalibration') ?? true;
+      } catch (e) { /* featureFlags unavailable — default to pausing (safer) */ }
+
+      const _reconstructionActive = StorageActivityCoordinator.isActive('reconstruction');
+      const _shouldDefer = (_pauseForCalib && CALIB.busy) || _reconstructionActive;
+
+      if (_shouldDefer) {
+        let _maxQueue = 60;
+        try {
+          _maxQueue = featureFlags.getFlag('calibrationDeferredFrameQueueMaxSize') ?? 60;
+        } catch (e) { /* use default */ }
+
+        if (calibrationDeferredFrames.length >= _maxQueue) {
+          const victim = calibrationDeferredFrames.shift();
+          try { victim.imageBitmap.close(); } catch (e) {}
+          console.warn('preprocessor.worker: deferred frame queue full — dropped oldest frame', victim.jobId);
+        }
+
+        calibrationDeferredFrames.push({ jobId, meta, imageBitmap, options });
+        console.debug(
+          `preprocessor.worker: deferring frame ${jobId} ` +
+          `(calibBusy=${CALIB.busy}, reconstructionActive=${_reconstructionActive})`
+        );
+        return;
+      }
       
       await processFrame({ jobId, meta, imageBitmap, options });
       
@@ -2368,6 +2670,17 @@ self.onmessage = async (ev) => {
     } else if (msg.op === 'computeCalibration') {
       const { jobId, frames, framesNeeded, resolution } = msg;
       await handleComputeCalibration({ jobId, frames, framesNeeded, resolution });
+      
+    } else if (msg.op === 'abortCalibration') {
+      // Best-effort abort: the in-flight computeCalibration async function cannot
+      // be forcibly interrupted, but recording the jobId here means that when it
+      // does finish, handleComputeCalibration immediately unpins/invalidates
+      // whatever it just persisted instead of leaving it orphaned.
+      const { jobId: abortJobId } = msg;
+      if (abortJobId) {
+        abortedCalibrationJobs.add(abortJobId);
+        console.warn(`preprocessor.worker: marked jobId ${abortJobId} as aborted`);
+      }
       
     } else if (msg.op === 'fetchCalibration') {
       try {

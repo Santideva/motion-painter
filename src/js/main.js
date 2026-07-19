@@ -30,6 +30,7 @@ import ArtifactPanel    from './ui/ArtifactPanel.js';
 
 // Import storage API (main may still use storageAPI for other needs)
 import storageAPI from './core/storage.js';
+import StorageActivityCoordinator from '/src/config/StorageActivityCoordinator.js';
 
 class MotionPainter {
   constructor() {
@@ -65,8 +66,36 @@ class MotionPainter {
     this._bc = null;
 
     // Artifact visualization system
-    this.artifactRenderer = null;  // GPU texture registry + visualization shaders
-    this.artifactPanel    = null;  // Floating "Scene Analysis" toggle panel
+    this.artifactRenderer = null;
+    this.artifactPanel    = null;
+
+    // ── Native continuous pipeline state ─────────────────────────────────
+    // These mirror what the test script manages manually via forcePipelineStart
+    // and forceDirectReconstruction. The native path automates the same logic
+    // that runs on every camera session without console intervention.
+    //
+    // _nativeCalibComplete:       set true when calibration:ready BC fires.
+    //   Before this, reconstruction cannot be dispatched (motion.worker has no
+    //   calibration data and would fail with calibratedFrameKey missing).
+    //
+    // _nativeReconInFlight:       prevents concurrent dispatches. One job at a
+    //   time. Cleared in .then() or .catch() of requestReconstructionByMeta.
+    //
+    // _nativeLastReconAt:         timestamp of last dispatch. Cooldown of 15s
+    //   prevents flooding motion.worker with jobs while one is still running.
+    //
+    // _lastCalibrationCompletedAt + _calibrationLockoutMs:
+    //   Post-calibration lockout. MotionDetector emits flat_field_degradation
+    //   immediately after calibration:ready fires because the fresh calibration
+    //   statistics differ from what was seen during capture. Without a lockout,
+    //   a second calibration starts before the first reconstruction completes.
+    //   90s is sufficient for one full reconstruction cycle (30-60s) plus buffer.
+    this._nativeCalibComplete        = false;
+    this._nativeReconInFlight        = false;
+    this._nativeLastReconAt          = 0;
+    this._nativeReconCooldownMs      = 15000;
+    this._lastCalibrationCompletedAt = 0;
+    this._calibrationLockoutMs       = 90000;
 
     // IMPORTANT: main no longer keeps calibration artifacts or bias arrays.
     // The canonical persisted metaKey and tokens are owned/pinned by the preprocessor.worker.
@@ -75,6 +104,21 @@ class MotionPainter {
     // Track unsubscribers for MotionDetector listeners so we can clean them up on destroy()
     this._motionDetectorUnsubs = [];
 
+    // Guards the periodic stale-job reaper (see init()) so it doesn't compete
+    // with calibration's own sequential IndexedDB writes for the same
+    // [artifacts, counters, pins] lock scope. This is a SEPARATE setInterval
+    // from the main evictor loop (storageAPI.stopEvictorLoop/startEvictorLoop).
+    // Now driven generically by StorageActivityCoordinator (see init()) rather
+    // than being set/cleared by hand inside _handleCalibrationRequest.
+    this._pauseReaper = false;
+
+    // Kinds of StorageActivityCoordinator activity that should pause the
+    // evictor/reaper while active. Add new kinds here as new exclusive IDB
+    // campaigns are introduced — no other changes to main.js are needed.
+    this._coordPauseKinds = ['calibration', 'reconstruction'];
+    this._evictorPausedByCoord = false;
+    this._coordCheckInterval = null;
+
     this.isRendering = false;
     this.isPaused = false;
     this.animationId = null;
@@ -82,6 +126,9 @@ class MotionPainter {
   }
   
   async init() {
+    // Silence high-frequency renderer/storage noise before anything else runs.
+    this._installLogFilter();
+
     try {
       // Get DOM elements
       this.canvas = document.getElementById('glcanvas');
@@ -242,13 +289,15 @@ class MotionPainter {
       // STORAGE INITIALIZATION & REAPER
       // ========================================================================
       try {
-        await storageAPI.initStorage({ 
-        quota: 2 * 1024 * 1024 * 1024,  // 2GB
-        startEvictor: true 
-      });
+        await storageAPI.initStorage({
+          quota: featureFlags.getFlag('storageQuotaBytes') ?? (2 * 1024 * 1024 * 1024),
+          // main.js is the designated evictor authority (see storageEvictorAuthority flag).
+          startEvictor: (featureFlags.getFlag('storageEvictorAuthority') ?? 'main') !== 'none'
+        });
         
         // Start periodic reaper for stale reconstruction jobs
         this._reaperInterval = setInterval(async () => {
+          if (this._pauseReaper) return;   // paused during calibration's persist phase — see _handleCalibrationRequest
           try {
             const reaped = await storageAPI.reapStaleRunning(10 * 60 * 1000); // 10 min timeout
             
@@ -265,6 +314,43 @@ class MotionPainter {
         }, 60000); // Every 60 seconds
         
         console.log('Storage initialized with periodic reaper (60s interval)');
+
+        // ── reconStatus cleanup ──────────────────────────────────────────────
+        // storageAPI.clearOldReconStatus() existed but was never invoked anywhere,
+        // so done/failed reconStatus records accumulated in IndexedDB indefinitely
+        // (observed: a 7-day-old stale record cleaned up only incidentally by the
+        // reaper above on next page load). Purges records older than reconStatusMaxAgeMs
+        // every reconStatusCleanupIntervalMs.
+        const _reconCleanupIntervalMs = featureFlags.getFlag('reconStatusCleanupIntervalMs') ?? 3600000;
+        const _reconMaxAgeMs = featureFlags.getFlag('reconStatusMaxAgeMs') ?? 604800000;
+        this._reconStatusCleanupInterval = setInterval(async () => {
+          try {
+            const deleted = await storageAPI.clearOldReconStatus(_reconMaxAgeMs);
+            if (deleted > 0) {
+              console.log(`reconStatus cleanup: purged ${deleted} old record(s)`);
+            }
+          } catch (cleanupErr) {
+            console.warn('reconStatus cleanup failed:', cleanupErr);
+          }
+        }, _reconCleanupIntervalMs);
+
+        // ── Generic evictor/reaper pause driven by StorageActivityCoordinator ──
+        // Replaces the earlier calibration-only stopEvictorLoop()/startEvictorLoop()
+        // calls that lived directly inside _handleCalibrationRequest. main.js no
+        // longer needs to know which specific worker is doing what — it just asks
+        // the coordinator whether any registered exclusive activity is in flight.
+        this._coordCheckInterval = setInterval(() => {
+          const anyActive = this._coordPauseKinds.some(k => StorageActivityCoordinator.isActive(k));
+          if (anyActive && !this._evictorPausedByCoord) {
+            try { storageAPI.stopEvictorLoop(); } catch (e) {}
+            this._pauseReaper = true;
+            this._evictorPausedByCoord = true;
+          } else if (!anyActive && this._evictorPausedByCoord) {
+            try { storageAPI.startEvictorLoop(); } catch (e) {}
+            this._pauseReaper = false;
+            this._evictorPausedByCoord = false;
+          }
+        }, 1000);
       } catch (storageErr) {
         console.error('Storage initialization failed:', storageErr);
         // Non-fatal - continue without reaper
@@ -581,6 +667,39 @@ class MotionPainter {
           }
         } else {
           console.log('[cameraContainer] main.js: evictionHook not yet initialized (will propagate on init)');
+        }
+
+        // ── Arm motionWorker early ───────────────────────────────────────────
+        // The wrapper takes ~4s to start (ES module worker + storage init).
+        // Starting here, rather than waiting for calibrationNeeded, ensures the
+        // worker is ready and listening to BC by the time calibration frames
+        // have been collected and the calibration:ready event fires.
+        if (!this._heavyPathRequested) {
+          this._heavyPathRequested = true;
+          try {
+            this._ensureMotionWorker();
+            console.log('[cameraContainer] main.js: heavy path armed — motionWorker bootstrap initiated');
+          } catch (e) {
+            console.warn('[cameraContainer] main.js: _ensureMotionWorker failed (non-fatal):', e);
+          }
+        }
+
+        // ── Open calibration stable-scene gate ──────────────────────────────
+        // MotionDetector._calibrationStale starts as an empty Map.
+        // _isCalibrationStale(cameraId) returns false for any new cameraId,
+        // which means the stable-scene condition in handleAnnularEvent never
+        // emits calibrationNeeded regardless of how stable the scene is.
+        // Calling _markCalibrationStale here opens that gate.
+        // The gate closes again when notifyCalibrationComplete is called from
+        // the calibration:ready BC handler, allowing the cycle to repeat.
+        if (this.motionDetector && cameraId) {
+          try {
+            this.motionDetector._markCalibrationStale(cameraId, 'camera_start');
+            console.log('[cameraContainer] main.js: calibration marked stale for', cameraId,
+                        '— stable-scene gate now open');
+          } catch (e) {
+            console.warn('[cameraContainer] main.js: _markCalibrationStale failed (non-fatal):', e);
+          }
         }
       };
       
@@ -1070,19 +1189,180 @@ class MotionPainter {
               console.warn('[Stage4] main.js: failed to release sdfInline/normalInline from cameraContainer', e);
             }
           }
-          // ── artifact:ready → MotionDetector dispatch wiring ───────────────────
-          // REQUIRED: forwards preprocessor manifest completion to MotionDetector
-          // so intents get their metaKey and reconstruction is dispatched.
+          // ── calibration:ready → close the calibration loop ──────────────────
+          // This is the event the preprocessor WORKER broadcasts when it has
+          // finished computing and persisting all calibration artifacts to IDB.
+          // (Different from the postMessage 'calibration:ready' that the wrapper
+          // uses internally — this is the BC broadcast, which main.js sees.)
+          //
+          // Three things must happen here:
+          // 1. notifyCalibrationComplete clears _calibrationPending so the
+          //    stable-scene gate can open again on the next cycle.
+          // 2. _nativeCalibComplete gates the native dispatch fallback.
+          // 3. _lastCalibrationCompletedAt starts the 90s lockout that prevents
+          //    flat_field_degradation from immediately triggering a second
+          //    calibration before the first reconstruction has completed.
+          if (msg && msg.event === 'calibration:ready') {
+            const _calCameraId = this.cameraContainer?.cameraId ?? null;
+            console.log('[calibration:ready] main.js:', {
+              key:      msg.metaKey || msg.key || null,
+              cameraId: _calCameraId
+            });
+
+            // Late-arm failsafe: ensure motionWorker exists even if camera-start
+            // arming (Change B) was somehow skipped.
+            if (!this._heavyPathRequested) {
+              this._heavyPathRequested = true;
+              try { this._ensureMotionWorker(); } catch (e) {
+                console.warn('[calibration:ready] main.js: _ensureMotionWorker failed:', e);
+              }
+            }
+
+            if (_calCameraId && this.motionDetector) {
+              try {
+                this.motionDetector.notifyCalibrationComplete(_calCameraId);
+                console.log('[calibration:ready] main.js: notifyCalibrationComplete called for',
+                            _calCameraId,
+                            '— cycle closed, gate reopens on next spike or exposure change');
+              } catch (e) {
+                console.warn('[calibration:ready] main.js: notifyCalibrationComplete failed:', e);
+              }
+
+              // Unblock intent creation in MotionDetector. Idempotent — once true,
+              // stays true for the lifetime of the detector instance. Must come
+              // AFTER notifyCalibrationComplete so the per-camera stale/pending
+              // flags are already cleared before the first post-calibration intent
+              // is ever created.
+              try {
+                this.motionDetector.setCalibrationConfirmed(true);
+              } catch (e) {
+                console.warn('[calibration:ready] main.js: setCalibrationConfirmed failed:', e);
+              }
+            }
+
+            // Arm native dispatch and start lockout timer.
+            this._nativeCalibComplete        = true;
+            this._lastCalibrationCompletedAt = Date.now();
+            console.log('[Native flow] Post-calibration reconstruction dispatch armed.',
+                        'Lockout active for', Math.round(this._calibrationLockoutMs / 1000), 's.');
+          }
+
+          // ── artifact:ready → MotionDetector + native dispatch ───────────────
+          //
+          // ORDERING IS CRITICAL: Step 1 before Step 2.
+          //
+          // Step 1 calls handleAnnularEvent(jobId) which calls _createIntent,
+          // registering jobId → intentId in _intentsByJobId.
+          //
+          // Step 2 calls onArtifactReady(jobId, metaKey) which looks up the
+          // intent by jobId, attaches metaKey, and calls _scheduleReconstruction
+          // → _processQueue → requestReconstructionByMeta.
+          //
+          // If Step 2 runs first, _intentsByJobId is empty and it is a no-op.
+          //
+          // The native dispatch fallback runs AFTER both steps. It directly
+          // calls requestReconstructionByMeta for every manifest (with cooldown)
+          // once calibration is confirmed. This mirrors what the test script does
+          // with forceDirectReconstruction(). It is needed because MotionDetector
+          // spike detection may not fire reliably for all scene types: after EMA
+          // warmup the adaptive threshold is mean + 3×std on normalized data,
+          // which can exceed 1.0 (the maximum possible peak) for uniform scenes.
           if (msg && msg.event === 'artifact:ready' && msg.metaKey && msg.jobId) {
+            const _arMeta = msg.meta ?? {};
+
+            // Step 1 — annular data into MotionDetector intent system.
+            // annular is now present in msg.meta (Change A in preprocessor.worker.js).
+            // Accept both Float32Array and plain Array (eviction hook uses Array.from).
+            if (_arMeta.annular && _arMeta.annular.length > 0 && this.motionDetector) {
+              try {
+                this.motionDetector.handleAnnularEvent({
+                  annular:   Float32Array.from(_arMeta.annular),
+                  meta: {
+                    jobId:    msg.jobId,
+                    cameraId: _arMeta.cameraId || this.cameraContainer?.cameraId || 'default',
+                    width:    _arMeta.width  ?? null,
+                    height:   _arMeta.height ?? null
+                  },
+                  avgLuma:   typeof _arMeta.avgLuma === 'number' ? _arMeta.avgLuma : 0,
+                  timestamp: _arMeta.captureTime ?? Date.now()
+                });
+              } catch (e) {
+                // Non-fatal — Step 2 and native dispatch must still run.
+                console.warn('[Dispatch] handleAnnularEvent error (non-fatal):', e);
+              }
+            }
+
+            // Step 2 — attach metaKey to intent created in Step 1.
+            // No _nativeCalibComplete guard needed here: MotionDetector refuses
+            // to create intents before setCalibrationConfirmed(true) is called,
+            // so _intentsByJobId will be empty for any pre-calibration jobId and
+            // this lookup is a natural no-op. Keeping the gating logic in one
+            // place (MotionDetector._calibrationConfirmed) avoids duplicating
+            // "does this require calibration" knowledge across two files.
             if (this.motionDetector?.onArtifactReady) {
               try {
                 this.motionDetector.onArtifactReady({
                   metaKey: msg.metaKey,
                   jobId:   msg.jobId,
-                  meta:    msg.meta ?? {}
+                  meta:    _arMeta
                 });
               } catch(e) {
                 console.warn('[Dispatch] motionDetector.onArtifactReady error:', e);
+              }
+            }
+
+            // ── Native dispatch fallback ─────────────────────────────────────
+            // Runs once calibration is confirmed, with a cooldown to avoid
+            // flooding motion.worker while a reconstruction is in progress.
+            //
+            // Guard: _manifestCalibKey must be present. The very first manifest
+            // after calibration:ready may have been constructed before CALIB.metaKey
+            // was set (Change A2 closes this for subsequent frames). If null, we
+            // skip silently — the next manifest (milliseconds later) will have it.
+            if (
+              this._nativeCalibComplete &&
+              this.motionWorker?.workerReady &&
+              !this._nativeReconInFlight &&
+              (Date.now() - this._nativeLastReconAt) >= this._nativeReconCooldownMs
+            ) {
+              const _nativeCameraId    = _arMeta.cameraId || this.cameraContainer?.cameraId || 'default';
+              const _manifestCalibKey  = _arMeta.calibrationKey ?? null;
+
+              if (!_manifestCalibKey) {
+                // Manifest pre-dates calibration. Next frame will have it.
+                // Do not consume the cooldown for a skip.
+                console.log('[Native flow] Skipping — no calibrationKey yet (race window).');
+              } else {
+                this._nativeReconInFlight = true;
+                this._nativeLastReconAt   = Date.now();
+
+                console.log('[Native flow] Dispatching reconstruction →', msg.metaKey, {
+                  cameraId:       _nativeCameraId,
+                  calibrationKey: _manifestCalibKey
+                });
+
+                this.motionWorker.requestReconstructionByMeta(
+                  msg.metaKey,
+                  {
+                    reason:   'native-continuous',
+                    priority: 50,
+                    reqId:    msg.jobId,
+                    cameraId: _nativeCameraId,
+                    // Pass calibrationKey from the BC artifact:ready message directly
+                    // into the job payload. The BC message reads CALIB.metaKey from
+                    // readyData which is constructed AFTER all persist awaits —
+                    // reliably after CALIB.metaKey is set even under quota pressure.
+                    // This bypasses the IDB manifest race where manifest.data.calibrationKey
+                    // was written to IDB before CALIB.metaKey was set in preprocessor.worker.
+                    calibrationKey: _manifestCalibKey
+                  }
+                ).then(() => {
+                  this._nativeReconInFlight = false;
+                  console.log('[Native flow] Reconstruction resolved for', msg.metaKey);
+                }).catch((err) => {
+                  this._nativeReconInFlight = false;
+                  console.warn('[Native flow] Reconstruction failed (will retry next manifest):', err.message);
+                });
               }
             }
           }
@@ -2517,6 +2797,32 @@ _ensureMotionWorker() {
             console.warn('⚠️ MotionPainter: Dispatcher connection verification failed!');
           }
 
+          // ── Override hfhHeavyPathThreshold → 0.0 ──────────────────────────
+          // Lesson from test script: _setFlag broadcasts
+          // { event: 'flagsChanged', flags: { hfhHeavyPathThreshold: 0.0 } }
+          // which is the event motion.worker's featureFlags listener handles.
+          //
+          // Why this is needed: motion.worker loads featureFlags from webpack's
+          // persistent bundle cache. If the cache pre-dates our change of the
+          // value to 0.0 in featureFlags.js, the worker sees 0.85. At 0.85,
+          // reconstruction is gated on HFH severity exceeding 0.85, which many
+          // scenes never reach. At 0.0, any HFH 'shouldRun' event is sufficient.
+          //
+          // We use this._bc (already initialized in init()) rather than a new
+          // channel to avoid creating/closing unnecessary resources. By the time
+          // this callback fires, motion.worker is confirmed ready and listening.
+          try {
+            if (this._bc) {
+              this._bc.postMessage({
+                event: 'flagsChanged',
+                flags: { hfhHeavyPathThreshold: 0.0 }
+              });
+              console.log('[MotionPainter] hfhHeavyPathThreshold overridden to 0.0 in motion.worker');
+            }
+          } catch (e) {
+            console.warn('[MotionPainter] hfhHeavyPathThreshold override failed (non-fatal):', e);
+          }
+
           // Instantiate topology.worker, minimizer.worker, and ambi.worker now
           // that motion.worker is confirmed ready. All Stage 4/5 workers consume
           // artifacts produced by motion.worker, so this ordering guarantees they
@@ -2971,6 +3277,88 @@ _ensureMotionWorker() {
     }
   }
 
+// ── Log filter ────────────────────────────────────────────────────────────
+  // Silences high-frequency renderer/storage telemetry so pipeline events
+  // are readable. restoreConsole() removes the filter at any time.
+  _installLogFilter() {
+    const _origLog   = console.log.bind(console);
+    const _origWarn  = console.warn.bind(console);
+    const _origDebug = (console.debug || console.log).bind(console);
+
+    window.restoreConsole = () => {
+      console.log = _origLog; console.warn = _origWarn; console.debug = _origDebug;
+      _origLog('[MotionPainter] Log filter removed');
+    };
+
+    // Strings that, when found at the start of the first argument, suppress the line.
+    const LOG_BLOCK = [
+      // ── Renderer (fires on every frame at 30fps) ──
+      '[FB]', '[FB_DIAG]', '[GL]', '[GL_DIAG]', '[GL_VALIDATE]', '[CR]',
+      'renderComposite', 'rotateBuffers', 'getSpiralIndices',
+      'uploadVideoFrame', 'advanceWriteIndex', 'initializeWithFrame',
+      '[CR] processFrame',
+      // ── Pin lifecycle (fires on every artifact write) ──
+      '[PIN] ✓', '[PIN] ⏱', '[PIN] ⏰', '[PIN] 🚫',
+      '[PIN] ⚠', '[PIN] ⏸', '[PIN] ℹ',
+      // ── Storage per-artifact / per-eviction ──
+      '[parts] Serializing',
+      'storage: NORMAL quota pressure',
+      'NORMAL quota pressure',
+      '[PERSIST]',
+      'artifact:pinned', 'artifact:unpinned',
+      'artifact:ttl_unpinned', 'artifact:evicted',
+      // ── Worker flag broadcasts ──
+      'motion.worker: feature flags updated',
+      '[PIN] Feature flag updated',
+      '[_wrapStorage]',
+      'MotionWorkerWrapper: init posted',
+      'MotionWorkerWrapper: feature flags',
+      'MotionWorkerWrapper: RECONSTRUCT_META missing',
+      // ── Preprocessor per-frame ──
+      'PreprocessorWorker: Frame',
+      'PreprocessorWorker: HFH',
+      // ── Camera container propagation ──
+      'cameraContainer:updated',
+      '[cameraContainer] main.js: propagating',
+      '[cameraContainer] FrameEvictionHook',
+      // ── Layout / resize ──
+      'Buffer configuration updated',
+      'panelRect',
+      'Canvas resized to',
+      // ── Expected non-actionable ──
+      'FrameEvictionHook: calibration buffer hard limit',
+      // ── Recurring flag and debug logs ──
+      'featureFlags: enableFlux',
+      'main.js: persistIntermediates flag changed',
+      'main.js: Initial MotionDetector',
+      'main.js: Metrics timer',
+      'Reaper:',
+      // ── Storage module boilerplate ──
+      'storage.js: All functions defined',
+      'storage.js: Setting up worker globals',
+      'storage.js: Worker globals set up successfully',
+    ];
+
+    const WARN_BLOCK = [
+      '[PIN] ✗ Aggressive unpin',
+      '[PIN] ✗ Failed to check',
+      'preprocessor.worker: BroadcastChannel failed',
+      'preprocessor.worker: failed to broadcast',
+    ];
+
+    const blocked = (list, args) => {
+      const s = typeof args[0] === 'string' ? args[0] : '';
+      return list.some(p => s.includes(p));
+    };
+
+    console.log   = (...a) => { if (!blocked(LOG_BLOCK,  a)) _origLog(...a);   };
+    console.debug = (...a) => { if (!blocked(LOG_BLOCK,  a)) _origDebug(...a); };
+    console.warn  = (...a) => { if (!blocked(WARN_BLOCK, a)) _origWarn(...a);  };
+    // console.error is never filtered.
+
+    _origLog('[MotionPainter] Log filter active — restoreConsole() to remove');
+  }
+
 /**
  * Teardown MotionWorker if present (called during destroy)
  */
@@ -3207,6 +3595,23 @@ verifyDispatcherConnection() {
       throw new Error('Preprocessor wrapper not initialized (cannot compute calibration)');
     }
 
+    // ── Post-calibration lockout ────────────────────────────────────────────
+    // After calibration:ready fires, MotionDetector immediately detects
+    // flat_field_degradation because the fresh calibration statistics differ
+    // from what was seen during frame capture. Without a lockout, a second
+    // calibration starts before the first reconstruction has finished.
+    // 90s is long enough for one full reconstruction cycle (30-60s) + buffer.
+    const _msSinceLastCalib = Date.now() - this._lastCalibrationCompletedAt;
+    if (this._lastCalibrationCompletedAt > 0 && _msSinceLastCalib < this._calibrationLockoutMs) {
+      console.log(
+        '[Calibration] Lockout active — suppressing request.',
+        `Completed ${Math.round(_msSinceLastCalib / 1000)}s ago,`,
+        `lockout expires in ${Math.round((this._calibrationLockoutMs - _msSinceLastCalib) / 1000)}s.`,
+        `Suppressed reason: ${reason}`
+      );
+      return;
+    }
+
     // Defensive: if a capture is already in progress, ignore duplicate triggers
     if (this.evictionHook.captureCalibration) {
       console.log('Calibration capture already in progress — ignoring duplicate request');
@@ -3244,6 +3649,13 @@ verifyDispatcherConnection() {
 
         // Transfer clones to preprocessor for calibration computation.
         // Main will await completion to ensure the transfer succeeded and then close any returned bitmaps.
+        //
+        // NOTE: evictor/reaper pausing is now handled generically by the
+        // _coordCheckInterval poller set up in init() — it watches
+        // StorageActivityCoordinator for any 'calibration' or 'reconstruction'
+        // activity and pauses/resumes accordingly. No per-call-site pause code
+        // is needed here anymore; preprocessor.worker registers the
+        // 'calibration' activity itself via StorageActivityCoordinator.begin/end.
         try {
           const res = resolution || { width: (this.video && this.video.videoWidth) || frames[0].width, height: (this.video && this.video.videoHeight) || frames[0].height };
           const callResult = await this.preprocessor.requestCalibration(frames, count, res);
@@ -3267,6 +3679,11 @@ verifyDispatcherConnection() {
             frames.forEach(f => { try { f.close(); } catch (e) {} });
           } catch (_) {}
           throw err;
+        } finally {
+          // No manual evictor/reaper resume needed here — the generic
+          // _coordCheckInterval poller (see init()) resumes both automatically
+          // once StorageActivityCoordinator reports no 'calibration' or
+          // 'reconstruction' activity remaining.
         }
 
       } catch (err) {
@@ -3291,7 +3708,13 @@ verifyDispatcherConnection() {
       this.evictionHook.startCalibrationCapture({
         count,
         resolution: resolution || null,
-        timeoutMs: 30_000,
+        // 90s matches the post-calibration lockout in _lastCalibrationCompletedAt.
+        // The 30s original timeout fired before the preprocessor worker finished
+        // its IDB persist loop for all five calibration artifacts, causing
+        // calibration:ready to never fire and stalling the pipeline permanently.
+        // In practice the 16 frames accumulate in ~0.5s; the timeout is only
+        // relevant if the scene is so busy that evictions stall.
+        timeoutMs: 90_000,
         forceFull: true
       });
 
@@ -3396,6 +3819,26 @@ verifyDispatcherConnection() {
         console.log('Reaper interval stopped');
       } catch (e) {
         console.warn('Failed to stop reaper interval:', e);
+      }
+    }
+
+    if (this._reconStatusCleanupInterval) {
+      try {
+        clearInterval(this._reconStatusCleanupInterval);
+        this._reconStatusCleanupInterval = null;
+        console.log('reconStatus cleanup interval stopped');
+      } catch (e) {
+        console.warn('Failed to stop reconStatus cleanup interval:', e);
+      }
+    }
+
+    if (this._coordCheckInterval) {
+      try {
+        clearInterval(this._coordCheckInterval);
+        this._coordCheckInterval = null;
+        console.log('StorageActivityCoordinator poll interval stopped');
+      } catch (e) {
+        console.warn('Failed to stop coordinator poll interval:', e);
       }
     }
     // ========================================================================

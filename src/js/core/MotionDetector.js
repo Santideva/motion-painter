@@ -192,10 +192,33 @@ export class MotionDetector {
     //                          emitted and capture has started. Prevents duplicate
     //                          emissions while waiting for the calibration worker
     //                          to finish. Cleared by notifyCalibrationComplete().
+    // ===== INVALIDATION-DRIVEN CALIBRATION STATE =====
     this._calibrationStale        = new Map();
     this._calibrationStaleReason  = new Map();
     this._calibrationStaleAt      = new Map();
     this._calibrationPending      = new Map();
+
+    // ===== INTENT GATING STATE =====
+    // True once the FIRST calibration cycle has ever completed for this
+    // detector instance. _createIntent is suppressed until this is true.
+    //
+    // Rationale: a manifest created before any calibration has run carries
+    // calibrationKey: undefined in IDB regardless of what its annular data
+    // shows. Dispatching it to motion.worker causes getArtifact(undefined)
+    // → calibData=null → CPU fallback → PackingSDF crash → camera quota
+    // consumed for the duration of the failed reconstruction, blocking every
+    // subsequent intent for 30s.
+    //
+    // EMA warmup, spike/exposure detection, and calibration invalidation
+    // triggers are NOT gated by this flag — they must run from frame one so
+    // the system can recognize when to fire the very first calibration cycle.
+    //
+    // Once true, stays true for the lifetime of the detector instance.
+    // A later calibration becoming stale does NOT reset this — the prior
+    // calibrated artifact remains valid in IDB and reconstruction can keep
+    // using it while a fresh calibration computes in the background.
+    // Cleared only by reset() and destroy().
+    this._calibrationConfirmed = false;
 
     // Validate and set annular config with defaults
     this._annularConfig = Object.assign({
@@ -443,6 +466,28 @@ export class MotionDetector {
   }
 
   /**
+   * setCalibrationConfirmed
+   *
+   * Called by main.js from the calibration:ready BC handler, immediately
+   * after notifyCalibrationComplete(cameraId). Once set true, reconstruction
+   * intent creation in handleAnnularEvent is unblocked for the lifetime of
+   * this detector instance (cleared only by reset()/destroy()).
+   *
+   * Kept separate from notifyCalibrationComplete intentionally: that method
+   * clears per-camera stale/pending flags on every cycle; this flag is set
+   * exactly once (on the first ever completion) and never cleared mid-session.
+   *
+   * @param {boolean} value
+   */
+  setCalibrationConfirmed(value) {
+    const next = !!value;
+    if (next && !this._calibrationConfirmed) {
+      console.log('MotionDetector: intent creation enabled — calibration confirmed');
+    }
+    this._calibrationConfirmed = next;
+  }
+
+  /**
    * handleAnnularEvent
    * PRIMARY trigger source for both reconstruction AND calibration.
    *
@@ -481,7 +526,13 @@ export class MotionDetector {
       const stats = this._annularStatsPerCamera.get(cameraId);
       const spike = this._detectAnnularSpikeAdaptive(norm, cameraId);
 
-      if (spike && stats && stats.sampleCount >= this._minEmaSamples) {
+      // Intent creation requires calibration to have completed at least once.
+      // Pre-calibration manifests carry calibrationKey: undefined in IDB —
+      // dispatching them to motion.worker always produces calibData=null.
+      // spike and exposureChange detection still run unconditionally below
+      // so they can feed the calibration invalidation path, which is how
+      // the very first calibration cycle gets triggered.
+      if (this._calibrationConfirmed && spike && stats && stats.sampleCount >= this._minEmaSamples) {
         this._createIntent({
           jobId: meta.jobId,
           cameraId,
@@ -494,7 +545,7 @@ export class MotionDetector {
       }
 
       const exposureChange = this._detectExposureChange(avgLuma, cameraId);
-      if (exposureChange) {
+      if (this._calibrationConfirmed && exposureChange) {
         this._createIntent({
           jobId: meta.jobId,
           cameraId,
@@ -2118,6 +2169,10 @@ export class MotionDetector {
     this._calibrationStaleAt.clear();
     this._calibrationPending.clear();
 
+    // Intent gating — reset means "start over from scratch"; the next camera
+    // session must complete a fresh calibration before intents can be created.
+    this._calibrationConfirmed = false;
+
     console.log('MotionDetector: reset complete');
   }
 
@@ -2132,14 +2187,15 @@ export class MotionDetector {
     return {
       avgMotion,
       avgLuma,
-      motionWindowSize:   this._motionHistory.length,
-      lastCalibrationAt:  this._lastCalibrationEmit,
-      pendingCandidates:  this._calibrationCandidates.size,
-      calibrationMode:    this.calibrationMode,
-      annularStatsCameras: this._annularStatsPerCamera.size,
-      trackedCameras:     this._cameras.size,
-      staleCameras:       this._calibrationStale.size,
-      pendingCalibrations: this._calibrationPending.size
+      motionWindowSize:     this._motionHistory.length,
+      lastCalibrationAt:    this._lastCalibrationEmit,
+      pendingCandidates:    this._calibrationCandidates.size,
+      calibrationMode:      this.calibrationMode,
+      calibrationConfirmed: this._calibrationConfirmed,
+      annularStatsCameras:  this._annularStatsPerCamera.size,
+      trackedCameras:       this._cameras.size,
+      staleCameras:         this._calibrationStale.size,
+      pendingCalibrations:  this._calibrationPending.size
     };
   }
 
@@ -2173,6 +2229,9 @@ export class MotionDetector {
     this._calibrationStaleReason.clear();
     this._calibrationStaleAt.clear();
     this._calibrationPending.clear();
+
+    // Intent gating state
+    this._calibrationConfirmed = false;
 
     // Persistence tracking
     if (this._persistedArtifacts) {

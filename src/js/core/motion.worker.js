@@ -16,6 +16,7 @@ import { DirectionalLifting } from '/src/js/core/DirectionalLifting.js';
 import { PenumbraAnalyzer } from '/src/js/core/PenumbraAnalyzer.js';  
 import PackingSDF from '/src/js/core/PackingSDF.js';
 import { DifferentialGeometry } from '/src/js/core/DifferentialGeometry.js';
+import StorageActivityCoordinator from '/src/config/StorageActivityCoordinator.js';
 
 const BC_CHANNEL = 'motion-painter-store';
 const bc = (typeof BroadcastChannel !== 'undefined') ? new BroadcastChannel(BC_CHANNEL) : null;
@@ -264,6 +265,36 @@ let _flags = {};                    // feature flags / runtime config snapshot
 let _running = true;
 let _jobs = new Map();
 let _inFlightMetaKeys = new Set();              // jobId -> { heartbeatTimer, createdAt, meta }
+let _activeReconJobId = null;   // single-flight guard: only one heavy reconstruction (GPU + IDB) runs at a time
+let _reconQueue = [];           // FIFO of RECONSTRUCT_META messages waiting for the active job to finish
+let _queueHeartbeatInterval = null;
+
+// Periodically re-announce every queued job's position while the queue is
+// non-empty. Without this, MotionWorkerWrapper's per-job watchdog has no way
+// to distinguish "still legitimately queued behind other work" from "worker
+// went silent/died" once the initial RECON_QUEUED notice ages past the
+// watchdog window — which is exactly what happens when several ~90s jobs are
+// queued ahead of a given job.
+function _startQueueHeartbeat() {
+  if (_queueHeartbeatInterval) return;
+  _queueHeartbeatInterval = setInterval(() => {
+    if (_reconQueue.length === 0) {
+      clearInterval(_queueHeartbeatInterval);
+      _queueHeartbeatInterval = null;
+      return;
+    }
+    _reconQueue.forEach((queuedMsg, idx) => {
+      self.postMessage({
+        event: 'RECON_QUEUED',
+        jobId: queuedMsg.jobId,
+        metaKey: queuedMsg.metaKey,
+        queuePosition: idx + 1,
+        activeJobId: _activeReconJobId,
+        heartbeat: true
+      });
+    });
+  }, 20000);
+}
 let _metrics = {
   jobsHandled: 0,
   lastError: null,
@@ -1958,8 +1989,15 @@ function _computeFMapRouteA(
   const count      = resolution * resolution;
   const N          = Math.max(8, Math.min(512, options.N_samples ?? 128));
 
-  const fMap        = new Float32Array(count);
-  const directness  = new Float32Array(count);
+  // pixelSubset / presetFMap / presetDirectness: when provided, only the
+  // listed pixel indices are computed exactly; all other entries are copied
+  // from the preset arrays untouched. This lets a caller reuse this exact,
+  // unchanged algorithm as a targeted refinement pass over a subset of
+  // pixels (see _computeFMapRouteAHybrid) without maintaining a second
+  // implementation. Default (no subset) behaves exactly as before.
+  const pixelSubset = options.pixelSubset ?? null;
+  const fMap        = options.presetFMap       ? options.presetFMap.slice()       : new Float32Array(count);
+  const directness  = options.presetDirectness ? options.presetDirectness.slice() : new Float32Array(count);
   const modalLabels = new Uint8Array(count);
 
   const depths     = depthMap.data;
@@ -2045,60 +2083,327 @@ function _computeFMapRouteA(
   for (const sp of sourcePoints) sp.weight /= totalWeight;
 
   // ── Per-pixel Monte Carlo visibility ─────────────────────────────────────
-  for (let y = 0; y < resolution; y++) {
-    for (let x = 0; x < resolution; x++) {
-      const i       = y * resolution + x;
-      const pDepthN = (depths[i] - depthMin) / depthRange;
-      const pnx     = x / resolution;
-      const pny     = y / resolution;
+  // computePixel(i): the exact per-pixel body, unchanged from before —
+  // factored out so both the full-grid loop and the subset loop below share
+  // identical logic (no risk of the two diverging).
+  const computePixel = (i) => {
+    const x       = i % resolution;
+    const y       = (i / resolution) | 0;
+    const pDepthN = (depths[i] - depthMin) / depthRange;
+    const pnx     = x / resolution;
+    const pny     = y / resolution;
 
-      let visibleW = 0;
+    let visibleW = 0;
 
-      for (const sp of sourcePoints) {
-        const dx = sp.nx - pnx;
-        const dy = sp.ny - pny;
-        const dd = sp.nd - pDepthN;
+    for (const sp of sourcePoints) {
+      const dx = sp.nx - pnx;
+      const dy = sp.ny - pny;
+      const dd = sp.nd - pDepthN;
 
-        let occluded = false;
+      let occluded = false;
 
-        // March intermediate steps (skip step 0 = pixel itself, step N = source)
-        for (let step = 1; step < marchSteps && !occluded; step++) {
-          const t   = step / marchSteps;
-          const mx  = Math.round((pnx + t * dx) * resolution);
-          const my  = Math.round((pny + t * dy) * resolution);
+      for (let step = 1; step < marchSteps && !occluded; step++) {
+        const t   = step / marchSteps;
+        const mx  = Math.round((pnx + t * dx) * resolution);
+        const my  = Math.round((pny + t * dy) * resolution);
 
-          // Ray exits image → source is outside frame → treat as unoccluded
-          if (mx < 0 || mx >= resolution || my < 0 || my >= resolution) break;
+        if (mx < 0 || mx >= resolution || my < 0 || my >= resolution) break;
 
-          const sampledN = (depths[my * resolution + mx] - depthMin) / depthRange;
-          const marchN   = pDepthN + t * dd;
+        const sampledN = (depths[my * resolution + mx] - depthMin) / depthRange;
+        const marchN   = pDepthN + t * dd;
 
-          // Occluder: buffer shallower than march ray by more than bias.
-          // The bias prevents self-occlusion from depth quantisation errors.
-          if (sampledN < marchN - occlusionBias) occluded = true;
-        }
-
-        if (!occluded) visibleW += sp.weight;
+        if (sampledN < marchN - occlusionBias) occluded = true;
       }
 
-      fMap[i]       = visibleW;
-      directness[i] = visibleW;
-
-      if      (visibleW >= directThresh) modalLabels[i] = 2;
-      else if (visibleW <= umbraThresh)  modalLabels[i] = 0;
-      else                               modalLabels[i] = 1;
+      if (!occluded) visibleW += sp.weight;
     }
+
+    fMap[i]       = visibleW;
+    directness[i] = visibleW;
+
+    if      (visibleW >= directThresh) modalLabels[i] = 2;
+    else if (visibleW <= umbraThresh)  modalLabels[i] = 0;
+    else                               modalLabels[i] = 1;
+  };
+
+  if (pixelSubset) {
+    // Refinement pass: only recompute flagged pixels exactly. Unflagged
+    // pixels keep whatever was copied in from presetFMap/presetDirectness
+    // above; their modalLabels is filled in below from the merged fMap.
+    for (let k = 0; k < pixelSubset.length; k++) computePixel(pixelSubset[k]);
+  } else {
+    for (let i = 0; i < count; i++) computePixel(i);
   }
 
   if (_flags.fMapDebug) {
     console.log(
       `[FMAP-RouteA] N=${N} srcXY=(${srcX.toFixed(1)},${srcY.toFixed(1)}) ` +
       `srcR=${srcRadius.toFixed(1)} srcDepthN=${srcDepthNorm.toFixed(3)} ` +
-      `fresnel=${!!fresnelDensityMap} ms=${(performance.now()-t0).toFixed(1)}`
+      `fresnel=${!!fresnelDensityMap} ms=${(performance.now()-t0).toFixed(1)}` +
+      (pixelSubset ? ` subsetPixels=${pixelSubset.length}/${count}` : '')
     );
   }
 
-  return { fMap, directness, modalLabels, route: 'depth_mc', N_samples: N };
+  return { fMap, directness, modalLabels, route: pixelSubset ? 'depth_mc_refined' : 'depth_mc', N_samples: N };
+}
+
+function _downsampleFieldNearest(dataArr, srcRes, dstRes) {
+  if (srcRes === dstRes) return dataArr;
+  const out = new Float32Array(dstRes * dstRes);
+  const scale = srcRes / dstRes;
+  for (let y = 0; y < dstRes; y++) {
+    const sy = Math.min(srcRes - 1, Math.floor(y * scale));
+    for (let x = 0; x < dstRes; x++) {
+      const sx = Math.min(srcRes - 1, Math.floor(x * scale));
+      out[y * dstRes + x] = dataArr[sy * srcRes + sx];
+    }
+  }
+  return out;
+}
+
+function _upsampleFieldBilinear(dataArr, srcRes, dstRes) {
+  if (srcRes === dstRes) return dataArr;
+  const out = new Float32Array(dstRes * dstRes);
+  const scale = (srcRes - 1) / Math.max(1, dstRes - 1);
+  for (let y = 0; y < dstRes; y++) {
+    const sy = y * scale, sy0 = Math.floor(sy), sy1 = Math.min(srcRes - 1, sy0 + 1), fy = sy - sy0;
+    for (let x = 0; x < dstRes; x++) {
+      const sx = x * scale, sx0 = Math.floor(sx), sx1 = Math.min(srcRes - 1, sx0 + 1), fx = sx - sx0;
+      const v00 = dataArr[sy0 * srcRes + sx0], v10 = dataArr[sy0 * srcRes + sx1];
+      const v01 = dataArr[sy1 * srcRes + sx0], v11 = dataArr[sy1 * srcRes + sx1];
+      const vTop = v00 + (v10 - v00) * fx, vBot = v01 + (v11 - v01) * fx;
+      out[y * dstRes + x] = vTop + (vBot - vTop) * fy;
+    }
+  }
+  return out;
+}
+
+/**
+ * _computeFMapRouteAHybrid
+ *
+ * Cuts Route A's wall time by skipping the exact O(pixels × N × marchSteps)
+ * march for pixels confidently in the interior of a uniform visibility
+ * region, WITHOUT ever letting a coarse/interpolated value determine the
+ * DIRECT/PENUMBRA/UMBRA classification boundary — that boundary directly
+ * drives PackingSDF._applyUmbraPolicy's per-pixel SDF attenuation ahead of
+ * narrow-band construction, so any blockiness or misalignment there risks
+ * reintroducing spurious topology (the same class of bug fixed earlier via
+ * the scalene-variance percentile change).
+ *
+ * Approach:
+ *   1. Run the exact algorithm (unchanged) on a coarse grid — fast, since
+ *      cost is O(pixels).
+ *   2. Upsample bilinearly as a cheap local signal only — never as a final
+ *      per-pixel answer.
+ *   3. Flag pixels near the modal threshold band or with high local gradient
+ *      in that upsampled signal (small dilation margin included).
+ *   4. Re-run the SAME exact per-pixel code, at FULL resolution, restricted
+ *      to just the flagged pixels.
+ *   5. Everywhere else, keep the coarse-derived value — safe, since
+ *      "unflagged" means the coarse pass found that region locally uniform,
+ *      so there is no boundary there to get wrong.
+ *
+ * Worst case (boundary-heavy scene): most pixels get flagged, cost
+ * approaches the original exact full-resolution computation — no silent
+ * quality loss, just a reduced/absent speedup for that scene.
+ */
+function _computeFMapRouteAHybrid(
+  depthMap, calibratedField, resolution,
+  lightTrack, fresnelDensityMap, samplingContext, flags, options = {}
+) {
+  const coarseMaxSide = flags.fMapCoarseMaxSide ?? 256;
+  const coarseRes = Math.max(32, Math.min(resolution, coarseMaxSide));
+
+  if (coarseRes >= resolution) {
+    // No reduction possible/requested — just run the exact algorithm.
+    return _computeFMapRouteA(depthMap, calibratedField, resolution, lightTrack, fresnelDensityMap, samplingContext, options);
+  }
+
+  const scale = coarseRes / resolution;
+  const coarseDepthMap = {
+    resolution: coarseRes,
+    data: _downsampleFieldNearest(depthMap.data, resolution, coarseRes),
+    min: depthMap.min,
+    max: depthMap.max
+  };
+  const coarseFresnel = fresnelDensityMap
+    ? _downsampleFieldNearest(fresnelDensityMap, resolution, coarseRes)
+    : null;
+  const coarseLightTrack = (lightTrack ?? []).map(lt => ({
+    ...lt,
+    imageXY: [lt.imageXY[0] * scale, lt.imageXY[1] * scale],
+    radius: (lt.radius ?? 0) * scale
+  }));
+
+  const coarseResult = _computeFMapRouteA(
+    coarseDepthMap, calibratedField, coarseRes,
+    coarseLightTrack, coarseFresnel, samplingContext, options
+  );
+
+  const approxFMap = _upsampleFieldBilinear(coarseResult.fMap, coarseRes, resolution);
+  const approxDirectness = _upsampleFieldBilinear(coarseResult.directness, coarseRes, resolution);
+
+  // ── Flag pixels needing exact refinement ──────────────────────────────
+  const directThresh = Number.isFinite(flags.fMapDirectThresh) ? flags.fMapDirectThresh : 0.9;
+  const umbraThresh  = Number.isFinite(flags.fMapUmbraThresh)  ? flags.fMapUmbraThresh  : 0.1;
+  const margin       = flags.fMapRefineMargin ?? 0.05;
+  const gradThresh   = flags.fMapRefineGradientThresh ?? 0.1;
+  const dilatePx     = Math.max(0, flags.fMapRefineDilatePx ?? 1);
+
+  const needsRefine = new Uint8Array(resolution * resolution);
+  for (let y = 0; y < resolution; y++) {
+    for (let x = 0; x < resolution; x++) {
+      const i = y * resolution + x;
+      const v = approxFMap[i];
+      let flag = (v >= umbraThresh - margin && v <= directThresh + margin);
+      if (!flag) {
+        const gx = x < resolution - 1 ? Math.abs(approxFMap[i + 1] - v) : 0;
+        const gy = y < resolution - 1 ? Math.abs(approxFMap[i + resolution] - v) : 0;
+        flag = (gx + gy) > gradThresh;
+      }
+      needsRefine[i] = flag ? 1 : 0;
+    }
+  }
+
+  // Dilate the flag mask by dilatePx so refinement covers a small margin
+  // around each detected transition, not just the exact crossing pixel.
+  let refineMask = needsRefine;
+  for (let pass = 0; pass < dilatePx; pass++) {
+    const dilated = new Uint8Array(refineMask);
+    for (let y = 0; y < resolution; y++) {
+      for (let x = 0; x < resolution; x++) {
+        const i = y * resolution + x;
+        if (refineMask[i]) continue;
+        const left  = x > 0 ? refineMask[i - 1] : 0;
+        const right = x < resolution - 1 ? refineMask[i + 1] : 0;
+        const up    = y > 0 ? refineMask[i - resolution] : 0;
+        const down  = y < resolution - 1 ? refineMask[i + resolution] : 0;
+        if (left || right || up || down) dilated[i] = 1;
+      }
+    }
+    refineMask = dilated;
+  }
+
+  const pixelSubset = [];
+  for (let i = 0; i < refineMask.length; i++) if (refineMask[i]) pixelSubset.push(i);
+
+  if (flags.fMapDebug) {
+    console.log(
+      `[FMap-RouteA-Hybrid] coarse=${coarseRes}² full=${resolution}² ` +
+      `refined=${pixelSubset.length}/${refineMask.length} ` +
+      `(${(100 * pixelSubset.length / refineMask.length).toFixed(1)}%)`
+    );
+  }
+
+  if (pixelSubset.length === 0) {
+    // Nothing near a boundary — recompute modalLabels from the smooth
+    // upsampled fMap and return directly, skipping the full-res march entirely.
+    const modalLabels = new Uint8Array(resolution * resolution);
+    for (let i = 0; i < modalLabels.length; i++) {
+      const v = approxFMap[i];
+      modalLabels[i] = v >= directThresh ? 2 : (v <= umbraThresh ? 0 : 1);
+    }
+    return { fMap: approxFMap, directness: approxDirectness, modalLabels, route: 'depth_mc_hybrid', N_samples: coarseResult.N_samples };
+  }
+
+  // Exact refinement pass, full resolution, flagged pixels only. Unflagged
+  // pixels are carried through untouched via presetFMap/presetDirectness.
+  const refined = _computeFMapRouteA(
+    depthMap, calibratedField, resolution,
+    lightTrack, fresnelDensityMap, samplingContext,
+    { ...options, pixelSubset, presetFMap: approxFMap, presetDirectness: approxDirectness }
+  );
+
+  // modalLabels for the untouched (non-refined) pixels must still be filled
+  // in from the coarse/upsampled fMap — _computeFMapRouteA only sets
+  // modalLabels for pixels it actually visited when pixelSubset is given.
+  for (let i = 0; i < refined.modalLabels.length; i++) {
+    if (!refineMask[i]) {
+      const v = refined.fMap[i];
+      refined.modalLabels[i] = v >= directThresh ? 2 : (v <= umbraThresh ? 0 : 1);
+    }
+  }
+
+  return { ...refined, route: 'depth_mc_hybrid' };
+}
+
+/**
+ * _deriveFresnelDensityFromPenumbra
+ *
+ * Fallback Fresnel density map, derived from PenumbraAnalyzer's edgeMask when
+ * no upstream fresnelKey artifact is available (currently: always — nothing
+ * in this pipeline yet produces one; the STAGE4.5 manifest lookup in
+ * _handleReconstructMeta is a placeholder for a future HFH producer). Without
+ * this, Route A always falls back to uniform importance sampling, which
+ * biases neither for nor against penumbra edges — exactly where visibility
+ * transitions (and thus most of the estimation error) concentrate.
+ *
+ * edgeMask marks candidate penumbra-edge pixels directly (Stage 1B); this
+ * converts that sparse binary signal into a smooth local density via a box
+ * blur (summed-area table, O(n) regardless of radius), normalised to [0,1].
+ * Blur radius defaults to the mean of PenumbraAnalyzer's own widthMap where
+ * available, so the density falloff scale matches the actual penumbra width
+ * PenumbraAnalyzer measured for this frame, rather than a fixed guess.
+ *
+ * @param {Object} penumbraResult — from _getPenumbraAnalyzer().analyze()
+ * @param {number} resolution
+ * @param {Object} flags
+ * @returns {Float32Array|null} density in [0,1], length resolution², or null
+ *   if penumbraResult/edgeMask is unavailable
+ */
+function _deriveFresnelDensityFromPenumbra(penumbraResult, resolution, flags) {
+  const edgeMask = penumbraResult?.edgeMask;
+  const count = resolution * resolution;
+  if (!edgeMask || edgeMask.length !== count) return null;
+
+  const widthMap = penumbraResult.widthMap;
+  let radius = Number.isFinite(flags.fresnelDerivedBlurRadiusPx)
+    ? flags.fresnelDerivedBlurRadiusPx
+    : 12;
+  if (widthMap) {
+    let sum = 0, n = 0;
+    for (let i = 0; i < count; i++) {
+      if (widthMap[i] > 0) { sum += widthMap[i]; n++; }
+    }
+    if (n > 0) radius = Math.max(4, Math.min(32, sum / n));
+  }
+  radius = Math.round(radius);
+
+  // Summed-area table over edgeMask — makes each box-blur query O(1)
+  // regardless of radius, so total cost is O(count) rather than O(count × radius²).
+  const W = resolution + 1;
+  const integral = new Float64Array(W * W);
+  for (let y = 0; y < resolution; y++) {
+    let rowSum = 0;
+    for (let x = 0; x < resolution; x++) {
+      rowSum += edgeMask[y * resolution + x];
+      integral[(y + 1) * W + (x + 1)] = integral[y * W + (x + 1)] + rowSum;
+    }
+  }
+  const boxSum = (x0, y0, x1, y1) => {
+    x0 = Math.max(0, x0); y0 = Math.max(0, y0);
+    x1 = Math.min(resolution - 1, x1); y1 = Math.min(resolution - 1, y1);
+    return integral[(y1 + 1) * W + (x1 + 1)] - integral[y0 * W + (x1 + 1)]
+         - integral[(y1 + 1) * W + x0]       + integral[y0 * W + x0];
+  };
+
+  const density = new Float32Array(count);
+  let maxDensity = 0;
+  for (let y = 0; y < resolution; y++) {
+    for (let x = 0; x < resolution; x++) {
+      const x0 = x - radius, y0 = y - radius, x1 = x + radius, y1 = y + radius;
+      const areaW = Math.min(resolution - 1, x1) - Math.max(0, x0) + 1;
+      const areaH = Math.min(resolution - 1, y1) - Math.max(0, y0) + 1;
+      const area  = areaW * areaH;
+      const d = area > 0 ? boxSum(x0, y0, x1, y1) / area : 0;
+      density[y * resolution + x] = d;
+      if (d > maxDensity) maxDensity = d;
+    }
+  }
+  if (maxDensity > 0) {
+    for (let i = 0; i < count; i++) density[i] = Math.min(1, density[i] / maxDensity);
+  }
+  return density;
 }
 
 /**
@@ -3325,9 +3630,6 @@ async function _computeDepthNormalsFlux(frameBitmap, calibData, options = {}) {
 
 if (depthMap && _flags.enableFMapRouteA !== false) {
   try {
-    // Scale sample count down quadratically with resolution to keep
-    // wall time roughly constant. At 512²: N=128 (~5s). At 1024²: N=32 (~13s).
-    // Route B (coherence proxy) is retained as fallback if Route A is too slow.
     const _fMapBaseN = _flags.fMapNSamples ?? 128;
     const _fMapResScale = Math.pow(Math.min(1, 512 / gridSize), 2);
     const _fMapN = Math.max(4, Math.round(_fMapBaseN * _fMapResScale));
@@ -3338,15 +3640,50 @@ if (depthMap && _flags.enableFMapRouteA !== false) {
       );
     }
 
-    fMapFinal = _computeFMapRouteA(
+    // Fresnel density fallback: nothing upstream currently produces a real
+    // fresnelKey artifact (see STAGE4.5 in _handleReconstructMeta — the
+    // manifest lookup finds nothing today), so Route A has always been
+    // running with uniform importance sampling. Derive an equivalent density
+    // map locally from PenumbraAnalyzer's own edgeMask (Stage 1B, already
+    // computed above in this same function) rather than leaving this unset.
+    let _fresnelDensityMap = options.fresnelDensityMap ?? null;
+    if (!_fresnelDensityMap) {
+      _fresnelDensityMap = _deriveFresnelDensityFromPenumbra(penumbraResult, gridSize, _flags);
+      if (_fresnelDensityMap) {
+        console.log('[FMap-RouteA] Derived fresnelDensityMap from PenumbraAnalyzer edgeMask (no upstream fresnelKey available)');
+      } else {
+        console.log('[FMap-RouteA] No fresnelKey and no derivable edgeMask — Route A using uniform sampling');
+      }
+    }
+
+    // Unconditional checkpoint (not gated behind fMapDebug) — confirms this
+    // branch actually executes and what coarseRes it will resolve to,
+    // independent of whether a flagsChanged broadcast has reached this
+    // worker's _flags snapshot yet.
+    console.log('[CHECKPOINT] Entering Route A / Hybrid branch', {
+      gridSize,
+      fMapDebugFlag:      !!_flags.fMapDebug,
+      fMapCoarseMaxSide:  _flags.fMapCoarseMaxSide ?? '(unset, default 256)',
+      resolvedCoarseRes:  Math.max(32, Math.min(gridSize, _flags.fMapCoarseMaxSide ?? 256)),
+      willUseHybridPath:  Math.max(32, Math.min(gridSize, _flags.fMapCoarseMaxSide ?? 256)) < gridSize,
+      hasFresnelDensity:  !!_fresnelDensityMap
+    });
+
+    fMapFinal = _computeFMapRouteAHybrid(
       depthMap,
       calibratedField,
       gridSize,
       penumbraResult?.lightTrack ?? [],
-      options.fresnelDensityMap ?? null,
+      _fresnelDensityMap,
       _buildSamplingContext(options.manifest ?? null, gridSize),
+      _flags,
       { N_samples: _fMapN }
     );
+
+    console.log('[CHECKPOINT] Route A / Hybrid branch complete', {
+      route: fMapFinal?.route ?? '(none)',
+      fmapAMs: performance.now() - telemetry.stages.fmapA_start
+    });
   } catch (e) {
     telemetry.warnings.push(`FMap RouteA failed: ${e.message} — keeping Route B`);
     console.warn('motion.worker: FMap RouteA failed, retaining Route B', e);
@@ -3527,12 +3864,29 @@ async function _handleReconstructMeta({ jobId, metaKey, options = {} }) {
   let storageWrapper = null;
   let frameBitmap = null;
   let manifest = null;
+  let _coordActivityId = null;
 
   try {
     if (!metaKey) {
       throw new Error('metaKey required for reconstruction');
     }
     storageWrapper = await _loadStorageAPI();
+
+    // Cross-worker coordination: preprocessor.worker's calibration persist
+    // phase runs 5 sequential writes against the same artifacts/pins/counters
+    // stores this reconstruction is about to use heavily. Give an in-flight
+    // calibration a short window to finish before starting on top of it.
+    try {
+      const _waitResult = await StorageActivityCoordinator.waitForClear('calibration', { timeoutMs: 20000 });
+      if (!_waitResult.cleared) {
+        console.warn(`[motion.worker] proceeding without calibration clearing after ${_waitResult.waitedMs}ms wait — contention possible`);
+      } else if (_waitResult.waitedMs > 0) {
+        console.log(`[motion.worker] waited ${_waitResult.waitedMs}ms for in-flight calibration to clear before starting`);
+      }
+    } catch (e) {
+      console.warn('[motion.worker] StorageActivityCoordinator.waitForClear failed (non-fatal)', e);
+    }
+    _coordActivityId = StorageActivityCoordinator.begin('reconstruction', 'motion.worker', { priority: 0 });
 
     // ========================================
     // STAGE 1: Check reconStatus (Deduplication)
@@ -3653,6 +4007,27 @@ self.postMessage({
   stage: 'loading_calibration'
 });
 
+// ── Race window patch ────────────────────────────────────────────────────
+// manifest.data.calibrationKey may be undefined when the manifest was
+// persisted to IDB before CALIB.metaKey was set in preprocessor.worker
+// (the key gets set during the manifest persist await under quota pressure).
+// main.js forwards calibrationKey from the BC artifact:ready message directly
+// into the job payload (options.calibrationKey) — that value is always correct
+// because readyData is constructed after all persist awaits. Patching here,
+// BEFORE the calibration-load branch below, ensures the patched key is actually
+// used to load calibData rather than being written too late to matter.
+//
+// FIX: was `msg.calibrationKey` — `msg` does not exist in this function's scope
+// (_handleReconstructMeta receives { jobId, metaKey, options }), which threw
+// `ReferenceError: msg is not defined` on every manifest that hit this race,
+// permanently failing reconstruction for those manifests (visible as
+// "[RECONSTRUCT_META] msg is not defined" in MotionWorkerWrapper rejections).
+if (!manifest.data.calibrationKey && options.calibrationKey) {
+  console.log('[STAGE4] Patching calibrationKey from job payload (IDB manifest race window):',
+              options.calibrationKey);
+  manifest.data.calibrationKey = options.calibrationKey;
+}
+
 let calibData = null;
 if (manifest.data.calibrationKey) {
   try {
@@ -3744,6 +4119,9 @@ if (manifest.data.calibrationKey) {
     calibData = null;
   }
 } else {
+  // The patch attempt above (before this if/else, using options.calibrationKey)
+  // already covered the race-window case. Reaching this branch means no
+  // calibration key was available from either the manifest or the job payload.
   // ✅ DIAGNOSTIC: Log when no calibration key present
   console.log('[STAGE4] No calibration key in manifest:', {
     manifestKey: metaKey,
@@ -4933,6 +5311,13 @@ console.log('[STAGE4] Final calibData state before depth computation:', {
     try {
       if (frameBitmap && typeof frameBitmap.close === 'function') frameBitmap.close();
     } catch (e) {}
+
+    // Release the cross-worker lock regardless of success/failure/timeout —
+    // calibration (or anything else waiting on this kind) is unblocked immediately.
+    if (_coordActivityId) {
+      try { StorageActivityCoordinator.end(_coordActivityId); } catch (e) { /* ignore */ }
+      _coordActivityId = null;
+    }
     
     _cleanupAfterReconstruction();
   }
@@ -5198,9 +5583,45 @@ self.onmessage = async (ev) => {
         });
         return;
       }
+
+      // GLOBAL single-flight guard: this worker owns exactly one THREE.js/WebGL
+      // renderer and one IndexedDB connection. Running a second full reconstruction
+      // (different metaKey) concurrently doesn't fail loudly — it silently
+      // serializes every IDB read/write behind the other job's transactions,
+      // turning normally-fast storage reads into 100-200s+ stalls, and shares
+      // the one GPU renderer across two unrelated jobs. Queue instead — nothing
+      // is dropped, jobs just run one at a time, in order.
+      if (_activeReconJobId !== null) {
+        console.warn('[motion.worker] Reconstruction already active — queuing job', {
+          activeJobId:   _activeReconJobId,
+          queuedMetaKey: inFlightKey,
+          queueLength:   _reconQueue.length + 1
+        });
+        _reconQueue.push(data);
+        // Tell the wrapper this job is legitimately waiting, not stuck — its
+        // per-job watchdog resets on this and on the periodic heartbeat below.
+        self.postMessage({
+          event: 'RECON_QUEUED',
+          jobId: data.jobId,
+          metaKey: inFlightKey,
+          queuePosition: _reconQueue.length,
+          activeJobId: _activeReconJobId,
+          heartbeat: false
+        });
+        _startQueueHeartbeat();
+        return;
+      }
+
       _inFlightMetaKeys.add(inFlightKey);
+      _activeReconJobId = data.jobId || data.reqId || inFlightKey;
       _handleReconstructMeta(data).finally(() => {
         _inFlightMetaKeys.delete(inFlightKey);
+        _activeReconJobId = null;
+        const next = _reconQueue.shift();
+        if (next) {
+          // Re-enter through the same guarded path for the next queued job.
+          self.onmessage({ data: next });
+        }
       });
       return;
     }
